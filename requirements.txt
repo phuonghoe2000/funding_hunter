@@ -1,0 +1,16 @@
+# Funding Hunter - Dependencies
+
+# HTTP client
+aiohttp>=3.9.0
+
+# For type hints compatibility
+typing-extensions>=4.0.0
+
+# GUI (tkinter is built-in, but we need these for better experience)
+# tkinter - built into Python
+
+# Optional: for better async support
+asyncio-throttle>=1.0.2
+
+# Optional: for environment variables
+python-dotenv>=1.0.0
