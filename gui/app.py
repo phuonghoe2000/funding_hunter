@@ -287,7 +287,7 @@ class FundingHunterGUI:
                 },
                 "trading": {
                     "leverage": self.leverage_var.get(),
-                    "size": self.size_var.get(),
+                    "size": self.size_entry.get(),
                     "debug": self.debug_mode.get()
                 }
             }
@@ -342,7 +342,8 @@ class FundingHunterGUI:
             # Trading settings
             if "trading" in config:
                 self.leverage_var.set(config["trading"].get("leverage", "10"))
-                self.size_var.set(config["trading"].get("size", "0.001"))
+                self.size_entry.delete(0, tk.END)
+                self.size_entry.insert(0, config["trading"].get("size", "0.001"))
                 self.debug_mode.set(config["trading"].get("debug", False))
             
             self._log("✅ Config loaded successfully")
