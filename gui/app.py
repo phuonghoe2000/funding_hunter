@@ -796,6 +796,10 @@ class FundingHunterGUI:
         long_ex = self._get_exchange_enum(long_ex_name)
         short_ex = self._get_exchange_enum(short_ex_name)
         
+        # Debug: Check connected exchanges
+        self._log(f"Connected exchanges: {[e.value for e in self.manager.clients.keys()]}")
+        self._log(f"Long exchange: {long_ex.value}, Short exchange: {short_ex.value}")
+        
         self._log(f"Opening: {pair} | Long {long_ex_name} | Short {short_ex_name} | Size: {size}")
         self.open_btn.config(state=tk.DISABLED)
         
