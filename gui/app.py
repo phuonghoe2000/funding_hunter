@@ -116,11 +116,11 @@ class MultiExchangeManager:
             short_balance = await short_client.get_balance("USDT")
             
             if long_balance.available < 10:  # Minimum $10 required
-                raise Exception(f"{long_exchange.value}: Insufficient balance (${long_balance.available:.2f})")
+                raise Exception(f"{long_exchange.value}: Insufficient balance (${long_balance.available:.6f})")
             if short_balance.available < 10:
-                raise Exception(f"{short_exchange.value}: Insufficient balance (${short_balance.available:.2f})")
+                raise Exception(f"{short_exchange.value}: Insufficient balance (${short_balance.available:.6f})")
             
-            logger.info(f"✓ Balance check passed: {long_exchange.value}=${long_balance.available:.2f}, {short_exchange.value}=${short_balance.available:.2f}")
+            logger.info(f"✓ Balance check passed: {long_exchange.value}=${long_balance.available:.6f}, {short_exchange.value}=${short_balance.available:.6f}")
             
             # Pre-flight validation: Check existing positions
             long_pos = await long_client.get_position(long_symbol)
@@ -624,6 +624,8 @@ class FundingHunterGUI:
         self.pair_combo = ttk.Combobox(pair_frame, values=POPULAR_PAIRS, width=15)
         self.pair_combo.set("BTC/USDT")
         self.pair_combo.pack(side=tk.LEFT, padx=5)
+        # Bind event to update info when pair is changed
+        self.pair_combo.bind('<<ComboboxSelected>>', self._on_pair_changed)
         
         # Current price display
         self.current_price_label = ttk.Label(pair_frame, text="", foreground="blue")
@@ -654,11 +656,13 @@ class FundingHunterGUI:
         self.long_exchange = ttk.Combobox(ex_frame, values=exchanges, width=12, state='readonly')
         self.long_exchange.set("OKX")
         self.long_exchange.grid(row=0, column=1, padx=5, pady=5)
+        self.long_exchange.bind('<<ComboboxSelected>>', self._on_exchange_changed)
         
         ttk.Label(ex_frame, text="SHORT Exchange:", style='Header.TLabel').grid(row=0, column=2, padx=15, pady=5, sticky='e')
         self.short_exchange = ttk.Combobox(ex_frame, values=exchanges, width=12, state='readonly')
         self.short_exchange.set("Binance")
         self.short_exchange.grid(row=0, column=3, padx=5, pady=5)
+        self.short_exchange.bind('<<ComboboxSelected>>', self._on_exchange_changed)
         
         # Funding rate info for selected pair
         funding_info_frame = ttk.LabelFrame(frame, text="📊 Selected Pair Info", padding="10")
@@ -903,11 +907,11 @@ class FundingHunterGUI:
         
         # Update balances
         if Exchange.OKX in balances:
-            self.okx_balance_label.config(text=f"${balances[Exchange.OKX].available:.2f}")
+            self.okx_balance_label.config(text=f"${balances[Exchange.OKX].available:.6f}")
         if Exchange.BINANCE in balances:
-            self.binance_balance_label.config(text=f"${balances[Exchange.BINANCE].available:.2f}")
+            self.binance_balance_label.config(text=f"${balances[Exchange.BINANCE].available:.6f}")
         if Exchange.BINGX in balances:
-            self.bingx_balance_label.config(text=f"${balances[Exchange.BINGX].available:.2f}")
+            self.bingx_balance_label.config(text=f"${balances[Exchange.BINGX].available:.6f}")
         
         # Update exchange dropdowns
         available = connected  # Use exchange names directly from connected list
@@ -1144,7 +1148,7 @@ class FundingHunterGUI:
                     # Update display with detailed breakdown
                     self.root.after(0, lambda u=unrealized_pnl, f=funding_fees, t=total_pnl: 
                         self.pos_pnl_label.config(
-                            text=f"PnL: ${u:.2f} | Funding: ${f:.2f} | Total: ${t:.2f}",
+                            text=f"PnL: ${u:.6f} | Funding: ${f:.6f} | Total: ${t:.6f}",
                             foreground='green' if t >= 0 else 'red'
                         ))
                     
@@ -1390,9 +1394,9 @@ class FundingHunterGUI:
             binance_rate = rates.get(Exchange.BINANCE)
             bingx_rate = rates.get(Exchange.BINGX)
             
-            okx_val = f"{okx_rate.funding_rate * 100:.4f}%" if okx_rate else "-"
-            binance_val = f"{binance_rate.funding_rate * 100:.4f}%" if binance_rate else "-"
-            bingx_val = f"{bingx_rate.funding_rate * 100:.4f}%" if bingx_rate else "-"
+            okx_val = f"{okx_rate.funding_rate * 100:.6f}%" if okx_rate else "-"
+            binance_val = f"{binance_rate.funding_rate * 100:.6f}%" if binance_rate else "-"
+            bingx_val = f"{bingx_rate.funding_rate * 100:.6f}%" if bingx_rate else "-"
             
             # Find best spread
             rate_values = {}
@@ -1411,7 +1415,7 @@ class FundingHunterGUI:
                 lowest = sorted_rates[0]
                 highest = sorted_rates[-1]
                 spread = (highest[1] - lowest[1]) * 100
-                best_spread = f"{spread:.4f}%"
+                best_spread = f"{spread:.6f}%"
                 recommendation = f"Long {lowest[0].value}, Short {highest[0].value}"
             
             self.funding_tree.insert("", tk.END, values=(
@@ -1421,7 +1425,7 @@ class FundingHunterGUI:
         self._log(f"✅ Loaded {len(sorted_pairs)} pairs sorted by funding rate (highest to lowest)")
     
     def _on_funding_select(self, event):
-        """Handle funding row double-click - auto select pair and exchanges"""
+        """Handle funding row double-click - auto select pair and exchanges in Trading Panel"""
         selected = self.funding_tree.selection()
         if not selected:
             return
@@ -1429,19 +1433,13 @@ class FundingHunterGUI:
         item = self.funding_tree.item(selected[0])
         values = item['values']
         pair = values[0]
-        okx_rate = values[1]
-        binance_rate = values[2]
-        bingx_rate = values[3]
-        best_spread = values[4]
         recommendation = values[5]
         
-        # Set the pair
+        # Set the pair in dropdown
         self.pair_combo.set(pair)
         self._log(f"📌 Selected pair: {pair}")
         
         # Parse and set exchanges from recommendation
-        long_display = ""
-        short_display = ""
         if recommendation != "-":
             # Parse recommendation like "Long okx, Short binance"
             parts = recommendation.split(", ")
@@ -1459,12 +1457,52 @@ class FundingHunterGUI:
                 
                 self._log(f"✅ Auto-selected: LONG on {long_display}, SHORT on {short_display}")
         
-        # Update selected pair info panel
+        # Update pair info (this will fetch funding rates and prices)
+        self._update_pair_info()
+    
+    def _on_pair_changed(self, event):
+        """Handle pair dropdown selection change in Trading Panel"""
+        self._update_pair_info()
+    
+    def _on_exchange_changed(self, event):
+        """Handle exchange dropdown selection change in Trading Panel"""
+        self._update_pair_info()
+    
+    def _update_pair_info(self):
+        """Update pair information display based on current Trading Panel selection"""
+        pair = self.pair_combo.get()
+        if not pair:
+            return
+        
+        self._log(f"📊 Updating info for {pair}")
+        
+        # Get funding rates from the funding tree if available
+        okx_rate = binance_rate = bingx_rate = "N/A"
+        best_spread = "N/A"
+        recommendation = ""
+        
+        # Search for this pair in the funding tree
+        for item_id in self.funding_tree.get_children():
+            item = self.funding_tree.item(item_id)
+            values = item['values']
+            if values[0] == pair:
+                okx_rate = values[1]
+                binance_rate = values[2]
+                bingx_rate = values[3]
+                best_spread = values[4]
+                recommendation = values[5]
+                break
+        
+        # Get current exchanges selection
+        long_display = self.long_exchange.get()
+        short_display = self.short_exchange.get()
+        
+        # Update info panel
         info_text = f"Pair: {pair}\n"
         info_text += f"OKX Rate: {okx_rate}  |  Binance Rate: {binance_rate}  |  BingX Rate: {bingx_rate}\n"
         info_text += f"Best Spread: {best_spread}\n"
-        if recommendation != "-":
-            info_text += f"Strategy: LONG on {long_display} (lower rate), SHORT on {short_display} (higher rate)"
+        if long_display and short_display:
+            info_text += f"Selected: LONG on {long_display}, SHORT on {short_display}"
         
         self.selected_pair_info.config(text=info_text, foreground="black")
         
@@ -1499,10 +1537,10 @@ class FundingHunterGUI:
                     avg_price = sum(price_list) / len(price_list)
                     
                     # Build price info string
-                    price_info = f"💲 ${avg_price:,.2f}"
+                    price_info = f"💲 ${avg_price:,.6f}"
                     
                     # Show individual exchange prices
-                    price_details = " | ".join([f"{ex.value}: ${p:,.2f}" for ex, p in prices.items()])
+                    price_details = " | ".join([f"{ex.value}: ${p:,.6f}" for ex, p in prices.items()])
                     
                     self.root.after(0, self._update_price_display, price_info, price_details)
                 else:
