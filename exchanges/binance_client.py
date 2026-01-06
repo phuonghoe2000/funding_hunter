@@ -68,7 +68,7 @@ class BinanceClient(BaseExchangeClient):
         self,
         method: str,
         endpoint: str,
-        params: Dict = None,
+        params: Optional[Dict] = None,
         signed: bool = True
     ) -> Any:
         """Make API request"""
@@ -246,6 +246,8 @@ class BinanceClient(BaseExchangeClient):
             raise Exception(f"No position found for {binance_symbol}")
         
         # Close by placing opposite order
+        # In hedge mode, use positionSide (do NOT use reduceOnly)
+        # The side must be opposite: SELL to close LONG, BUY to close SHORT
         close_side = "SELL" if position.side == Side.LONG else "BUY"
         
         params = {
@@ -253,8 +255,8 @@ class BinanceClient(BaseExchangeClient):
             "side": close_side,
             "type": "MARKET",
             "quantity": position.size,
-            "positionSide": "LONG" if position.side == Side.LONG else "SHORT",
-            "reduceOnly": "true"
+            "positionSide": "LONG" if position.side == Side.LONG else "SHORT"
+            # Note: Do NOT include reduceOnly when using positionSide (hedge mode)
         }
         
         result = await self._request("POST", "/fapi/v1/order", params)
@@ -301,6 +303,25 @@ class BinanceClient(BaseExchangeClient):
             raw_data=result
         )
     
+    async def get_all_funding_rates(self) -> List[FundingRate]:
+        """Get all funding rates for all perpetual contracts"""
+        result = await self._request("GET", "/fapi/v1/premiumIndex", {}, signed=False)
+        
+        funding_rates = []
+        for item in result:
+            symbol = item.get("symbol", "")
+            # Only include USDT perpetual contracts
+            if symbol.endswith("USDT"):
+                funding_rates.append(FundingRate(
+                    symbol=symbol,
+                    funding_rate=float(item.get("lastFundingRate", 0)),
+                    next_funding_time=datetime.fromtimestamp(item.get("nextFundingTime", 0) / 1000, tz=timezone.utc),
+                    estimated_rate=float(item.get("interestRate", 0)),
+                    raw_data=item
+                ))
+        
+        return funding_rates
+    
     async def get_mark_price(self, symbol: str) -> float:
         """Get current mark price"""
         binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
@@ -338,12 +359,26 @@ class BinanceClient(BaseExchangeClient):
             print(f"Error setting position mode: {e}")
             return False
     
-    async def get_income_history(self, income_type: str = "FUNDING_FEE", limit: int = 100) -> List[Dict]:
-        """Get income history (funding fees, etc.)"""
-        result = await self._request("GET", "/fapi/v1/income", {
+    async def get_income_history(self, income_type: str = "FUNDING_FEE", limit: int = 100, symbol: Optional[str] = None) -> List[Dict]:
+        """Get income history (funding fees, etc.)
+        
+        Args:
+            income_type: Type of income (FUNDING_FEE, REALIZED_PNL, etc.)
+            limit: Maximum number of records
+            symbol: Optional symbol filter (applied client-side)
+        """
+        params = {
             "incomeType": income_type,
             "limit": limit
-        })
+        }
+        
+        # Binance API doesn't support symbol filter, we filter client-side
+        result = await self._request("GET", "/fapi/v1/income", params)
+        
+        # If symbol filter provided, filter the results
+        if symbol:
+            binance_symbol = symbol if "USDT" in symbol and "/" not in symbol else symbol.replace('/', '')
+            result = [item for item in result if item.get('symbol') == binance_symbol]
         
         return result
     

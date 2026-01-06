@@ -81,8 +81,8 @@ class OKXClient(BaseExchangeClient):
         self,
         method: str,
         endpoint: str,
-        params: Dict = None,
-        data: Dict = None
+        params: Optional[Dict] = None,
+        data: Optional[Dict] = None
     ) -> Dict[str, Any]:
         """Make API request"""
         if self._session is None:
@@ -237,7 +237,7 @@ class OKXClient(BaseExchangeClient):
         
         # For net mode
         if reduce_only:
-            order_data["reduceOnly"] = True
+            order_data["reduceOnly"] = "true"
         else:
             # Set position side for hedge mode
             order_data["posSide"] = "long" if side == Side.LONG else "short"
@@ -281,7 +281,7 @@ class OKXClient(BaseExchangeClient):
             "ordType": "market",
             "sz": str(position.size),
             "posSide": "long" if position.side == Side.LONG else "short",
-            "reduceOnly": True
+            "reduceOnly": "true"
         }
         
         result = await self._request("POST", "/api/v5/trade/order", data=order_data)
@@ -385,6 +385,44 @@ class OKXClient(BaseExchangeClient):
         except Exception as e:
             print(f"Error setting position mode: {e}")
             return False
+    
+    async def get_income_history(self, symbol: Optional[str] = None, limit: int = 100) -> List[Dict]:
+        """Get income history (funding fees, etc.)
+        
+        Args:
+            symbol: OKX symbol (e.g., BTC-USDT-SWAP), optional
+            limit: Maximum number of records to return
+            
+        Returns:
+            List of income records with keys: symbol, income, time, type
+        """
+        params = {
+            "instType": "SWAP",
+            "type": "8",  # 8 = funding fee
+            "limit": str(limit)
+        }
+        
+        if symbol:
+            okx_symbol = symbol if "-SWAP" in symbol else get_exchange_symbol(symbol, Exchange.OKX)
+            params["instId"] = okx_symbol
+        
+        try:
+            result = await self._request("GET", "/api/v5/account/bills", params)
+            
+            # Transform to common format
+            income_list = []
+            for item in result.get("data", []):
+                income_list.append({
+                    "symbol": item.get("instId", ""),
+                    "income": float(item.get("balChg", 0)),  # Balance change (can be positive or negative)
+                    "time": int(item.get("ts", 0)),  # Timestamp in milliseconds
+                    "type": "FUNDING_FEE"
+                })
+            
+            return income_list
+        except Exception as e:
+            print(f"Error getting OKX income history: {e}")
+            return []
     
     def get_exchange_name(self) -> str:
         """Get exchange name"""

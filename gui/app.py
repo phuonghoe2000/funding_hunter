@@ -6,7 +6,7 @@ import asyncio
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import logging
 import json
@@ -87,7 +87,10 @@ class MultiExchangeManager:
         size: float,
         leverage: int
     ) -> Dict[str, Any]:
-        """Open hedged position between two exchanges"""
+        """
+        Open hedged position between two exchanges with atomic-like behavior.
+        If one exchange fails, automatically rollback the other.
+        """
         results = {"success": False, "long_order": None, "short_order": None, "error": None}
         
         if long_exchange not in self.clients or short_exchange not in self.clients:
@@ -100,29 +103,165 @@ class MultiExchangeManager:
         long_symbol = get_exchange_symbol(pair, long_exchange)
         short_symbol = get_exchange_symbol(pair, short_exchange)
         
+        # Track what we've done for rollback
+        long_order = None
+        short_order = None
+        leverage_set = False
+        
         try:
-            # Set leverage
-            await asyncio.gather(
-                long_client.set_leverage(long_symbol, leverage),
-                short_client.set_leverage(short_symbol, leverage)
-            )
+            logger.info(f"Step 1/3: Pre-flight checks for {pair}...")
             
-            # Open positions simultaneously
-            long_order, short_order = await asyncio.gather(
-                long_client.place_market_order(long_symbol, Side.LONG, size),
-                short_client.place_market_order(short_symbol, Side.SHORT, size)
-            )
+            # Pre-flight validation: Check balances
+            long_balance = await long_client.get_balance("USDT")
+            short_balance = await short_client.get_balance("USDT")
             
+            if long_balance.available < 10:  # Minimum $10 required
+                raise Exception(f"{long_exchange.value}: Insufficient balance (${long_balance.available:.2f})")
+            if short_balance.available < 10:
+                raise Exception(f"{short_exchange.value}: Insufficient balance (${short_balance.available:.2f})")
+            
+            logger.info(f"✓ Balance check passed: {long_exchange.value}=${long_balance.available:.2f}, {short_exchange.value}=${short_balance.available:.2f}")
+            
+            # Pre-flight validation: Check existing positions
+            long_pos = await long_client.get_position(long_symbol)
+            short_pos = await short_client.get_position(short_symbol)
+            
+            if long_pos and long_pos.size > 0:
+                raise Exception(f"{long_exchange.value}: Already have position for {long_symbol}")
+            if short_pos and short_pos.size > 0:
+                raise Exception(f"{short_exchange.value}: Already have position for {short_symbol}")
+            
+            logger.info(f"✓ Position check passed: No existing positions")
+            
+            # Step 1: Set leverage on both exchanges
+            logger.info(f"Step 2/3: Setting leverage to {leverage}x...")
+            try:
+                await asyncio.gather(
+                    long_client.set_leverage(long_symbol, leverage),
+                    short_client.set_leverage(short_symbol, leverage)
+                )
+                leverage_set = True
+                logger.info(f"✓ Leverage set successfully")
+            except Exception as e:
+                raise Exception(f"Failed to set leverage: {e}")
+            
+            # Step 2: Open LONG position first (safer to fail here before SHORT)
+            logger.info(f"Step 3/3: Opening positions...")
+            logger.info(f"  → Opening LONG on {long_exchange.value}...")
+            
+            try:
+                long_order = await self._place_order_with_retry(
+                    long_client, long_symbol, Side.LONG, size, long_exchange, max_retries=3
+                )
+                logger.info(f"✓ LONG order placed: {long_order.order_id}")
+            except Exception as e:
+                # LONG failed - no cleanup needed, just fail
+                raise Exception(f"LONG order failed on {long_exchange.value} after retries: {e}")
+            
+            # Step 3: Open SHORT position
+            logger.info(f"  → Opening SHORT on {short_exchange.value}...")
+            
+            try:
+                short_order = await self._place_order_with_retry(
+                    short_client, short_symbol, Side.SHORT, size, short_exchange, max_retries=3
+                )
+                logger.info(f"✓ SHORT order placed: {short_order.order_id}")
+            except Exception as e:
+                # SHORT failed but LONG succeeded - CRITICAL: Must rollback LONG!
+                logger.error(f"✗ SHORT order failed! Attempting to rollback LONG position...")
+                
+                rollback_success = await self._rollback_long_position(
+                    long_client, long_symbol, long_order, long_exchange
+                )
+                
+                if rollback_success:
+                    raise Exception(f"SHORT order failed on {short_exchange.value}, LONG position rolled back successfully: {e}")
+                else:
+                    raise Exception(f"CRITICAL: SHORT order failed AND rollback failed! You have an unhedged LONG position on {long_exchange.value}. Please close manually! Error: {e}")
+            
+            # Both orders successful
             results["success"] = True
             results["long_order"] = long_order
             results["short_order"] = short_order
+            logger.info(f"✅ Hedged position opened successfully!")
             
         except Exception as e:
             results["error"] = str(e)
-            # Cleanup
-            await self._cleanup_partial(long_exchange, short_exchange, pair)
+            logger.error(f"❌ Failed to open hedged position: {e}")
         
         return results
+    
+    async def _rollback_long_position(
+        self, 
+        client: BaseExchangeClient, 
+        symbol: str, 
+        order: Any,
+        exchange: Exchange
+    ) -> bool:
+        """
+        Rollback a LONG position by closing it immediately.
+        Returns True if successful, False otherwise.
+        """
+        try:
+            logger.warning(f"🔄 Rolling back LONG position on {exchange.value}...")
+            
+            # Wait a moment for order to settle
+            await asyncio.sleep(0.5)
+            
+            # Verify position exists
+            position = await client.get_position(symbol)
+            if not position or position.size == 0:
+                logger.warning(f"⚠️ No position found on {exchange.value}, might have been rejected")
+                return True
+            
+            # Close the position with retry
+            close_order = await self._place_order_with_retry(
+                client, symbol, Side.SHORT, position.size, exchange, max_retries=3
+            )
+            logger.info(f"✓ Rollback successful: Closed LONG position on {exchange.value} (Order: {close_order.order_id})")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"✗ Rollback failed on {exchange.value}: {e}")
+            return False
+    
+    async def _place_order_with_retry(
+        self,
+        client: BaseExchangeClient,
+        symbol: str,
+        side: Side,
+        size: float,
+        exchange: Exchange,
+        max_retries: int = 3
+    ) -> Any:
+        """
+        Place order with exponential backoff retry logic.
+        Retries up to max_retries times with increasing delays.
+        """
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    # Exponential backoff: 0.5s, 1s, 2s
+                    delay = 0.5 * (2 ** attempt)
+                    logger.info(f"  ↻ Retry {attempt}/{max_retries} after {delay}s delay...")
+                    await asyncio.sleep(delay)
+                
+                order = await client.place_market_order(symbol, side, size)
+                return order
+                
+            except Exception as e:
+                last_error = e
+                logger.warning(f"  ⚠️ Attempt {attempt + 1}/{max_retries} failed: {e}")
+                
+                if attempt == max_retries - 1:
+                    # Last attempt failed
+                    raise Exception(f"All {max_retries} attempts failed. Last error: {e}")
+        
+        # Should not reach here, but just in case
+        raise Exception(f"Order failed after {max_retries} retries: {last_error}")
     
     async def close_hedged_position(
         self,
@@ -235,6 +374,7 @@ class FundingHunterGUI:
         self.monitoring = False
         self.active_position = None  # Store active position info
         self._monitor_task = None
+        self.cached_funding_rates = {}  # Cache funding rates for quick access
         
         # Build UI
         self._create_menu()
@@ -481,9 +621,18 @@ class FundingHunterGUI:
         pair_frame.pack(fill=tk.X, pady=5)
         
         ttk.Label(pair_frame, text="Pair:").pack(side=tk.LEFT, padx=5)
-        self.pair_combo = ttk.Combobox(pair_frame, values=POPULAR_PAIRS, width=12)
+        self.pair_combo = ttk.Combobox(pair_frame, values=POPULAR_PAIRS, width=15)
         self.pair_combo.set("BTC/USDT")
         self.pair_combo.pack(side=tk.LEFT, padx=5)
+        
+        # Current price display
+        self.current_price_label = ttk.Label(pair_frame, text="", foreground="blue")
+        self.current_price_label.pack(side=tk.LEFT, padx=10)
+        
+        # Button to load all Binance pairs
+        self.load_pairs_btn = ttk.Button(pair_frame, text="📋 Load All Binance Pairs", 
+                                         command=self._load_binance_pairs, state=tk.DISABLED)
+        self.load_pairs_btn.pack(side=tk.LEFT, padx=5)
         
         ttk.Label(pair_frame, text="Leverage:").pack(side=tk.LEFT, padx=10)
         self.leverage_var = tk.StringVar(value="10")
@@ -510,6 +659,14 @@ class FundingHunterGUI:
         self.short_exchange = ttk.Combobox(ex_frame, values=exchanges, width=12, state='readonly')
         self.short_exchange.set("Binance")
         self.short_exchange.grid(row=0, column=3, padx=5, pady=5)
+        
+        # Funding rate info for selected pair
+        funding_info_frame = ttk.LabelFrame(frame, text="📊 Selected Pair Info", padding="10")
+        funding_info_frame.pack(fill=tk.X, pady=10)
+        
+        self.selected_pair_info = ttk.Label(funding_info_frame, text="Double-click a pair in Funding Rates panel to see details", 
+                                            foreground="gray", wraplength=400, justify=tk.LEFT)
+        self.selected_pair_info.pack(fill=tk.X)
         
         # Action buttons
         btn_frame = ttk.Frame(frame)
@@ -590,7 +747,7 @@ class FundingHunterGUI:
         self.pos_size_label = ttk.Label(self.position_info, text="Size: -")
         self.pos_size_label.pack(side=tk.LEFT, padx=10)
         
-        self.pos_pnl_label = ttk.Label(self.position_info, text="Total PnL: $0.00")
+        self.pos_pnl_label = ttk.Label(self.position_info, text="PnL: $0.00 | Funding: $0.00 | Total: $0.00")
         self.pos_pnl_label.pack(side=tk.LEFT, padx=10)
         
         self.pos_status_label = ttk.Label(self.position_info, text="Status: No Position")
@@ -740,6 +897,10 @@ class FundingHunterGUI:
         self.close_btn.config(state=tk.NORMAL)
         self.refresh_funding_btn.config(state=tk.NORMAL)
         
+        # Enable load pairs button if Binance is connected
+        if "Binance" in connected:
+            self.load_pairs_btn.config(state=tk.NORMAL)
+        
         # Update balances
         if Exchange.OKX in balances:
             self.okx_balance_label.config(text=f"${balances[Exchange.OKX].available:.2f}")
@@ -749,7 +910,7 @@ class FundingHunterGUI:
             self.bingx_balance_label.config(text=f"${balances[Exchange.BINGX].available:.2f}")
         
         # Update exchange dropdowns
-        available = [ex.upper() if ex != "BingX" else "BingX" for ex in connected]
+        available = connected  # Use exchange names directly from connected list
         self.long_exchange['values'] = available
         self.short_exchange['values'] = available
         if available:
@@ -765,6 +926,7 @@ class FundingHunterGUI:
         self.open_btn.config(state=tk.DISABLED)
         self.close_btn.config(state=tk.DISABLED)
         self.refresh_funding_btn.config(state=tk.DISABLED)
+        self.load_pairs_btn.config(state=tk.DISABLED)
         self.connected = False
     
     def _disconnect(self):
@@ -773,6 +935,74 @@ class FundingHunterGUI:
         self._run_async(self.manager.disconnect_all())
         self._stop_monitoring()
         self._update_ui_disconnected()
+    
+    def _load_binance_pairs(self):
+        """Load all trading pairs from Binance"""
+        if not self.connected:
+            return
+        
+        binance_client = self.manager.clients.get(Exchange.BINANCE)
+        if not binance_client:
+            messagebox.showerror("Error", "Binance is not connected")
+            return
+        
+        self._log("Loading all pairs from Binance...")
+        self.load_pairs_btn.config(state=tk.DISABLED)
+        
+        async def async_load_pairs():
+            try:
+                from exchanges.binance_client import BinanceClient
+                if not isinstance(binance_client, BinanceClient):
+                    return []
+                
+                # Get all funding rates (which includes all perpetual contracts)
+                funding_rates = await binance_client.get_all_funding_rates()
+                
+                # Convert to unified pair format
+                pairs = []
+                for rate in funding_rates:
+                    symbol = rate.symbol
+                    if symbol.endswith("USDT"):
+                        base = symbol.replace("USDT", "")
+                        pair = f"{base}/USDT"
+                        pairs.append(pair)
+                
+                # Sort alphabetically
+                pairs.sort()
+                return pairs
+                
+            except Exception as e:
+                logger.error(f"Error loading Binance pairs: {e}")
+                return []
+        
+        future = self._run_async(async_load_pairs())
+        if future:
+            future.add_done_callback(self._on_load_pairs_complete)
+    
+    def _on_load_pairs_complete(self, future):
+        """Handle load pairs complete"""
+        self.root.after(0, lambda: self.load_pairs_btn.config(state=tk.NORMAL))
+        
+        try:
+            pairs = future.result()
+            if pairs:
+                self.root.after(0, self._update_pair_dropdown, pairs)
+                self._log(f"✅ Loaded {len(pairs)} pairs from Binance")
+            else:
+                self._log("❌ No pairs loaded from Binance")
+        except Exception as e:
+            self._log(f"Error loading pairs: {e}")
+    
+    def _update_pair_dropdown(self, pairs):
+        """Update pair dropdown with new pairs"""
+        current_pair = self.pair_combo.get()
+        self.pair_combo['values'] = pairs
+        
+        # Keep current selection if it exists in new list
+        if current_pair in pairs:
+            self.pair_combo.set(current_pair)
+        elif pairs:
+            self.pair_combo.set(pairs[0])
     
     def _open_position(self):
         """Open hedged position"""
@@ -819,11 +1049,15 @@ class FundingHunterGUI:
             result = future.result()
             if result["success"]:
                 self._log("✅ Position opened successfully!")
+                from datetime import datetime
                 self.active_position = {
                     "pair": pair,
                     "long_exchange": long_ex,
                     "short_exchange": short_ex,
-                    "size": size
+                    "size": size,
+                    "open_time": datetime.now(timezone.utc),  # Track open time for funding fee calculation (must be timezone-aware)
+                    "total_funding_fees": 0.0,  # Track accumulated funding fees
+                    "last_funding_check": datetime.now(timezone.utc)  # Last time we checked funding fees
                 }
                 self.root.after(0, self._update_position_display)
                 
@@ -887,15 +1121,32 @@ class FundingHunterGUI:
                         pos['pair'], pos['long_exchange'], pos['short_exchange']
                     )
                     
-                    # Update PnL
+                    # Get unrealized PnL from positions
                     long_pnl = result['long'].unrealized_pnl if result['long'] else 0
                     short_pnl = result['short'].unrealized_pnl if result['short'] else 0
-                    total_pnl = long_pnl + short_pnl
+                    unrealized_pnl = long_pnl + short_pnl
                     
-                    self.root.after(0, lambda p=total_pnl: self.pos_pnl_label.config(
-                        text=f"Total PnL: ${p:.2f}",
-                        foreground='green' if p >= 0 else 'red'
-                    ))
+                    # Get funding fees (every 30 seconds to avoid rate limit)
+                    from datetime import timedelta
+                    now = datetime.now(timezone.utc)
+                    time_since_check = (now - pos.get('last_funding_check', now)).total_seconds()
+                    
+                    if time_since_check >= 30:  # Check funding fees every 30 seconds
+                        funding_fees = await self._get_funding_fees(pos)
+                        pos['total_funding_fees'] = funding_fees
+                        pos['last_funding_check'] = now
+                    else:
+                        funding_fees = pos.get('total_funding_fees', 0.0)
+                    
+                    # Total PnL = Unrealized PnL + Funding Fees
+                    total_pnl = unrealized_pnl + funding_fees
+                    
+                    # Update display with detailed breakdown
+                    self.root.after(0, lambda u=unrealized_pnl, f=funding_fees, t=total_pnl: 
+                        self.pos_pnl_label.config(
+                            text=f"PnL: ${u:.2f} | Funding: ${f:.2f} | Total: ${t:.2f}",
+                            foreground='green' if t >= 0 else 'red'
+                        ))
                     
                     # Check liquidation
                     if result['liquidated']:
@@ -934,6 +1185,86 @@ class FundingHunterGUI:
         """Stop monitoring"""
         self.monitoring = False
     
+    async def _get_funding_fees(self, position: Dict[str, Any]) -> float:
+        """Get total funding fees for the position from both exchanges"""
+        total_funding = 0.0
+        open_time = position.get('open_time')
+        if not open_time:
+            return 0.0
+        
+        # Convert to timestamp in milliseconds
+        start_time = int(open_time.timestamp() * 1000)
+        
+        # Get funding fees from long exchange
+        long_client = self.manager.clients.get(position['long_exchange'])
+        if long_client:
+            try:
+                symbol = get_exchange_symbol(position['pair'], position['long_exchange'])
+                
+                # Call get_income_history based on exchange type
+                from exchanges.binance_client import BinanceClient
+                from exchanges.okx_client import OKXClient
+                from exchanges.bingx_client import BingXClient
+                
+                if isinstance(long_client, BinanceClient):
+                    # Binance format: BTCUSDT
+                    binance_symbol = symbol.replace('/', '')
+                    income = await long_client.get_income_history("FUNDING_FEE", limit=100, symbol=binance_symbol)
+                    for item in income:
+                        if item.get('time', 0) >= start_time:
+                            total_funding += float(item.get('income', 0))
+                
+                elif isinstance(long_client, OKXClient):
+                    # OKX format: BTC-USDT-SWAP
+                    income = await long_client.get_income_history(symbol, limit=100)
+                    for item in income:
+                        if item.get('time', 0) >= start_time:
+                            total_funding += float(item.get('income', 0))
+                
+                elif isinstance(long_client, BingXClient):
+                    # BingX format: BTC-USDT
+                    income = await long_client.get_income_history(symbol, limit=100)
+                    for item in income:
+                        if item.get('time', 0) >= start_time:
+                            total_funding += float(item.get('income', 0))
+                            
+            except Exception as e:
+                logger.debug(f"Error getting funding from {position['long_exchange'].value}: {e}")
+        
+        # Get funding fees from short exchange
+        short_client = self.manager.clients.get(position['short_exchange'])
+        if short_client:
+            try:
+                symbol = get_exchange_symbol(position['pair'], position['short_exchange'])
+                
+                from exchanges.binance_client import BinanceClient
+                from exchanges.okx_client import OKXClient
+                from exchanges.bingx_client import BingXClient
+                
+                if isinstance(short_client, BinanceClient):
+                    binance_symbol = symbol.replace('/', '')
+                    income = await short_client.get_income_history("FUNDING_FEE", limit=100, symbol=binance_symbol)
+                    for item in income:
+                        if item.get('time', 0) >= start_time:
+                            total_funding += float(item.get('income', 0))
+                
+                elif isinstance(short_client, OKXClient):
+                    income = await short_client.get_income_history(symbol, limit=100)
+                    for item in income:
+                        if item.get('time', 0) >= start_time:
+                            total_funding += float(item.get('income', 0))
+                
+                elif isinstance(short_client, BingXClient):
+                    income = await short_client.get_income_history(symbol, limit=100)
+                    for item in income:
+                        if item.get('time', 0) >= start_time:
+                            total_funding += float(item.get('income', 0))
+                            
+            except Exception as e:
+                logger.debug(f"Error getting funding from {position['short_exchange'].value}: {e}")
+        
+        return total_funding
+    
     def _update_position_display(self):
         """Update position display"""
         if self.active_position:
@@ -950,7 +1281,7 @@ class FundingHunterGUI:
         self.pos_long_label.config(text="Long: -")
         self.pos_short_label.config(text="Short: -")
         self.pos_size_label.config(text="Size: -")
-        self.pos_pnl_label.config(text="Total PnL: $0.00", foreground='black')
+        self.pos_pnl_label.config(text="PnL: $0.00 | Funding: $0.00 | Total: $0.00", foreground='black')
         self.pos_status_label.config(text="Status: No Position", foreground='black')
     
     def _refresh_funding(self):
@@ -958,16 +1289,69 @@ class FundingHunterGUI:
         if not self.connected:
             return
         
-        self._log("Refreshing funding rates...")
+        self._log("Refreshing funding rates from all exchanges...")
         
         async def async_refresh():
             all_rates = {}
-            for pair in POPULAR_PAIRS[:5]:  # Top 5 pairs
-                try:
-                    rates = await self.manager.get_funding_rates(pair)
+            
+            # Get Binance client
+            binance_client = self.manager.clients.get(Exchange.BINANCE)
+            if not binance_client:
+                logger.error("Binance not connected. Cannot fetch funding rates.")
+                return {}
+            
+            # Get all funding rates from Binance
+            try:
+                # Import to check type
+                from exchanges.binance_client import BinanceClient
+                if not isinstance(binance_client, BinanceClient):
+                    logger.error("Invalid Binance client type")
+                    return {}
+                
+                binance_rates = await binance_client.get_all_funding_rates()
+                # Sort by funding rate (highest to lowest) and take top 15
+                binance_rates.sort(key=lambda x: abs(x.funding_rate), reverse=True)
+                top_binance_rates = binance_rates[:15]
+                
+                self._log(f"Found {len(binance_rates)} pairs on Binance, showing top 15 by funding rate")
+                
+                # For each Binance pair, get rates from other exchanges
+                for binance_rate in top_binance_rates:
+                    binance_symbol = binance_rate.symbol
+                    # Convert Binance symbol to unified pair (e.g., BTCUSDT -> BTC/USDT)
+                    base = binance_symbol.replace("USDT", "")
+                    pair = f"{base}/USDT"
+                    
+                    rates = {Exchange.BINANCE: binance_rate}
+                    
+                    # Get OKX rate
+                    okx_client = self.manager.clients.get(Exchange.OKX)
+                    if okx_client:
+                        try:
+                            from config.constants import get_exchange_symbol
+                            okx_symbol = get_exchange_symbol(pair, Exchange.OKX)
+                            okx_rate = await okx_client.get_funding_rate(okx_symbol)
+                            rates[Exchange.OKX] = okx_rate
+                        except Exception as e:
+                            logger.debug(f"OKX rate not available for {pair}: {e}")
+                    
+                    # Get BingX rate
+                    bingx_client = self.manager.clients.get(Exchange.BINGX)
+                    if bingx_client:
+                        try:
+                            from config.constants import get_exchange_symbol
+                            bingx_symbol = get_exchange_symbol(pair, Exchange.BINGX)
+                            bingx_rate = await bingx_client.get_funding_rate(bingx_symbol)
+                            rates[Exchange.BINGX] = bingx_rate
+                        except Exception as e:
+                            logger.debug(f"BingX rate not available for {pair}: {e}")
+                    
                     all_rates[pair] = rates
-                except Exception as e:
-                    logger.error(f"Error getting rates for {pair}: {e}")
+                    
+            except Exception as e:
+                logger.error(f"Error getting Binance rates: {e}")
+                return {}
+            
             return all_rates
         
         future = self._run_async(async_refresh())
@@ -983,11 +1367,25 @@ class FundingHunterGUI:
             self._log(f"Error: {e}")
     
     def _update_funding_table(self, all_rates):
-        """Update funding table"""
+        """Update funding table - sorted by Binance funding rate (highest to lowest)"""
         for item in self.funding_tree.get_children():
             self.funding_tree.delete(item)
         
-        for pair, rates in all_rates.items():
+        if not all_rates:
+            self._log("No funding rates available")
+            return
+        
+        # Cache the funding rates for later use
+        self.cached_funding_rates = all_rates
+        
+        # Sort by Binance funding rate (highest to lowest by absolute value)
+        sorted_pairs = sorted(
+            all_rates.items(),
+            key=lambda x: abs(x[1].get(Exchange.BINANCE).funding_rate) if Exchange.BINANCE in x[1] else 0,
+            reverse=True
+        )
+        
+        for pair, rates in sorted_pairs:
             okx_rate = rates.get(Exchange.OKX)
             binance_rate = rates.get(Exchange.BINANCE)
             bingx_rate = rates.get(Exchange.BINGX)
@@ -1019,29 +1417,110 @@ class FundingHunterGUI:
             self.funding_tree.insert("", tk.END, values=(
                 pair, okx_val, binance_val, bingx_val, best_spread, recommendation
             ))
+        
+        self._log(f"✅ Loaded {len(sorted_pairs)} pairs sorted by funding rate (highest to lowest)")
     
     def _on_funding_select(self, event):
-        """Handle funding row select"""
+        """Handle funding row double-click - auto select pair and exchanges"""
         selected = self.funding_tree.selection()
-        if selected:
-            item = self.funding_tree.item(selected[0])
-            values = item['values']
-            pair = values[0]
-            rec = values[5]
+        if not selected:
+            return
             
-            self.pair_combo.set(pair)
+        item = self.funding_tree.item(selected[0])
+        values = item['values']
+        pair = values[0]
+        okx_rate = values[1]
+        binance_rate = values[2]
+        bingx_rate = values[3]
+        best_spread = values[4]
+        recommendation = values[5]
+        
+        # Set the pair
+        self.pair_combo.set(pair)
+        self._log(f"📌 Selected pair: {pair}")
+        
+        # Parse and set exchanges from recommendation
+        long_display = ""
+        short_display = ""
+        if recommendation != "-":
+            # Parse recommendation like "Long okx, Short binance"
+            parts = recommendation.split(", ")
+            if len(parts) == 2:
+                long_ex = parts[0].replace("Long ", "").strip().lower()
+                short_ex = parts[1].replace("Short ", "").strip().lower()
+                
+                # Map to display names (case-insensitive)
+                name_map = {"okx": "OKX", "binance": "Binance", "bingx": "BingX"}
+                long_display = name_map.get(long_ex, long_ex.upper())
+                short_display = name_map.get(short_ex, short_ex.upper())
+                
+                self.long_exchange.set(long_display)
+                self.short_exchange.set(short_display)
+                
+                self._log(f"✅ Auto-selected: LONG on {long_display}, SHORT on {short_display}")
+        
+        # Update selected pair info panel
+        info_text = f"Pair: {pair}\n"
+        info_text += f"OKX Rate: {okx_rate}  |  Binance Rate: {binance_rate}  |  BingX Rate: {bingx_rate}\n"
+        info_text += f"Best Spread: {best_spread}\n"
+        if recommendation != "-":
+            info_text += f"Strategy: LONG on {long_display} (lower rate), SHORT on {short_display} (higher rate)"
+        
+        self.selected_pair_info.config(text=info_text, foreground="black")
+        
+        # Fetch and display current prices
+        self._update_pair_price_info(pair, recommendation)
+    
+    def _update_pair_price_info(self, pair: str, recommendation: str = ""):
+        """Fetch and display current price information for the selected pair"""
+        if not self.connected:
+            return
+        
+        async def async_get_price():
+            prices = {}
             
-            if rec != "-":
-                # Parse recommendation
-                parts = rec.split(", ")
-                if len(parts) == 2:
-                    long_ex = parts[0].replace("Long ", "").strip()
-                    short_ex = parts[1].replace("Short ", "").strip()
+            # Get price from each connected exchange
+            for exchange, client in self.manager.clients.items():
+                try:
+                    symbol = get_exchange_symbol(pair, exchange)
+                    mark_price = await client.get_mark_price(symbol)
+                    prices[exchange] = mark_price
+                except Exception as e:
+                    logger.debug(f"Could not get price from {exchange.value}: {e}")
+            
+            return prices
+        
+        def on_complete(future):
+            try:
+                prices = future.result()
+                if prices:
+                    # Display average price or price from available exchanges
+                    price_list = list(prices.values())
+                    avg_price = sum(price_list) / len(price_list)
                     
-                    # Map to display names
-                    name_map = {"okx": "OKX", "binance": "Binance", "bingx": "BingX"}
-                    self.long_exchange.set(name_map.get(long_ex, long_ex))
-                    self.short_exchange.set(name_map.get(short_ex, short_ex))
+                    # Build price info string
+                    price_info = f"💲 ${avg_price:,.2f}"
+                    
+                    # Show individual exchange prices
+                    price_details = " | ".join([f"{ex.value}: ${p:,.2f}" for ex, p in prices.items()])
+                    
+                    self.root.after(0, self._update_price_display, price_info, price_details)
+                else:
+                    self.root.after(0, self._update_price_display, "", "")
+            except Exception as e:
+                logger.error(f"Error getting prices: {e}")
+                self.root.after(0, self._update_price_display, "", "")
+        
+        future = self._run_async(async_get_price())
+        if future:
+            future.add_done_callback(on_complete)
+    
+    def _update_price_display(self, price_info: str, price_details: str):
+        """Update the price display labels"""
+        self.current_price_label.config(text=price_info)
+        if price_details:
+            self._log(f"📊 Current prices: {price_details}")
+
     
     def _log(self, message: str):
         """Log message"""

@@ -31,13 +31,19 @@ class BingXClient(BaseExchangeClient):
     
     def _sign(self, params: Dict[str, Any]) -> str:
         """Generate signature for API request"""
-        # Sort parameters alphabetically
-        sorted_params = sorted(params.items())
+        # BingX signatures are computed over the URL-encoded query string.
+        # Be defensive: never include an existing `signature` field
+        params_to_sign = {k: v for k, v in params.items() if k != "signature"}
+
+        # Convert all values to strings and sort parameters alphabetically
+        str_params = {k: str(v) for k, v in params_to_sign.items()}
+        sorted_params = sorted(str_params.items())
+
         query_string = urlencode(sorted_params)
         signature = hmac.new(
             self.secret_key.encode('utf-8'),
             query_string.encode('utf-8'),
-            hashlib.sha256
+            hashlib.sha256,
         ).hexdigest()
         return signature
     
@@ -45,7 +51,7 @@ class BingXClient(BaseExchangeClient):
         """Get headers for API request"""
         return {
             "X-BX-APIKEY": self.api_key,
-            "Content-Type": "application/json"
+            "Content-Type": "application/x-www-form-urlencoded"
         }
     
     async def connect(self) -> bool:
@@ -70,7 +76,7 @@ class BingXClient(BaseExchangeClient):
         self,
         method: str,
         endpoint: str,
-        params: Dict = None,
+        params: Optional[Dict] = None,
         signed: bool = True
     ) -> Any:
         """Make API request"""
@@ -79,40 +85,69 @@ class BingXClient(BaseExchangeClient):
         
         url = f"{self.base_url}{endpoint}"
         params = params or {}
+        signature = None
         
         if signed:
+            # Add timestamp
             params["timestamp"] = self._get_timestamp()
-            params["signature"] = self._sign(params)
+
+            # Generate signature from params (without signature)
+            signature = self._sign(params)
+
+            # Build parameter string (same order as signed string)
+            params_without_sig = {k: v for k, v in params.items() if k != "signature"}
+            query_string = urlencode(sorted((k, str(v)) for k, v in params_without_sig.items()))
+            # Append signature at the end
+            param_string = f"{query_string}&signature={signature}"
+        else:
+            # For unsigned requests, just encode all params
+            param_string = urlencode(sorted((k, str(v)) for k, v in params.items()))
         
         headers = self._get_headers()
+        
+        # BingX uses different methods for different endpoints:
+        # - GET requests: parameters in query string
+        # - POST requests: parameters in query string (NOT form body or JSON)
+        # This is consistent across their API
+        full_url = f"{url}?{param_string}"
         
         # Debug: Print request details
         if self.debug:
             print(f"\n{'='*60}")
             print(f"[BINGX REQUEST]")
             print(f"  Method: {method}")
-            print(f"  URL: {url}")
-            print(f"  Params: {json.dumps({k: v for k, v in params.items() if k != 'signature'}, indent=2)}")
+            print(f"  Base URL: {url}")
+            print(f"  Param String: {param_string}")
+            print(f"  Full URL: {full_url}")
+
+            if signed and signature:
+                params_without_sig = {k: v for k, v in params.items() if k != "signature"}
+                string_to_sign = urlencode(sorted((k, str(v)) for k, v in params_without_sig.items()))
+                print(f"  StringToSign: {string_to_sign}")
+                print(f"  Params: {json.dumps(params_without_sig, indent=2)}")
+                print(f"  Signature: {signature[:16]}...")
             print(f"  Headers: X-BX-APIKEY: {self.api_key[:8]}...")
         
-        if method == "GET":
-            async with self._session.get(url, headers=headers, params=params) as response:
+        # Send request with full URL (no params argument to avoid re-encoding)
+        try:
+            async with self._session.request(method, full_url, headers=headers) as response:
                 result = await response.json()
-        else:
-            async with self._session.request(method, url, headers=headers, params=params) as response:
-                result = await response.json()
-        
-        # Debug: Print response
-        if self.debug:
-            print(f"[BINGX RESPONSE]")
-            print(f"  Status: {response.status}")
-            print(f"  Data: {json.dumps(result, indent=2)[:1000]}")
-            print(f"{'='*60}\n")
+                
+                # Debug: Print response
+                if self.debug:
+                    print(f"[BINGX RESPONSE]")
+                    print(f"  Status: {response.status}")
+                    print(f"  Data: {json.dumps(result, indent=2)[:1000]}")
+                    print(f"{'='*60}\n")
+        except Exception as e:
+            print(f"Request error: {e}")
+            raise
         
         if isinstance(result, dict) and result.get("code") and result.get("code") != 0:
             raise Exception(f"BingX API Error: {result.get('msg', 'Unknown error')} (code: {result.get('code')})")
         
         return result
+
     
     async def get_balance(self, currency: str = "USDT") -> Balance:
         """Get account balance"""
@@ -145,11 +180,15 @@ class BingXClient(BaseExchangeClient):
                     if pos_amt == 0:
                         continue
                     
+                    # BingX returns positionSide: "LONG" or "SHORT" in hedge mode
                     pos_side = pos_data.get("positionSide", "")
-                    if pos_side == "LONG" or pos_amt > 0:
+                    if pos_side == "LONG":
                         side = Side.LONG
-                    else:
+                    elif pos_side == "SHORT":
                         side = Side.SHORT
+                    else:
+                        # Fallback: use positionAmt sign (for one-way mode)
+                        side = Side.LONG if pos_amt > 0 else Side.SHORT
                     
                     return Position(
                         symbol=bingx_symbol,
@@ -179,11 +218,15 @@ class BingXClient(BaseExchangeClient):
                 if pos_amt == 0:
                     continue
                 
+                # BingX returns positionSide: "LONG" or "SHORT" in hedge mode
                 pos_side = pos_data.get("positionSide", "")
-                if pos_side == "LONG" or pos_amt > 0:
+                if pos_side == "LONG":
                     side = Side.LONG
-                else:
+                elif pos_side == "SHORT":
                     side = Side.SHORT
+                else:
+                    # Fallback: use positionAmt sign (for one-way mode)
+                    side = Side.LONG if pos_amt > 0 else Side.SHORT
                 
                 positions.append(Position(
                     symbol=pos_data["symbol"],
@@ -211,11 +254,12 @@ class BingXClient(BaseExchangeClient):
         """Place a market order"""
         bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
         
+        # BingX expects quantity as a string to avoid floating point precision issues
         params = {
             "symbol": bingx_symbol,
             "side": "BUY" if side == Side.LONG else "SELL",
             "type": "MARKET",
-            "quantity": size,
+            "quantity": str(size),
             "positionSide": "LONG" if side == Side.LONG else "SHORT"
         }
         
@@ -253,15 +297,19 @@ class BingXClient(BaseExchangeClient):
         if not position:
             raise Exception(f"No position found for {bingx_symbol}")
         
-        # Close by placing opposite order
+        # Close by placing opposite order with closePosition flag
+        # For BingX: to close a LONG position, we SELL with positionSide=LONG
+        # For closing, the side is opposite but positionSide stays the same
         close_side = "SELL" if position.side == Side.LONG else "BUY"
         
+        # BingX expects quantity as a string to avoid floating point precision issues
         params = {
             "symbol": bingx_symbol,
             "side": close_side,
             "type": "MARKET",
-            "quantity": position.size,
-            "positionSide": "LONG" if position.side == Side.LONG else "SHORT"
+            "quantity": str(position.size),
+            "positionSide": "LONG" if position.side == Side.LONG else "SHORT",
+            "closePosition": "true"  # BingX parameter to close position
         }
         
         result = await self._request("POST", "/openApi/swap/v2/trade/order", params)
@@ -292,9 +340,10 @@ class BingXClient(BaseExchangeClient):
         # Set for both long and short
         for pos_side in ["LONG", "SHORT"]:
             try:
+                # BingX expects leverage as string
                 await self._request("POST", "/openApi/swap/v2/trade/leverage", {
                     "symbol": bingx_symbol,
-                    "leverage": leverage,
+                    "leverage": str(leverage),
                     "side": pos_side
                 })
             except Exception as e:
@@ -369,6 +418,47 @@ class BingXClient(BaseExchangeClient):
                 return True
             print(f"Error setting position mode: {e}")
             return False
+    
+    async def get_income_history(self, symbol: Optional[str] = None, limit: int = 100) -> List[Dict]:
+        """Get income history (funding fees, etc.)
+        
+        Args:
+            symbol: BingX symbol (e.g., BTC-USDT), optional
+            limit: Maximum number of records to return
+            
+        Returns:
+            List of income records with keys: symbol, income, time, type
+        """
+        params = {
+            "incomeType": "FUNDING_FEE",
+            "limit": str(limit)
+        }
+        
+        if symbol:
+            bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
+            params["symbol"] = bingx_symbol
+        
+        try:
+            result = await self._request("GET", "/openApi/swap/v2/user/income", params)
+            
+            # Transform to common format
+            income_list = []
+            if result.get("code") == 0 and result.get("data"):
+                # BingX returns data as a direct array, not nested in "incomes"
+                data = result.get("data", [])
+                if isinstance(data, list):
+                    for item in data:
+                        income_list.append({
+                            "symbol": item.get("symbol", ""),
+                            "income": float(item.get("income", 0)),
+                            "time": int(item.get("time", 0)),  # Timestamp in milliseconds
+                            "type": "FUNDING_FEE"
+                        })
+            
+            return income_list
+        except Exception as e:
+            print(f"Error getting BingX income history: {e}")
+            return []
     
     def get_exchange_name(self) -> str:
         """Get exchange name"""
