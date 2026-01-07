@@ -13,6 +13,7 @@ from typing import Optional, Dict, Any, List
 import logging
 import json
 import os
+import sys
 
 from config.settings import settings
 from config.constants import POPULAR_PAIRS, Side, Exchange, get_exchange_symbol
@@ -23,7 +24,14 @@ from exchanges.base import BaseExchangeClient, FundingRate
 logger = logging.getLogger(__name__)
 
 # Config file path
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "user_config_lite.json")
+def _get_base_dir() -> str:
+    """Return the directory for persistent files (works when frozen)."""
+    if getattr(sys, "frozen", False):  # PyInstaller onefile/onedir
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(__file__))
+
+
+CONFIG_FILE = os.path.join(_get_base_dir(), "user_config_lite.json")
 
 
 class MultiExchangeManager:
