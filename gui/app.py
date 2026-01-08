@@ -151,7 +151,7 @@ class MultiExchangeManager:
             
             try:
                 long_order = await self._place_order_with_retry(
-                    long_client, long_symbol, Side.LONG, size, long_exchange, max_retries=3
+                    long_client, long_symbol, Side.LONG, size, long_exchange, max_retries=1
                 )
                 logger.info(f"✓ LONG order placed: {long_order.order_id}")
             except Exception as e:
@@ -163,7 +163,7 @@ class MultiExchangeManager:
             
             try:
                 short_order = await self._place_order_with_retry(
-                    short_client, short_symbol, Side.SHORT, size, short_exchange, max_retries=3
+                    short_client, short_symbol, Side.SHORT, size, short_exchange, max_retries=1
                 )
                 logger.info(f"✓ SHORT order placed: {short_order.order_id}")
             except Exception as e:
@@ -216,7 +216,7 @@ class MultiExchangeManager:
             
             # Close the position with retry
             close_order = await self._place_order_with_retry(
-                client, symbol, Side.SHORT, position.size, exchange, max_retries=3
+                client, symbol, Side.SHORT, position.size, exchange, max_retries=1
             )
             logger.info(f"✓ Rollback successful: Closed LONG position on {exchange.value} (Order: {close_order.order_id})")
             
@@ -233,11 +233,11 @@ class MultiExchangeManager:
         side: Side,
         size: float,
         exchange: Exchange,
-        max_retries: int = 3
+        max_retries: int = 1
     ) -> Any:
         """
-        Place order with exponential backoff retry logic.
-        Retries up to max_retries times with increasing delays.
+        Place order with single attempt (no retries by default for speed).
+        Can optionally retry if max_retries > 1.
         """
         last_error = None
         
@@ -375,6 +375,16 @@ class FundingHunterGUI:
         self.active_position = None  # Store active position info
         self._monitor_task = None
         self.cached_funding_rates = {}  # Cache funding rates for quick access
+        
+        # Auto trading state
+        self.auto_trading_active = False
+        self.auto_trade_check_task = None
+        self.last_auto_trade_check = None
+        
+        # Price spread waiting state (for manual open position)
+        self.waiting_for_price_spread = False
+        self.price_spread_check_task = None
+        self.price_spread_params = None  # Store params: pair, long_ex, short_ex, size, leverage
         
         # Build UI
         self._create_menu()
@@ -612,9 +622,41 @@ class FundingHunterGUI:
         self.bingx_balance_label.pack(side=tk.LEFT, padx=5)
     
     def _create_trading_frame(self, parent):
-        """Create trading panel"""
-        frame = ttk.LabelFrame(parent, text="📊 Trading Panel", padding="10")
-        frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        """Create trading panel with scrollbar"""
+        # Outer frame
+        outer_frame = ttk.LabelFrame(parent, text="📊 Trading Panel", padding="5")
+        outer_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        
+        # Create canvas and scrollbar
+        canvas = tk.Canvas(outer_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer_frame, orient="vertical", command=canvas.yview)
+        
+        # Scrollable frame inside canvas
+        frame = ttk.Frame(canvas)
+        frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack canvas and scrollbar
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Enable mousewheel scrolling only when mouse is over the canvas
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        def _bind_mousewheel(event):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        def _unbind_mousewheel(event):
+            canvas.unbind_all("<MouseWheel>")
+        
+        canvas.bind("<Enter>", _bind_mousewheel)
+        canvas.bind("<Leave>", _unbind_mousewheel)
         
         # Trading pair
         pair_frame = ttk.Frame(frame)
@@ -692,9 +734,72 @@ class FundingHunterGUI:
         ttk.Checkbutton(option_frame, text="Auto-close other side on liquidation", 
                        variable=self.auto_close_var).pack(anchor=tk.W)
         
+        self.auto_close_reversal_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(option_frame, text="Auto-close on funding reversal", 
+                       variable=self.auto_close_reversal_var).pack(anchor=tk.W, pady=2)
+        
         self.monitor_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(option_frame, text="Monitor positions (check every 2s)", 
                        variable=self.monitor_var).pack(anchor=tk.W)
+        
+        # Threshold settings
+        threshold_frame = ttk.Frame(option_frame)
+        threshold_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(threshold_frame, text="Price Spread Min:").pack(side=tk.LEFT)
+        self.price_spread_threshold = ttk.Entry(threshold_frame, width=8)
+        self.price_spread_threshold.insert(0, "0.05")  # 0.05% = 5 basis points
+        self.price_spread_threshold.pack(side=tk.LEFT, padx=3)
+        ttk.Label(threshold_frame, text="%").pack(side=tk.LEFT, padx=(0,10))
+        
+        ttk.Label(threshold_frame, text="Funding Spread Min:").pack(side=tk.LEFT, padx=(10,0))
+        self.min_spread_threshold = ttk.Entry(threshold_frame, width=8)
+        self.min_spread_threshold.insert(0, "0.01")  # 0.01% = 1 basis point
+        self.min_spread_threshold.pack(side=tk.LEFT, padx=3)
+        ttk.Label(threshold_frame, text="%").pack(side=tk.LEFT)
+        
+        # Auto Trading section - COMPACT DESIGN
+        auto_trade_frame = ttk.LabelFrame(option_frame, text="🤖 Auto Trading", padding="3")
+        auto_trade_frame.pack(fill=tk.X, pady=5)
+        
+        # Row 1: All settings in one line
+        settings_row = ttk.Frame(auto_trade_frame)
+        settings_row.pack(fill=tk.X, pady=2)
+        
+        ttk.Label(settings_row, text="Vol:").pack(side=tk.LEFT, padx=2)
+        self.auto_volume_entry = ttk.Entry(settings_row, width=6)
+        self.auto_volume_entry.insert(0, "100")
+        self.auto_volume_entry.pack(side=tk.LEFT, padx=1)
+        ttk.Label(settings_row, text="USDT").pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(settings_row, text="Lev:").pack(side=tk.LEFT, padx=(5,2))
+        self.auto_leverage_entry = ttk.Entry(settings_row, width=4)
+        self.auto_leverage_entry.insert(0, "10")
+        self.auto_leverage_entry.pack(side=tk.LEFT, padx=1)
+        ttk.Label(settings_row, text="x").pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(settings_row, text="MinSpread:").pack(side=tk.LEFT, padx=(5,2))
+        self.auto_min_spread_entry = ttk.Entry(settings_row, width=5)
+        self.auto_min_spread_entry.insert(0, "0.02")
+        self.auto_min_spread_entry.pack(side=tk.LEFT, padx=1)
+        ttk.Label(settings_row, text="%").pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(settings_row, text="MaxHrs:").pack(side=tk.LEFT, padx=(5,2))
+        self.auto_max_hours_entry = ttk.Entry(settings_row, width=3)
+        self.auto_max_hours_entry.insert(0, "2")
+        self.auto_max_hours_entry.pack(side=tk.LEFT, padx=1)
+        ttk.Label(settings_row, text="h").pack(side=tk.LEFT, padx=2)
+        
+        # Row 2: Button and Status
+        control_row = ttk.Frame(auto_trade_frame)
+        control_row.pack(fill=tk.X, pady=2)
+        
+        self.auto_trade_btn = ttk.Button(control_row, text="🚀 Start", 
+                                         command=self._toggle_auto_trading, state=tk.DISABLED, width=12)
+        self.auto_trade_btn.pack(side=tk.LEFT, padx=2)
+        
+        self.auto_trade_status = ttk.Label(control_row, text="Stopped", foreground="gray", font=('Arial', 8))
+        self.auto_trade_status.pack(side=tk.LEFT, padx=5)
     
     def _create_funding_frame(self, parent):
         """Create funding rates panel"""
@@ -900,6 +1005,7 @@ class FundingHunterGUI:
         self.open_btn.config(state=tk.NORMAL)
         self.close_btn.config(state=tk.NORMAL)
         self.refresh_funding_btn.config(state=tk.NORMAL)
+        self.auto_trade_btn.config(state=tk.NORMAL)
         
         # Enable load pairs button if Binance is connected
         if "Binance" in connected:
@@ -931,6 +1037,7 @@ class FundingHunterGUI:
         self.close_btn.config(state=tk.DISABLED)
         self.refresh_funding_btn.config(state=tk.DISABLED)
         self.load_pairs_btn.config(state=tk.DISABLED)
+        self.auto_trade_btn.config(state=tk.DISABLED)
         self.connected = False
     
     def _disconnect(self):
@@ -1009,8 +1116,13 @@ class FundingHunterGUI:
             self.pair_combo.set(pairs[0])
     
     def _open_position(self):
-        """Open hedged position"""
+        """Open hedged position - starts monitoring price spread and auto-opens when threshold met"""
         if not self.connected:
+            return
+        
+        # If already waiting, this is a CANCEL action
+        if self.waiting_for_price_spread:
+            self._cancel_price_spread_wait()
             return
         
         pair = self.pair_combo.get()
@@ -1024,26 +1136,196 @@ class FundingHunterGUI:
         try:
             size = float(self.size_entry.get())
             leverage = int(self.leverage_var.get())
+            price_spread_min = float(self.price_spread_threshold.get())
         except ValueError:
-            messagebox.showerror("Error", "Invalid size or leverage")
+            messagebox.showerror("Error", "Invalid size, leverage, or price spread threshold")
             return
         
         long_ex = self._get_exchange_enum(long_ex_name)
         short_ex = self._get_exchange_enum(short_ex_name)
         
-        # Debug: Check connected exchanges
-        self._log(f"Connected exchanges: {[e.value for e in self.manager.clients.keys()]}")
-        self._log(f"Long exchange: {long_ex.value}, Short exchange: {short_ex.value}")
+        # Store parameters for continuous checking
+        self.price_spread_params = {
+            "pair": pair,
+            "long_ex": long_ex,
+            "short_ex": short_ex,
+            "long_ex_name": long_ex_name,
+            "short_ex_name": short_ex_name,
+            "size": size,
+            "leverage": leverage,
+            "price_spread_min": price_spread_min
+        }
         
-        self._log(f"Opening: {pair} | Long {long_ex_name} | Short {short_ex_name} | Size: {size}")
-        self.open_btn.config(state=tk.DISABLED)
+        # Start waiting mode
+        self.waiting_for_price_spread = True
+        self.open_btn.configure(text="🛑 Cancel")
+        self._log(f"⏳ Waiting for price spread >= {price_spread_min}% on {pair}...")
+        self._log(f"   Checking every 2 seconds. Click 'Cancel' to stop.")
         
-        async def async_open():
-            return await self.manager.open_hedged_position(pair, long_ex, short_ex, size, leverage)
+        # Start price spread monitoring loop
+        self._check_price_spread_and_open()
+    
+    def _cancel_price_spread_wait(self):
+        """Cancel waiting for price spread"""
+        self.waiting_for_price_spread = False
+        if self.price_spread_check_task:
+            self.root.after_cancel(self.price_spread_check_task)
+            self.price_spread_check_task = None
+        self.price_spread_params = None
+        self.open_btn.configure(text="Open Position", state=tk.NORMAL)
+        self._log("🛑 Cancelled waiting for price spread")
+    
+    def _check_price_spread_and_open(self):
+        """Check price spread and open position if threshold met"""
+        if not self.waiting_for_price_spread or not self.price_spread_params:
+            return
         
-        future = self._run_async(async_open())
+        params = self.price_spread_params
+        
+        async def check_and_open():
+            try:
+                # Get current prices from both exchanges
+                long_client = self.manager.clients.get(params["long_ex"])
+                short_client = self.manager.clients.get(params["short_ex"])
+                
+                if not long_client or not short_client:
+                    self._log("❌ Exchange clients not available")
+                    return {"success": False, "error": "Exchange clients not available"}
+                
+                long_symbol = get_exchange_symbol(params["pair"], params["long_ex"])
+                short_symbol = get_exchange_symbol(params["pair"], params["short_ex"])
+                
+                long_price = await long_client.get_mark_price(long_symbol)
+                short_price = await short_client.get_mark_price(short_symbol)
+                
+                # Calculate price spread percentage
+                price_diff = abs(short_price - long_price)
+                avg_price = (long_price + short_price) / 2
+                price_spread_pct = (price_diff / avg_price) * 100
+                
+                self._log(f"📊 Price spread: {price_spread_pct:.4f}% (threshold: {params['price_spread_min']}%) | LONG: ${long_price:,.6f} | SHORT: ${short_price:,.6f}")
+                
+                # Check if spread meets minimum threshold
+                if price_spread_pct < params["price_spread_min"]:
+                    # Not ready yet, check again in 2 seconds
+                    return {"success": False, "waiting": True}
+                
+                # Price spread is good, proceed to open position!
+                self._log(f"✅ Price spread threshold met! Opening position now...")
+                self._log(f"Opening: {params['pair']} | Long {params['long_ex_name']} | Short {params['short_ex_name']} | Size: {params['size']}")
+                
+                result = await self.manager.open_hedged_position(
+                    params["pair"], 
+                    params["long_ex"], 
+                    params["short_ex"], 
+                    params["size"], 
+                    params["leverage"]
+                )
+                
+                return result
+                
+            except Exception as e:
+                self._log(f"❌ Error: {e}")
+                return {"success": False, "error": str(e)}
+        
+        future = self._run_async(check_and_open())
         if future:
-            future.add_done_callback(lambda f: self._on_open_complete(f, pair, long_ex, short_ex, size))
+            future.add_done_callback(lambda f: self._on_price_spread_check_complete(f))
+    
+    def _on_price_spread_check_complete(self, future):
+        """Handle price spread check result"""
+        try:
+            result = future.result()
+            
+            # Check if just waiting (spread not met yet)
+            if not result.get("success") and result.get("waiting"):
+                # Schedule next check in 2 seconds
+                if self.waiting_for_price_spread:
+                    self.price_spread_check_task = self.root.after(2000, self._check_price_spread_and_open)
+                return
+            
+            # Either success or error - stop waiting mode
+            self.waiting_for_price_spread = False
+            self.open_btn.configure(text="Open Position", state=tk.NORMAL)
+            
+            if result.get("success"):
+                # Position opened successfully!
+                params = self.price_spread_params
+                if not params:
+                    return
+                    
+                self._log("✅ Position opened successfully!")
+                
+                # Get initial funding rates and setup position tracking
+                self._setup_position_tracking(
+                    params["pair"], 
+                    params["long_ex"], 
+                    params["short_ex"], 
+                    params["size"]
+                )
+                
+                # Start monitoring
+                if not self.monitoring:
+                    self._start_monitoring()
+                
+            else:
+                # Error occurred
+                error_msg = result.get("error", "Unknown error")
+                self._log(f"❌ Failed to open position: {error_msg}")
+                messagebox.showerror("Error", f"Failed to open position:\n{error_msg}")
+            
+        except Exception as e:
+            self.waiting_for_price_spread = False
+            self.open_btn.configure(text="Open Position", state=tk.NORMAL)
+            self._log(f"❌ Error: {e}")
+            messagebox.showerror("Error", str(e))
+    
+    def _setup_position_tracking(self, pair, long_ex, short_ex, size):
+        """Setup position tracking after successful open"""
+        async def get_initial_funding():
+            rates = {}
+            for ex in [long_ex, short_ex]:
+                client = self.manager.clients.get(ex)
+                if client:
+                    try:
+                        symbol = get_exchange_symbol(pair, ex)
+                        funding_rate = await client.get_funding_rate(symbol)
+                        rates[ex] = funding_rate.funding_rate
+                    except Exception as e:
+                        logger.debug(f"Could not get funding rate from {ex.value}: {e}")
+            return rates
+        
+        def on_funding_fetched(fut):
+            try:
+                initial_rates = fut.result()
+                long_rate = initial_rates.get(long_ex, 0)
+                short_rate = initial_rates.get(short_ex, 0)
+                initial_net_funding = short_rate - long_rate
+                
+                from datetime import datetime
+                self.active_position = {
+                    "pair": pair,
+                    "long_exchange": long_ex,
+                    "short_exchange": short_ex,
+                    "size": size,
+                    "open_time": datetime.now(timezone.utc),
+                    "total_funding_fees": 0.0,
+                    "last_funding_check": datetime.now(timezone.utc),
+                    # Funding reversal tracking
+                    "initial_long_rate": long_rate,
+                    "initial_short_rate": short_rate,
+                    "initial_net_funding": initial_net_funding,
+                }
+                
+                self._log(f"📊 Initial Funding - LONG: {long_rate*100:.6f}%, SHORT: {short_rate*100:.6f}%, Net: {initial_net_funding*100:.6f}%")
+                self._update_position_display()
+                
+            except Exception as e:
+                logger.error(f"Error fetching initial funding: {e}")
+        
+        future = self._run_async(get_initial_funding())
+        if future:
+            future.add_done_callback(on_funding_fetched)
     
     def _on_open_complete(self, future, pair, long_ex, short_ex, size):
         """Handle open complete"""
@@ -1053,21 +1335,75 @@ class FundingHunterGUI:
             result = future.result()
             if result["success"]:
                 self._log("✅ Position opened successfully!")
-                from datetime import datetime
-                self.active_position = {
-                    "pair": pair,
-                    "long_exchange": long_ex,
-                    "short_exchange": short_ex,
-                    "size": size,
-                    "open_time": datetime.now(timezone.utc),  # Track open time for funding fee calculation (must be timezone-aware)
-                    "total_funding_fees": 0.0,  # Track accumulated funding fees
-                    "last_funding_check": datetime.now(timezone.utc)  # Last time we checked funding fees
-                }
-                self.root.after(0, self._update_position_display)
                 
-                # Start monitoring
-                if self.monitor_var.get():
-                    self._start_monitoring()
+                # Get initial funding rates
+                async def get_initial_funding():
+                    rates = {}
+                    for ex in [long_ex, short_ex]:
+                        client = self.manager.clients.get(ex)
+                        if client:
+                            try:
+                                symbol = get_exchange_symbol(pair, ex)
+                                funding_rate = await client.get_funding_rate(symbol)
+                                rates[ex] = funding_rate.funding_rate
+                            except Exception as e:
+                                logger.debug(f"Could not get funding rate from {ex.value}: {e}")
+                    return rates
+                
+                def on_funding_fetched(fut):
+                    try:
+                        initial_rates = fut.result()
+                        long_rate = initial_rates.get(long_ex, 0)
+                        short_rate = initial_rates.get(short_ex, 0)
+                        initial_net_funding = short_rate - long_rate
+                        
+                        from datetime import datetime
+                        self.active_position = {
+                            "pair": pair,
+                            "long_exchange": long_ex,
+                            "short_exchange": short_ex,
+                            "size": size,
+                            "open_time": datetime.now(timezone.utc),
+                            "total_funding_fees": 0.0,
+                            "last_funding_check": datetime.now(timezone.utc),
+                            # Funding reversal tracking
+                            "initial_long_rate": long_rate,
+                            "initial_short_rate": short_rate,
+                            "initial_net_funding": initial_net_funding,
+                        }
+                        
+                        self._log(f"📊 Initial Funding - LONG: {long_rate*100:.6f}%, SHORT: {short_rate*100:.6f}%, Net: {initial_net_funding*100:.6f}%")
+                        self.root.after(0, self._update_position_display)
+                        
+                        # Start monitoring
+                        if self.monitor_var.get():
+                            self._start_monitoring()
+                            
+                    except Exception as e:
+                        logger.error(f"Error tracking initial funding: {e}")
+                
+                # Fetch initial funding rates
+                funding_future = self._run_async(get_initial_funding())
+                if funding_future:
+                    funding_future.add_done_callback(on_funding_fetched)
+                else:
+                    # Fallback if async fails
+                    from datetime import datetime
+                    self.active_position = {
+                        "pair": pair,
+                        "long_exchange": long_ex,
+                        "short_exchange": short_ex,
+                        "size": size,
+                        "open_time": datetime.now(timezone.utc),
+                        "total_funding_fees": 0.0,
+                        "last_funding_check": datetime.now(timezone.utc),
+                        "initial_long_rate": 0,
+                        "initial_short_rate": 0,
+                        "initial_net_funding": 0,
+                    }
+                    self.root.after(0, self._update_position_display)
+                    if self.monitor_var.get():
+                        self._start_monitoring()
             else:
                 self._log(f"❌ Failed: {result['error']}")
                 messagebox.showerror("Error", result['error'])
@@ -1104,6 +1440,10 @@ class FundingHunterGUI:
                 self._stop_monitoring()
                 self.active_position = None
                 self.root.after(0, self._clear_position_display)
+                
+                # If auto trading is enabled, it will resume scanning
+                if self.auto_trading_active:
+                    self._log(f"🤖 Auto Trading: Resuming signal scanning...")
             else:
                 self._log(f"❌ Close failed: {result['error']}")
         except Exception as e:
@@ -1175,7 +1515,46 @@ class FundingHunterGUI:
                         self.monitoring = False
                         self.active_position = None
                         self.root.after(0, self._clear_position_display)
+                        
+                        # If auto trading is enabled, it will resume scanning
+                        if self.auto_trading_active:
+                            self._log(f"🤖 Auto Trading: Resuming signal scanning after liquidation...")
+                        
                         break
+                    
+                    # Check funding reversal (if enabled)
+                    if self.auto_close_reversal_var.get() and 'initial_net_funding' in pos:
+                        should_close, reason = await self._check_funding_reversal(pos)
+                        if should_close:
+                            self._log(f"🔄 Funding reversal detected: {reason}")
+                            self._log(f"🔄 Auto-closing position...")
+                            
+                            # Close position
+                            try:
+                                close_result = await self.manager.close_hedged_position(
+                                    pos['pair'], pos['long_exchange'], pos['short_exchange']
+                                )
+                                
+                                if close_result["success"]:
+                                    self._log(f"✅ Position auto-closed due to: {reason}")
+                                    self.root.after(0, lambda r=reason: messagebox.showinfo(
+                                        "Auto-Close", 
+                                        f"Position closed:\n{r}"
+                                    ))
+                                    
+                                    # If auto trading is enabled, it will resume scanning
+                                    if self.auto_trading_active:
+                                        self._log(f"🤖 Auto Trading: Resuming signal scanning...")
+                                else:
+                                    self._log(f"❌ Auto-close failed: {close_result['error']}")
+                                    
+                            except Exception as e:
+                                self._log(f"❌ Auto-close error: {e}")
+                            
+                            self.monitoring = False
+                            self.active_position = None
+                            self.root.after(0, self._clear_position_display)
+                            break
                     
                     await asyncio.sleep(2)
                     
@@ -1188,6 +1567,94 @@ class FundingHunterGUI:
     def _stop_monitoring(self):
         """Stop monitoring"""
         self.monitoring = False
+    
+    async def _check_funding_reversal(self, position: Dict[str, Any]) -> tuple[bool, str]:
+        """
+        Check if funding rate has reversed and position should be closed
+        Returns: (should_close: bool, reason: str)
+        """
+        try:
+            # Get threshold setting
+            try:
+                min_threshold = float(self.min_spread_threshold.get()) / 100  # Convert % to decimal
+            except:
+                min_threshold = 0.0001  # Default 0.01%
+            
+            # Get initial funding data
+            initial_net_funding = position.get('initial_net_funding', 0)
+            initial_long_rate = position.get('initial_long_rate', 0)
+            initial_short_rate = position.get('initial_short_rate', 0)
+            
+            # Get current funding rates
+            long_ex = position['long_exchange']
+            short_ex = position['short_exchange']
+            pair = position['pair']
+            
+            current_rates = {}
+            for ex in [long_ex, short_ex]:
+                client = self.manager.clients.get(ex)
+                if client:
+                    try:
+                        symbol = get_exchange_symbol(pair, ex)
+                        funding_rate_obj = await client.get_funding_rate(symbol)
+                        current_rates[ex] = funding_rate_obj.funding_rate
+                    except Exception as e:
+                        logger.debug(f"Could not get funding rate from {ex.value}: {e}")
+                        return False, ""
+            
+            if len(current_rates) < 2:
+                return False, ""
+            
+            current_long_rate = current_rates.get(long_ex, 0)
+            current_short_rate = current_rates.get(short_ex, 0)
+            current_net_funding = current_short_rate - current_long_rate
+            
+            # Log current vs initial
+            logger.debug(f"Funding check - Initial: {initial_net_funding*100:.6f}%, Current: {current_net_funding*100:.6f}%")
+            
+            # Check 1: Direction reversal (sign change)
+            if initial_net_funding != 0 and (initial_net_funding * current_net_funding) < 0:
+                reason = (
+                    f"Funding direction reversed\n"
+                    f"Initial: {initial_net_funding*100:.6f}% "
+                    f"({'positive' if initial_net_funding > 0 else 'negative'})\n"
+                    f"Current: {current_net_funding*100:.6f}% "
+                    f"({'positive' if current_net_funding > 0 else 'negative'})\n"
+                    f"LONG {long_ex.value}: {initial_long_rate*100:.6f}% → {current_long_rate*100:.6f}%\n"
+                    f"SHORT {short_ex.value}: {initial_short_rate*100:.6f}% → {current_short_rate*100:.6f}%"
+                )
+                return True, reason
+            
+            # Check 2: Spread too low (below threshold)
+            if abs(current_net_funding) < min_threshold:
+                reason = (
+                    f"Spread dropped below threshold\n"
+                    f"Current spread: {abs(current_net_funding)*100:.6f}%\n"
+                    f"Threshold: {min_threshold*100:.6f}%\n"
+                    f"Initial spread: {abs(initial_net_funding)*100:.6f}%\n"
+                    f"LONG {long_ex.value}: {current_long_rate*100:.6f}%\n"
+                    f"SHORT {short_ex.value}: {current_short_rate*100:.6f}%"
+                )
+                return True, reason
+            
+            # Check 3: Spread dropped significantly (>70% reduction)
+            if abs(initial_net_funding) > 0:
+                spread_reduction = 1 - (abs(current_net_funding) / abs(initial_net_funding))
+                if spread_reduction > 0.70:  # 70% drop
+                    reason = (
+                        f"Spread dropped by {spread_reduction*100:.1f}%\n"
+                        f"Initial: {abs(initial_net_funding)*100:.6f}%\n"
+                        f"Current: {abs(current_net_funding)*100:.6f}%\n"
+                        f"LONG {long_ex.value}: {initial_long_rate*100:.6f}% → {current_long_rate*100:.6f}%\n"
+                        f"SHORT {short_ex.value}: {initial_short_rate*100:.6f}% → {current_short_rate*100:.6f}%"
+                    )
+                    return True, reason
+            
+            return False, ""
+            
+        except Exception as e:
+            logger.error(f"Error checking funding reversal: {e}")
+            return False, ""
     
     async def _get_funding_fees(self, position: Dict[str, Any]) -> float:
         """Get total funding fees for the position from both exchanges"""
@@ -1371,7 +1838,7 @@ class FundingHunterGUI:
             self._log(f"Error: {e}")
     
     def _update_funding_table(self, all_rates):
-        """Update funding table - sorted by Binance funding rate (highest to lowest)"""
+        """Update funding table - sorted by Best Spread (highest to lowest)"""
         for item in self.funding_tree.get_children():
             self.funding_tree.delete(item)
         
@@ -1382,14 +1849,30 @@ class FundingHunterGUI:
         # Cache the funding rates for later use
         self.cached_funding_rates = all_rates
         
-        # Sort by Binance funding rate (highest to lowest by absolute value)
-        sorted_pairs = sorted(
-            all_rates.items(),
-            key=lambda x: abs(x[1].get(Exchange.BINANCE).funding_rate) if Exchange.BINANCE in x[1] else 0,
-            reverse=True
-        )
+        # Calculate spreads for sorting
+        pairs_with_spreads = []
+        for pair, rates in all_rates.items():
+            # Collect available rates
+            rate_values = {}
+            if Exchange.OKX in rates:
+                rate_values[Exchange.OKX] = rates[Exchange.OKX].funding_rate
+            if Exchange.BINANCE in rates:
+                rate_values[Exchange.BINANCE] = rates[Exchange.BINANCE].funding_rate
+            if Exchange.BINGX in rates:
+                rate_values[Exchange.BINGX] = rates[Exchange.BINGX].funding_rate
+            
+            # Calculate spread
+            spread_value = 0.0
+            if len(rate_values) >= 2:
+                sorted_rates = sorted(rate_values.values())
+                spread_value = (sorted_rates[-1] - sorted_rates[0]) * 100  # Convert to percentage
+            
+            pairs_with_spreads.append((pair, rates, spread_value))
         
-        for pair, rates in sorted_pairs:
+        # Sort by spread (highest to lowest)
+        sorted_pairs = sorted(pairs_with_spreads, key=lambda x: x[2], reverse=True)
+        
+        for pair, rates, spread_value in sorted_pairs:
             okx_rate = rates.get(Exchange.OKX)
             binance_rate = rates.get(Exchange.BINANCE)
             bingx_rate = rates.get(Exchange.BINGX)
@@ -1422,7 +1905,7 @@ class FundingHunterGUI:
                 pair, okx_val, binance_val, bingx_val, best_spread, recommendation
             ))
         
-        self._log(f"✅ Loaded {len(sorted_pairs)} pairs sorted by funding rate (highest to lowest)")
+        self._log(f"✅ Loaded {len(sorted_pairs)} pairs sorted by Best Spread (highest to lowest)")
     
     def _on_funding_select(self, event):
         """Handle funding row double-click - auto select pair and exchanges in Trading Panel"""
@@ -1468,46 +1951,441 @@ class FundingHunterGUI:
         """Handle exchange dropdown selection change in Trading Panel"""
         self._update_pair_info()
     
-    def _update_pair_info(self):
-        """Update pair information display based on current Trading Panel selection"""
-        pair = self.pair_combo.get()
-        if not pair:
+    def _toggle_auto_trading(self):
+        """Toggle auto trading on/off with Start/Stop button"""
+        # Check current state
+        if self.auto_trading_active:
+            # Currently running - STOP it
+            self.auto_trading_active = False
+            self.auto_trade_status.config(text="Stopped", foreground="gray")
+            self.auto_trade_btn.config(text="🚀 Start")
+            self._log("🛑 Auto Trading STOPPED")
+            
+            # Stop check loop
+            if self.auto_trade_check_task:
+                self.root.after_cancel(self.auto_trade_check_task)
+                self.auto_trade_check_task = None
+        else:
+            # Currently stopped - START it
+            # Validation
+            if not self.connected:
+                self._log("❌ Cannot start auto trading: Not connected to exchanges")
+                return
+            
+            if self.active_position:
+                self._log("❌ Cannot start auto trading: Active position exists. Close it first.")
+                return
+            
+            try:
+                volume = float(self.auto_volume_entry.get())
+                leverage = int(self.auto_leverage_entry.get())
+                min_spread = float(self.auto_min_spread_entry.get())
+                max_hours = float(self.auto_max_hours_entry.get())
+                
+                if volume <= 0 or leverage <= 0 or min_spread < 0 or max_hours <= 0:
+                    raise ValueError("Invalid values")
+                    
+            except ValueError:
+                self._log("❌ Invalid auto trading settings. Please check your inputs.")
+                return
+            
+            # Enable auto trading
+            self.auto_trading_active = True
+            self.auto_trade_status.config(text="Scanning...", foreground="green")
+            self.auto_trade_btn.config(text="🛑 Stop")
+            self._log(f"🤖 Auto Trading STARTED | Scan: 2s | Vol: {volume} USDT | Lev: {leverage}x | MinSpread: {min_spread}% | MaxHrs: {max_hours}h")
+            
+            # Start auto trading check loop
+            self._start_auto_trading_check()
+    
+    def _start_auto_trading_check(self):
+        """Start the auto trading signal check loop"""
+        if not self.auto_trading_active:
             return
         
-        self._log(f"📊 Updating info for {pair}")
+        # Check for trading signal
+        self._check_auto_trading_signal()
         
-        # Get funding rates from the funding tree if available
-        okx_rate = binance_rate = bingx_rate = "N/A"
-        best_spread = "N/A"
-        recommendation = ""
+        # Schedule next check in 2 seconds (for price spread monitoring)
+        self.auto_trade_check_task = self.root.after(2000, self._start_auto_trading_check)
+    
+    def _check_auto_trading_signal(self):
+        """Check if current market conditions meet auto trading criteria"""
+        if not self.auto_trading_active or not self.connected:
+            return
         
-        # Search for this pair in the funding tree
-        for item_id in self.funding_tree.get_children():
-            item = self.funding_tree.item(item_id)
-            values = item['values']
-            if values[0] == pair:
-                okx_rate = values[1]
-                binance_rate = values[2]
-                bingx_rate = values[3]
-                best_spread = values[4]
-                recommendation = values[5]
-                break
+        # Don't open new position if one already exists
+        if self.active_position:
+            self._log("⏸️  Auto Trading: Position already active, waiting...")
+            return
+        
+        # Get auto trading settings
+        try:
+            min_spread_threshold = float(self.auto_min_spread_entry.get()) / 100  # Convert to decimal
+            max_hours_before_funding = float(self.auto_max_hours_entry.get())
+        except ValueError:
+            self._log("❌ Invalid auto trading settings")
+            return
+        
+        # Check funding rates table for best opportunity
+        if not self.cached_funding_rates:
+            self._log("⏸️  Auto Trading: No funding rates available yet")
+            return
+        
+        # Find best opportunity from cached funding rates
+        best_pair = None
+        best_spread = 0
+        best_long_ex = None
+        best_short_ex = None
+        best_long_rate = None
+        best_short_rate = None
+        
+        for pair, rates in self.cached_funding_rates.items():
+            rate_values = {}
+            if Exchange.OKX in rates:
+                rate_values[Exchange.OKX] = rates[Exchange.OKX].funding_rate
+            if Exchange.BINANCE in rates:
+                rate_values[Exchange.BINANCE] = rates[Exchange.BINANCE].funding_rate
+            if Exchange.BINGX in rates:
+                rate_values[Exchange.BINGX] = rates[Exchange.BINGX].funding_rate
+            
+            if len(rate_values) >= 2:
+                sorted_rates = sorted(rate_values.items(), key=lambda x: x[1])
+                lowest_ex, lowest_rate = sorted_rates[0]
+                highest_ex, highest_rate = sorted_rates[-1]
+                spread = highest_rate - lowest_rate
+                
+                if spread > best_spread:
+                    best_spread = spread
+                    best_pair = pair
+                    best_long_ex = lowest_ex
+                    best_short_ex = highest_ex
+                    best_long_rate = lowest_rate
+                    best_short_rate = highest_rate
+        
+        # Check if best opportunity meets criteria
+        if not best_pair or best_spread < min_spread_threshold or not best_long_ex or not best_short_ex:
+            self._log(f"⏸️  Auto Trading: No pair meets min spread ({min_spread_threshold*100:.3f}%). Best: {best_spread*100:.3f}%")
+            return
+        
+        # Check timing - need to verify hours until funding
+        async def check_timing_and_open():
+            try:
+                # Type check
+                if not best_long_ex or not best_short_ex:
+                    return False
+                    
+                # Get funding rate to check next funding time
+                long_client = self.manager.clients.get(best_long_ex)
+                if not long_client:
+                    return False
+                
+                symbol = get_exchange_symbol(best_pair, best_long_ex)
+                funding_rate_obj = await long_client.get_funding_rate(symbol)
+                
+                # Calculate hours until funding
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc)
+                next_funding_time = funding_rate_obj.next_funding_time
+                time_until_funding = next_funding_time - now
+                hours_until = time_until_funding.total_seconds() / 3600
+                
+                if hours_until > max_hours_before_funding:
+                    self._log(f"⏸️  Auto Trading: Too early ({hours_until:.1f}h until funding). Waiting...")
+                    return False
+                
+                # Check price spread threshold before opening
+                short_client = self.manager.clients.get(best_short_ex)
+                if not short_client:
+                    return False
+                
+                long_symbol = get_exchange_symbol(best_pair, best_long_ex)
+                short_symbol = get_exchange_symbol(best_pair, best_short_ex)
+                
+                # Get prices from both exchanges
+                long_price = await long_client.get_mark_price(long_symbol)
+                short_price = await short_client.get_mark_price(short_symbol)
+                
+                # Calculate price spread percentage
+                price_diff = abs(short_price - long_price)
+                avg_price = (long_price + short_price) / 2
+                price_spread_pct = (price_diff / avg_price) * 100
+                
+                # Get price spread threshold from UI
+                try:
+                    price_spread_min = float(self.price_spread_threshold.get())
+                except:
+                    price_spread_min = 0.05  # Default 0.05%
+                
+                if price_spread_pct < price_spread_min:
+                    self._log(f"⏸️  Auto Trading: Price spread too small ({price_spread_pct:.3f}% < {price_spread_min}%). Waiting...")
+                    return False
+                
+                # All conditions met - open position!
+                self._log(f"✅ Auto Trading SIGNAL DETECTED!")
+                self._log(f"   Pair: {best_pair} | Funding Spread: {best_spread*100:.3f}% | Price Spread: {price_spread_pct:.3f}% | Hours: {hours_until:.1f}h")
+                
+                if best_long_rate is not None and best_short_rate is not None:
+                    self._log(f"   LONG: {best_long_ex.value} ({best_long_rate*100:.4f}%) | SHORT: {best_short_ex.value} ({best_short_rate*100:.4f}%)")
+                
+                # Auto-populate the trading panel
+                self.root.after(0, lambda: self._auto_populate_and_open(best_pair, best_long_ex, best_short_ex))
+                
+                return True
+                
+            except Exception as e:
+                logger.error(f"Error checking timing: {e}")
+                return False
+        
+        # Run async check
+        future = self._run_async(check_timing_and_open())
+        if future:
+            future.add_done_callback(lambda f: None)  # Just log any errors
+    
+    def _auto_populate_and_open(self, pair: str, long_ex: Exchange, short_ex: Exchange):
+        """Auto-populate trading panel and open position"""
+        if not long_ex or not short_ex:
+            self._log("❌ Invalid exchanges")
+            return
+            
+        # Set pair
+        self.pair_combo.set(pair)
+        
+        # Set exchanges
+        exchange_display_map = {Exchange.OKX: "OKX", Exchange.BINANCE: "Binance", Exchange.BINGX: "BingX"}
+        self.long_exchange.set(exchange_display_map[long_ex])
+        self.short_exchange.set(exchange_display_map[short_ex])
+        
+        # Set leverage from auto trading settings
+        leverage = self.auto_leverage_entry.get()
+        self.leverage_var.set(leverage)
+        
+        # Calculate size based on volume (USDT) and leverage
+        # Size = Volume / Price
+        # We need to get current price first
+        async def get_price_and_open():
+            try:
+                long_client = self.manager.clients.get(long_ex)
+                if not long_client:
+                    self._log("❌ Cannot get client for auto trading")
+                    return
+                    
+                symbol = get_exchange_symbol(pair, long_ex)
+                price = await long_client.get_mark_price(symbol)
+                
+                # Calculate size in base currency
+                volume_usdt = float(self.auto_volume_entry.get())
+                leverage_val = int(leverage)
+                
+                # Total position value = volume_usdt * leverage
+                # Size in base currency = total_value / price
+                total_value = volume_usdt * leverage_val
+                size = total_value / price
+                
+                self._log(f"💡 Calculated size: {size:.4f} {pair.split('/')[0]} (Price: ${price:,.2f}, Volume: {volume_usdt} USDT, Leverage: {leverage_val}x)")
+                
+                # Set size
+                self.root.after(0, lambda: self.size_entry.delete(0, tk.END))
+                self.root.after(0, lambda: self.size_entry.insert(0, f"{size:.4f}"))
+                
+                # Trigger position open
+                self.root.after(0, lambda: self._log(f"🤖 Auto Trading: Opening position..."))
+                self.root.after(0, self._open_position)
+                
+            except Exception as e:
+                self._log(f"❌ Auto Trading: Failed to calculate size: {e}")
+        
+        future = self._run_async(get_price_and_open())
+        if future:
+            future.add_done_callback(lambda f: None)
+    
+    def _update_pair_info(self):
+        """Update pair information display with real-time prices and timing"""
+        pair = self.pair_combo.get()
+        if not pair or not self.connected:
+            return
         
         # Get current exchanges selection
         long_display = self.long_exchange.get()
         short_display = self.short_exchange.get()
         
-        # Update info panel
-        info_text = f"Pair: {pair}\n"
-        info_text += f"OKX Rate: {okx_rate}  |  Binance Rate: {binance_rate}  |  BingX Rate: {bingx_rate}\n"
-        info_text += f"Best Spread: {best_spread}\n"
-        if long_display and short_display:
-            info_text += f"Selected: LONG on {long_display}, SHORT on {short_display}"
+        if not long_display or not short_display:
+            self.selected_pair_info.config(text="Please select both LONG and SHORT exchanges", foreground="gray")
+            return
         
-        self.selected_pair_info.config(text=info_text, foreground="black")
+        # Map display names to Exchange enum
+        exchange_map = {"OKX": Exchange.OKX, "Binance": Exchange.BINANCE, "BingX": Exchange.BINGX}
+        long_ex = exchange_map.get(long_display)
+        short_ex = exchange_map.get(short_display)
         
-        # Fetch and display current prices
-        self._update_pair_price_info(pair, recommendation)
+        if not long_ex or not short_ex:
+            return
+        
+        # Fetch real-time prices from the two selected exchanges
+        self._fetch_pair_prices_for_display(pair, long_ex, short_ex, long_display, short_display)
+    
+    def _fetch_pair_prices_for_display(self, pair: str, long_ex: Exchange, short_ex: Exchange, 
+                                        long_display: str, short_display: str):
+        """Fetch real-time prices for the two selected exchanges and update display"""
+        async def async_get_prices():
+            prices = {}
+            funding_rates = {}
+            
+            # Get prices and funding rates from both exchanges
+            for exchange in [long_ex, short_ex]:
+                client = self.manager.clients.get(exchange)
+                if client:
+                    try:
+                        symbol = get_exchange_symbol(pair, exchange)
+                        mark_price = await client.get_mark_price(symbol)
+                        prices[exchange] = mark_price
+                        
+                        # Try to get funding rate
+                        try:
+                            funding_rate = await client.get_funding_rate(symbol)
+                            funding_rates[exchange] = funding_rate
+                        except:
+                            pass
+                    except Exception as e:
+                        logger.debug(f"Could not get data from {exchange.value}: {e}")
+            
+            return prices, funding_rates
+        
+        def on_complete(future):
+            try:
+                prices, funding_rates = future.result()
+                
+                if len(prices) >= 2:
+                    long_price = prices.get(long_ex, 0)
+                    short_price = prices.get(short_ex, 0)
+                    
+                    # Calculate price spread
+                    price_diff = abs(short_price - long_price)
+                    price_spread_pct = (price_diff / long_price * 100) if long_price > 0 else 0
+                    
+                    # Determine if spread is good for entry
+                    # Price difference should ideally favor our position
+                    # For hedged position: we want to buy low (LONG) and sell high (SHORT)
+                    is_good_entry = short_price > long_price  # SHORT price should be higher
+                    
+                    # Get funding rates to determine next funding time from API
+                    from datetime import datetime, timezone, timedelta
+                    now = datetime.now(timezone.utc)
+                    
+                    # Get next funding time from exchange API (use whichever is available)
+                    long_funding = funding_rates.get(long_ex)
+                    short_funding = funding_rates.get(short_ex)
+                    
+                    # Use the next funding time from API (prefer long exchange, fallback to short)
+                    next_funding_time = None
+                    if long_funding and long_funding.next_funding_time:
+                        next_funding_time = long_funding.next_funding_time
+                    elif short_funding and short_funding.next_funding_time:
+                        next_funding_time = short_funding.next_funding_time
+                    
+                    # Fallback: calculate manually if API didn't provide it
+                    if not next_funding_time:
+                        current_hour = now.hour
+                        # Default funding times: 00:00, 08:00, 16:00 UTC (8-hour intervals)
+                        funding_hours = [0, 8, 16]
+                        next_funding_hour = None
+                        for fh in funding_hours:
+                            if current_hour < fh:
+                                next_funding_hour = fh
+                                break
+                        
+                        if next_funding_hour is None:
+                            next_funding_hour = funding_hours[0]  # Next day 00:00
+                        
+                        next_funding_time = now.replace(hour=next_funding_hour, minute=0, second=0, microsecond=0)
+                        if next_funding_time <= now:
+                            next_funding_time += timedelta(days=1)
+                    
+                    # Calculate time until next funding
+                    time_until_funding = next_funding_time - now
+                    hours_until = time_until_funding.total_seconds() / 3600
+                    
+                    # Format time remaining
+                    hours = int(time_until_funding.total_seconds() // 3600)
+                    minutes = int((time_until_funding.total_seconds() % 3600) // 60)
+                    seconds = int(time_until_funding.total_seconds() % 60)
+                    time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                    
+                    # Entry timing recommendation
+                    entry_status = ""
+                    entry_color = "black"
+                    if hours_until <= 1:
+                        # Within 1 hour before funding - BEST TIME
+                        entry_status = "🟢 GOOD - Within 1h before funding"
+                        entry_color = "green"
+                    elif hours_until <= 2:
+                        entry_status = "🟡 OK - 1-2h before funding"
+                        entry_color = "orange"
+                    else:
+                        entry_status = f"🔴 WAIT - {hours_until:.1f}h until funding"
+                        entry_color = "red"
+                    
+                    # Build funding info display
+                    funding_info = ""
+                    funding_interval_text = "Every 8 hours"  # Default
+                    
+                    if long_funding and short_funding:
+                        net_funding = short_funding.funding_rate - long_funding.funding_rate
+                        funding_info = f"\nNet Funding: {net_funding * 100:.6f}% (per 8h)"
+                        
+                        # Use funding interval from the exchanges (they should be the same)
+                        # If different, show the one from the exchange with funding data
+                        interval_hours = long_funding.funding_interval_hours
+                        if interval_hours == 4:
+                            funding_interval_text = "Every 4 hours"
+                            funding_info = f"\nNet Funding: {net_funding * 100:.6f}% (per 4h)"
+                        elif interval_hours == 8:
+                            funding_interval_text = "Every 8 hours"
+                            funding_info = f"\nNet Funding: {net_funding * 100:.6f}% (per {interval_hours}h)"
+                        else:
+                            funding_interval_text = f"Every {interval_hours} hours"
+                            funding_info = f"\nNet Funding: {net_funding * 100:.6f}% (per {interval_hours}h)"
+                    
+                    # Build display text
+                    info_text = f"═══ {pair} ═══\n\n"
+                    info_text += f"LONG  ({long_display}):  ${long_price:,.6f}\n"
+                    info_text += f"SHORT ({short_display}): ${short_price:,.6f}\n\n"
+                    info_text += f"Price Spread: ${price_diff:,.6f} ({price_spread_pct:.3f}%)\n"
+                    
+                    if is_good_entry:
+                        info_text += f"Price Position: ✅ SHORT higher than LONG (Good)\n"
+                    else:
+                        info_text += f"Price Position: ⚠️ LONG higher than SHORT (Inverted)\n"
+                    
+                    info_text += f"{funding_info}\n"
+                    info_text += f"─────────────────────────\n"
+                    info_text += f"Next Funding: {time_str}\n"
+                    info_text += f"Entry Timing: {entry_status}\n"
+                    info_text += f"Funding Interval: {funding_interval_text}"
+                    
+                    self.root.after(0, lambda: self.selected_pair_info.config(
+                        text=info_text, 
+                        foreground=entry_color,
+                        font=('Courier', 9)
+                    ))
+                    
+                    # Schedule next update in 2 seconds for continuous refresh
+                    self.root.after(2000, self._update_pair_info)
+                    
+                else:
+                    self.root.after(0, lambda: self.selected_pair_info.config(
+                        text="Could not fetch prices from selected exchanges",
+                        foreground="red"
+                    ))
+                    
+            except Exception as e:
+                logger.error(f"Error updating pair info: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        future = self._run_async(async_get_prices())
+        if future:
+            future.add_done_callback(on_complete)
     
     def _update_pair_price_info(self, pair: str, recommendation: str = ""):
         """Fetch and display current price information for the selected pair"""

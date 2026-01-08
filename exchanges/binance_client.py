@@ -236,8 +236,13 @@ class BinanceClient(BaseExchangeClient):
             raw_data=result
         )
     
-    async def close_position(self, symbol: str) -> Order:
-        """Close position for symbol"""
+    async def close_position(self, symbol: str, aggressive: bool = False) -> Order:
+        """Close position for symbol
+        
+        Args:
+            symbol: Trading symbol
+            aggressive: If True, uses aggressive limit order (5% off market) for guaranteed fill
+        """
         binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
         
         position = await self.get_position(binance_symbol)
@@ -250,14 +255,44 @@ class BinanceClient(BaseExchangeClient):
         # The side must be opposite: SELL to close LONG, BUY to close SHORT
         close_side = "SELL" if position.side == Side.LONG else "BUY"
         
-        params = {
-            "symbol": binance_symbol,
-            "side": close_side,
-            "type": "MARKET",
-            "quantity": position.size,
-            "positionSide": "LONG" if position.side == Side.LONG else "SHORT"
-            # Note: Do NOT include reduceOnly when using positionSide (hedge mode)
-        }
+        if aggressive:
+            # AGGRESSIVE MODE: Use limit order with extreme price
+            current_price = position.mark_price
+            
+            # For SELL (closing LONG): set price 5% below market
+            # For BUY (closing SHORT): set price 5% above market
+            if position.side == Side.LONG:
+                aggressive_price = current_price * 0.95  # SELL 5% below
+            else:
+                aggressive_price = current_price * 1.05  # BUY 5% above
+            
+            # Round to Binance's tick size (usually 0.1 or 0.01)
+            if aggressive_price > 1000:
+                aggressive_price = round(aggressive_price, 1)
+            elif aggressive_price > 100:
+                aggressive_price = round(aggressive_price, 2)
+            else:
+                aggressive_price = round(aggressive_price, 3)
+            
+            params = {
+                "symbol": binance_symbol,
+                "side": close_side,
+                "type": "LIMIT",
+                "timeInForce": "IOC",  # Immediate Or Cancel
+                "price": aggressive_price,
+                "quantity": position.size,
+                "positionSide": "LONG" if position.side == Side.LONG else "SHORT"
+            }
+        else:
+            # STANDARD MODE: Market order
+            params = {
+                "symbol": binance_symbol,
+                "side": close_side,
+                "type": "MARKET",
+                "quantity": position.size,
+                "positionSide": "LONG" if position.side == Side.LONG else "SHORT"
+                # Note: Do NOT include reduceOnly when using positionSide (hedge mode)
+            }
         
         result = await self._request("POST", "/fapi/v1/order", params)
         
@@ -295,11 +330,19 @@ class BinanceClient(BaseExchangeClient):
         
         result = await self._request("GET", "/fapi/v1/premiumIndex", {"symbol": binance_symbol}, signed=False)
         
+        # Calculate funding interval by analyzing next funding time
+        next_funding_time = datetime.fromtimestamp(result.get("nextFundingTime", 0) / 1000, tz=timezone.utc)
+        current_hour = next_funding_time.hour
+        
+        # Binance uses 8-hour intervals (00:00, 08:00, 16:00 UTC)
+        funding_interval_hours = 8
+        
         return FundingRate(
             symbol=binance_symbol,
             funding_rate=float(result.get("lastFundingRate", 0)),
-            next_funding_time=datetime.fromtimestamp(result.get("nextFundingTime", 0) / 1000, tz=timezone.utc),
+            next_funding_time=next_funding_time,
             estimated_rate=float(result.get("interestRate", 0)),
+            funding_interval_hours=funding_interval_hours,
             raw_data=result
         )
     
@@ -312,11 +355,15 @@ class BinanceClient(BaseExchangeClient):
             symbol = item.get("symbol", "")
             # Only include USDT perpetual contracts
             if symbol.endswith("USDT"):
+                # Binance uses 8-hour intervals
+                funding_interval_hours = 8
+                
                 funding_rates.append(FundingRate(
                     symbol=symbol,
                     funding_rate=float(item.get("lastFundingRate", 0)),
                     next_funding_time=datetime.fromtimestamp(item.get("nextFundingTime", 0) / 1000, tz=timezone.utc),
                     estimated_rate=float(item.get("interestRate", 0)),
+                    funding_interval_hours=funding_interval_hours,
                     raw_data=item
                 ))
         

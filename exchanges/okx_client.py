@@ -260,8 +260,13 @@ class OKXClient(BaseExchangeClient):
             raw_data=order_info
         )
     
-    async def close_position(self, symbol: str) -> Order:
-        """Close position for symbol"""
+    async def close_position(self, symbol: str, aggressive: bool = False) -> Order:
+        """Close position for symbol
+        
+        Args:
+            symbol: Trading symbol
+            aggressive: If True, uses aggressive limit order (5% off market price) for guaranteed fill
+        """
         okx_symbol = symbol if "-SWAP" in symbol else get_exchange_symbol(symbol, Exchange.OKX)
         
         # Get current position
@@ -273,16 +278,46 @@ class OKXClient(BaseExchangeClient):
         # Close by placing opposite order
         close_side = Side.SHORT if position.side == Side.LONG else Side.LONG
         
-        # Use market close order
-        order_data = {
-            "instId": okx_symbol,
-            "tdMode": "cross",
-            "side": "sell" if position.side == Side.LONG else "buy",
-            "ordType": "market",
-            "sz": str(position.size),
-            "posSide": "long" if position.side == Side.LONG else "short",
-            "reduceOnly": "true"
-        }
+        if aggressive:
+            # AGGRESSIVE MODE: Use limit order with extreme price
+            current_price = position.mark_price
+            
+            # For SELL (closing LONG): set price 5% below market
+            # For BUY (closing SHORT): set price 5% above market
+            if position.side == Side.LONG:
+                aggressive_price = current_price * 0.95  # SELL 5% below
+            else:
+                aggressive_price = current_price * 1.05  # BUY 5% above
+            
+            # Round to appropriate decimals
+            if aggressive_price > 1000:
+                aggressive_price = round(aggressive_price, 1)
+            elif aggressive_price > 100:
+                aggressive_price = round(aggressive_price, 2)
+            else:
+                aggressive_price = round(aggressive_price, 3)
+            
+            order_data = {
+                "instId": okx_symbol,
+                "tdMode": "cross",
+                "side": "sell" if position.side == Side.LONG else "buy",
+                "ordType": "ioc",  # Immediate or Cancel
+                "px": str(aggressive_price),  # Aggressive price
+                "sz": str(position.size),
+                "posSide": "long" if position.side == Side.LONG else "short",
+                "reduceOnly": "true"
+            }
+        else:
+            # STANDARD MODE: Market close order
+            order_data = {
+                "instId": okx_symbol,
+                "tdMode": "cross",
+                "side": "sell" if position.side == Side.LONG else "buy",
+                "ordType": "market",
+                "sz": str(position.size),
+                "posSide": "long" if position.side == Side.LONG else "short",
+                "reduceOnly": "true"
+            }
         
         result = await self._request("POST", "/api/v5/trade/order", data=order_data)
         
@@ -333,11 +368,19 @@ class OKXClient(BaseExchangeClient):
             data = result["data"][0]
             next_funding = int(data.get("nextFundingTime", 0))
             
+            # OKX typically uses 8-hour intervals
+            # fundingTime field contains the interval in milliseconds if present
+            funding_interval_hours = 8
+            if "fundingTime" in data:
+                interval_ms = int(data["fundingTime"])
+                funding_interval_hours = interval_ms // (1000 * 3600)  # Convert ms to hours
+            
             return FundingRate(
                 symbol=okx_symbol,
                 funding_rate=float(data.get("fundingRate", 0)),
                 next_funding_time=datetime.fromtimestamp(next_funding / 1000, tz=timezone.utc),
                 estimated_rate=float(data.get("nextFundingRate", 0)) if data.get("nextFundingRate") else None,
+                funding_interval_hours=funding_interval_hours,
                 raw_data=data
             )
         

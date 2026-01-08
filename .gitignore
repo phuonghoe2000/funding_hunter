@@ -9,6 +9,7 @@ ENV/
 
 # Config with API keys - DO NOT COMMIT
 user_config.json
+user_config_lite.json
 .env
 
 # IDE

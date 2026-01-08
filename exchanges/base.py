@@ -22,7 +22,7 @@ class Position:
     leverage: int
     status: PositionStatus
     timestamp: datetime
-    raw_data: Dict[str, Any] = None
+    raw_data: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -38,7 +38,7 @@ class Order:
     avg_price: float
     status: str
     timestamp: datetime
-    raw_data: Dict[str, Any] = None
+    raw_data: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -48,7 +48,8 @@ class FundingRate:
     funding_rate: float
     next_funding_time: datetime
     estimated_rate: Optional[float] = None
-    raw_data: Dict[str, Any] = None
+    funding_interval_hours: int = 8  # Default 8 hours, can be 4 or other values
+    raw_data: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -58,7 +59,7 @@ class Balance:
     total: float
     available: float
     frozen: float
-    raw_data: Dict[str, Any] = None
+    raw_data: Optional[Dict[str, Any]] = None
 
 
 class BaseExchangeClient(ABC):
@@ -106,8 +107,13 @@ class BaseExchangeClient(ABC):
         pass
     
     @abstractmethod
-    async def close_position(self, symbol: str) -> Order:
-        """Close position for symbol"""
+    async def close_position(self, symbol: str, aggressive: bool = False) -> Order:
+        """Close position for symbol
+        
+        Args:
+            symbol: Trading symbol
+            aggressive: If True, uses aggressive limit order for guaranteed fast fill
+        """
         pass
     
     @abstractmethod

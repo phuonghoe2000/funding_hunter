@@ -288,8 +288,14 @@ class BingXClient(BaseExchangeClient):
             raw_data=order_data
         )
     
-    async def close_position(self, symbol: str) -> Order:
-        """Close position for symbol"""
+    async def close_position(self, symbol: str, aggressive: bool = False) -> Order:
+        """Close position for symbol
+        
+        Args:
+            symbol: Trading symbol
+            aggressive: If True, uses aggressive limit order to ensure fill (faster execution)
+                       If False, uses standard market order with IOC
+        """
         bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
         
         position = await self.get_position(bingx_symbol)
@@ -302,15 +308,49 @@ class BingXClient(BaseExchangeClient):
         # For closing, the side is opposite but positionSide stays the same
         close_side = "SELL" if position.side == Side.LONG else "BUY"
         
-        # BingX expects quantity as a string to avoid floating point precision issues
-        params = {
-            "symbol": bingx_symbol,
-            "side": close_side,
-            "type": "MARKET",
-            "quantity": str(position.size),
-            "positionSide": "LONG" if position.side == Side.LONG else "SHORT",
-            "closePosition": "true"  # BingX parameter to close position
-        }
+        if aggressive:
+            # AGGRESSIVE MODE: Use limit order with extreme price to guarantee fill
+            # This is the "nhồi lệnh" technique
+            current_price = position.mark_price
+            
+            # For SELL (closing LONG): set price 5% below market (always fills)
+            # For BUY (closing SHORT): set price 5% above market (always fills)
+            if close_side == "SELL":
+                aggressive_price = current_price * 0.95  # 5% below
+            else:
+                aggressive_price = current_price * 1.05  # 5% above
+            
+            # Round to appropriate decimal places (BingX typically uses 2-4 decimals)
+            if aggressive_price > 1000:
+                aggressive_price = round(aggressive_price, 1)
+            elif aggressive_price > 100:
+                aggressive_price = round(aggressive_price, 2)
+            elif aggressive_price > 10:
+                aggressive_price = round(aggressive_price, 3)
+            else:
+                aggressive_price = round(aggressive_price, 4)
+            
+            params = {
+                "symbol": bingx_symbol,
+                "side": close_side,
+                "type": "LIMIT",  # Use LIMIT for aggressive close
+                "price": str(aggressive_price),
+                "quantity": str(position.size),
+                "positionSide": "LONG" if position.side == Side.LONG else "SHORT",
+                "closePosition": "true",
+                "timeInForce": "IOC"  # Must fill immediately
+            }
+        else:
+            # STANDARD MODE: Market order with IOC (default)
+            params = {
+                "symbol": bingx_symbol,
+                "side": close_side,
+                "type": "MARKET",
+                "quantity": str(position.size),
+                "positionSide": "LONG" if position.side == Side.LONG else "SHORT",
+                "closePosition": "true",  # BingX parameter to close position
+                "timeInForce": "IOC"  # Fill immediately or cancel (fastest execution)
+            }
         
         result = await self._request("POST", "/openApi/swap/v2/trade/order", params)
         
@@ -361,13 +401,17 @@ class BingXClient(BaseExchangeClient):
         
         if result.get("code") == 0 and result.get("data"):
             data = result["data"]
-            next_funding_time = int(data.get("nextFundingTime", 0))
+            next_funding_time_ms = int(data.get("nextFundingTime", 0))
+            
+            # BingX typically uses 8-hour intervals
+            funding_interval_hours = 8
             
             return FundingRate(
                 symbol=bingx_symbol,
                 funding_rate=float(data.get("lastFundingRate", 0)),
-                next_funding_time=datetime.fromtimestamp(next_funding_time / 1000, tz=timezone.utc) if next_funding_time else datetime.now(timezone.utc),
+                next_funding_time=datetime.fromtimestamp(next_funding_time_ms / 1000, tz=timezone.utc) if next_funding_time_ms else datetime.now(timezone.utc),
                 estimated_rate=float(data.get("estimatedSettlePrice", 0)) if data.get("estimatedSettlePrice") else None,
+                funding_interval_hours=funding_interval_hours,
                 raw_data=data
             )
         
