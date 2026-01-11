@@ -965,12 +965,11 @@ class FundingHunterGUI:
         # Bind size entry to update USDT volume on change
         self.size_entry.bind('<KeyRelease>', self._update_usdt_volume)
         
-        # Split count for DCA-style opening
+        # Split count for DCA-style opening (user input)
         ttk.Label(settings_frame, text="Splits:").pack(side=tk.LEFT, padx=10)
         self.split_count_var = tk.StringVar(value="1")
-        self.split_count_combo = ttk.Combobox(settings_frame, textvariable=self.split_count_var, 
-                                               values=["1", "3", "5", "10"], width=4, state='readonly')
-        self.split_count_combo.pack(side=tk.LEFT, padx=5)
+        self.split_count_entry = ttk.Entry(settings_frame, textvariable=self.split_count_var, width=5)
+        self.split_count_entry.pack(side=tk.LEFT, padx=5)
         
         # Exchange selection
         ex_frame = ttk.LabelFrame(frame, text="Select Exchanges for Arbitrage", padding="10")
@@ -1489,8 +1488,13 @@ class FundingHunterGUI:
             leverage = int(self.leverage_var.get())
             price_spread_min = float(self.price_spread_threshold.get())
             split_count = int(self.split_count_var.get())
+            if split_count < 1:
+                split_count = 1
+            elif split_count > 1000:
+                messagebox.showerror("Error", "Split count cannot exceed 1000")
+                return
         except ValueError:
-            messagebox.showerror("Error", "Invalid size, leverage, or price spread threshold")
+            messagebox.showerror("Error", "Invalid size, leverage, split count, or price spread threshold")
             return
         
         long_ex = self._get_exchange_enum(long_ex_name)
