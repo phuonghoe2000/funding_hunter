@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import time
 import json
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode
@@ -64,12 +65,19 @@ class BingXClient(BaseExchangeClient):
             return balance is not None
         except Exception as e:
             print(f"BingX connection error: {e}")
+            # Close session on failed connection to prevent leak
+            if self._session:
+                await self._session.close()
+                self._session = None
             return False
     
     async def disconnect(self):
         """Disconnect from BingX API"""
         if self._session:
             await self._session.close()
+            # Give time for the underlying connections to close
+            import asyncio
+            await asyncio.sleep(0.25)
             self._session = None
     
     async def _request(
@@ -129,8 +137,10 @@ class BingXClient(BaseExchangeClient):
             print(f"  Headers: X-BX-APIKEY: {self.api_key[:8]}...")
         
         # Send request with full URL (no params argument to avoid re-encoding)
+        # Add timeout to prevent hanging
+        req_timeout = aiohttp.ClientTimeout(total=15.0)
         try:
-            async with self._session.request(method, full_url, headers=headers) as response:
+            async with self._session.request(method, full_url, headers=headers, timeout=req_timeout) as response:
                 result = await response.json()
                 
                 # Debug: Print response
@@ -139,6 +149,8 @@ class BingXClient(BaseExchangeClient):
                     print(f"  Status: {response.status}")
                     print(f"  Data: {json.dumps(result, indent=2)[:1000]}")
                     print(f"{'='*60}\n")
+        except asyncio.TimeoutError:
+            raise Exception(f"BingX API request timeout after 15s")
         except Exception as e:
             print(f"Request error: {e}")
             raise

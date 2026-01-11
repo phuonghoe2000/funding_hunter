@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import time
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import aiohttp
@@ -69,12 +70,19 @@ class OKXClient(BaseExchangeClient):
             return balance is not None
         except Exception as e:
             print(f"OKX connection error: {e}")
+            # Close session on failed connection to prevent leak
+            if self._session:
+                await self._session.close()
+                self._session = None
             return False
     
     async def disconnect(self):
         """Disconnect from OKX API"""
         if self._session:
             await self._session.close()
+            # Give time for the underlying connections to close
+            import asyncio
+            await asyncio.sleep(0.25)
             self._session = None
     
     async def _request(
@@ -109,25 +117,31 @@ class OKXClient(BaseExchangeClient):
             print(f"  Body: {body if body else 'None'}")
             print(f"  Headers: OK-ACCESS-KEY: {self.api_key[:8]}...")
         
-        async with self._session.request(
-            method,
-            url,
-            headers=headers,
-            data=body if body else None
-        ) as response:
-            result = await response.json()
-            
-            # Debug: Print response
-            if self.debug:
-                print(f"[OKX RESPONSE]")
-                print(f"  Status: {response.status}")
-                print(f"  Data: {json.dumps(result, indent=2)[:1000]}")
-                print(f"{'='*60}\n")
-            
-            if result.get("code") != "0":
-                raise Exception(f"OKX API Error: {result.get('msg', 'Unknown error')}")
-            
-            return result
+        # Add timeout to prevent hanging
+        req_timeout = aiohttp.ClientTimeout(total=15.0)
+        try:
+            async with self._session.request(
+                method,
+                url,
+                headers=headers,
+                data=body if body else None,
+                timeout=req_timeout
+            ) as response:
+                result = await response.json()
+                
+                # Debug: Print response
+                if self.debug:
+                    print(f"[OKX RESPONSE]")
+                    print(f"  Status: {response.status}")
+                    print(f"  Data: {json.dumps(result, indent=2)[:1000]}")
+                    print(f"{'='*60}\n")
+                
+                if result.get("code") != "0":
+                    raise Exception(f"OKX API Error: {result.get('msg', 'Unknown error')}")
+                
+                return result
+        except asyncio.TimeoutError:
+            raise Exception(f"OKX API request timeout after 15s")
     
     async def get_balance(self, currency: str = "USDT") -> Balance:
         """Get account balance"""

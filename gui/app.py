@@ -343,6 +343,266 @@ class MultiExchangeManager:
             logger.error(f"Error checking positions: {e}")
         
         return result
+    
+    async def scan_all_positions(self) -> Dict[Exchange, List[Any]]:
+        """
+        Scan all positions from all connected exchanges
+        
+        Returns:
+            Dict mapping Exchange to list of positions
+        """
+        all_positions = {}
+        
+        for exchange, client in self.clients.items():
+            try:
+                # Add timeout per exchange to prevent hanging
+                positions = await asyncio.wait_for(
+                    client.get_all_positions(),
+                    timeout=15.0
+                )
+                all_positions[exchange] = positions
+                logger.info(f"Found {len(positions)} positions on {exchange.value}")
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout scanning positions from {exchange.value}")
+                all_positions[exchange] = []
+            except Exception as e:
+                logger.error(f"Error scanning positions from {exchange.value}: {e}")
+                all_positions[exchange] = []
+        
+        return all_positions
+    
+    async def open_hedged_position_split(
+        self,
+        pair: str,
+        long_exchange: Exchange,
+        short_exchange: Exchange,
+        total_size: float,
+        leverage: int,
+        split_count: int = 1,
+        delay_between_splits: float = 0.5,
+        price_spread_min: float = 0.0,
+        spread_check_interval: float = 2.0,
+        max_wait_per_split: float = 300.0,
+        log_callback = None,
+        on_first_split_complete = None,
+        skip_leverage_set: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Open hedged position in multiple splits (DCA style)
+        Checks price spread threshold before each split.
+        
+        Args:
+            pair: Trading pair
+            long_exchange: Exchange for LONG
+            short_exchange: Exchange for SHORT
+            total_size: Total position size
+            leverage: Leverage to use
+            split_count: Number of splits (1, 3, 5, 10)
+            delay_between_splits: Delay in seconds between each split
+            price_spread_min: Minimum price spread % required before opening each split
+            spread_check_interval: Seconds between spread checks when waiting
+            max_wait_per_split: Maximum seconds to wait for spread per split (0 = unlimited)
+            log_callback: Optional callback function for logging to GUI
+            on_first_split_complete: Optional callback called after first split completes (to start monitoring)
+            skip_leverage_set: Skip setting leverage (use if leverage already set)
+        
+        Returns:
+            Dict with success status and details
+        """
+        def log_msg(msg: str):
+            logger.info(msg)
+            if log_callback:
+                log_callback(msg)
+        
+        results = {
+            "success": False, 
+            "splits_completed": 0,
+            "splits_total": split_count,
+            "total_long_size": 0,
+            "total_short_size": 0,
+            "error": None,
+            "split_results": []
+        }
+        
+        if long_exchange not in self.clients or short_exchange not in self.clients:
+            results["error"] = "One or both exchanges not connected"
+            return results
+        
+        long_client = self.clients[long_exchange]
+        short_client = self.clients[short_exchange]
+        
+        long_symbol = get_exchange_symbol(pair, long_exchange)
+        short_symbol = get_exchange_symbol(pair, short_exchange)
+        
+        # Calculate size per split
+        size_per_split = total_size / split_count
+        
+        async def check_spread() -> tuple[bool, float, float, float]:
+            """Check if current spread meets threshold. Returns (is_ok, spread_pct, long_price, short_price)"""
+            try:
+                # Add timeout to prevent hanging
+                long_price, short_price = await asyncio.wait_for(
+                    asyncio.gather(
+                        long_client.get_mark_price(long_symbol),
+                        short_client.get_mark_price(short_symbol)
+                    ),
+                    timeout=10.0
+                )
+                price_diff = abs(short_price - long_price)
+                avg_price = (long_price + short_price) / 2
+                spread_pct = (price_diff / avg_price) * 100
+                return (spread_pct >= price_spread_min, spread_pct, long_price, short_price)
+            except asyncio.TimeoutError:
+                logger.warning("Timeout checking spread")
+                return (False, 0.0, 0.0, 0.0)
+            except Exception as e:
+                logger.error(f"Error checking spread: {e}")
+                return (False, 0.0, 0.0, 0.0)
+        
+        try:
+            # Set leverage first (skip if already set to save time)
+            if not skip_leverage_set:
+                log_msg(f"Setting leverage to {leverage}x on both exchanges...")
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            long_client.set_leverage(long_symbol, leverage),
+                            short_client.set_leverage(short_symbol, leverage)
+                        ),
+                        timeout=15.0
+                    )
+                except asyncio.TimeoutError:
+                    log_msg("⚠️ Timeout setting leverage, continuing anyway...")
+            
+            # Open positions in splits
+            for i in range(split_count):
+                split_num = i + 1
+                
+                # Yield to event loop briefly to keep GUI responsive
+                await asyncio.sleep(0.01)
+                
+                # Check spread before each split (except first one which was already checked)
+                if i > 0 and price_spread_min > 0:
+                    log_msg(f"⏳ Split {split_num}/{split_count}: Waiting for spread threshold ({price_spread_min}%)...")
+                    wait_start = asyncio.get_event_loop().time()
+                    
+                    while True:
+                        is_ok, spread_pct, long_price, short_price = await check_spread()
+                        
+                        if is_ok:
+                            log_msg(f"✅ Split {split_num}: Spread {spread_pct:.4f}% >= {price_spread_min}% - Opening...")
+                            break
+                        
+                        # Check timeout
+                        elapsed = asyncio.get_event_loop().time() - wait_start
+                        if max_wait_per_split > 0 and elapsed >= max_wait_per_split:
+                            log_msg(f"⚠️ Split {split_num}: Timeout waiting for spread ({elapsed:.0f}s). Skipping remaining splits.")
+                            results["error"] = f"Timeout waiting for spread at split {split_num}"
+                            # Return with whatever splits we completed
+                            if results["splits_completed"] > 0:
+                                results["success"] = True
+                            return results
+                        
+                        log_msg(f"📊 Split {split_num}: Spread {spread_pct:.4f}% < {price_spread_min}% | LONG: ${long_price:,.4f} | SHORT: ${short_price:,.4f} | Waiting...")
+                        await asyncio.sleep(spread_check_interval)
+                
+                log_msg(f"🔄 Opening split {split_num}/{split_count} (size: {size_per_split})...")
+                
+                try:
+                    # Open both sides simultaneously for this split with timeout
+                    long_order, short_order = await asyncio.wait_for(
+                        asyncio.gather(
+                            long_client.place_market_order(long_symbol, Side.LONG, size_per_split),
+                            short_client.place_market_order(short_symbol, Side.SHORT, size_per_split)
+                        ),
+                        timeout=30.0
+                    )
+                    
+                    results["splits_completed"] += 1
+                    results["total_long_size"] += size_per_split
+                    results["total_short_size"] += size_per_split
+                    results["split_results"].append({
+                        "split": split_num,
+                        "success": True,
+                        "long_order": long_order.order_id if long_order else None,
+                        "short_order": short_order.order_id if short_order else None
+                    })
+                    
+                    log_msg(f"✓ Split {split_num}/{split_count} completed")
+                    
+                    # Call callback after first split to start monitoring
+                    if split_num == 1 and on_first_split_complete:
+                        try:
+                            on_first_split_complete(size_per_split)
+                        except Exception as e:
+                            logger.error(f"Error in on_first_split_complete callback: {e}")
+                    
+                    # Delay between splits (except for last one)
+                    if i < split_count - 1:
+                        log_msg(f"⏳ Waiting {delay_between_splits}s before next split...")
+                        await asyncio.sleep(delay_between_splits)
+                
+                except asyncio.TimeoutError:
+                    log_msg(f"⚠️ Split {split_num} timeout - retrying once...")
+                    # Retry once on timeout
+                    try:
+                        long_order, short_order = await asyncio.wait_for(
+                            asyncio.gather(
+                                long_client.place_market_order(long_symbol, Side.LONG, size_per_split),
+                                short_client.place_market_order(short_symbol, Side.SHORT, size_per_split)
+                            ),
+                            timeout=30.0
+                        )
+                        results["splits_completed"] += 1
+                        results["total_long_size"] += size_per_split
+                        results["total_short_size"] += size_per_split
+                        results["split_results"].append({
+                            "split": split_num,
+                            "success": True,
+                            "long_order": long_order.order_id if long_order else None,
+                            "short_order": short_order.order_id if short_order else None
+                        })
+                        log_msg(f"✓ Split {split_num}/{split_count} completed (retry)")
+                        
+                        if split_num == 1 and on_first_split_complete:
+                            try:
+                                on_first_split_complete(size_per_split)
+                            except Exception as e:
+                                logger.error(f"Error in on_first_split_complete callback: {e}")
+                        
+                        if i < split_count - 1:
+                            await asyncio.sleep(delay_between_splits)
+                    except Exception as retry_e:
+                        logger.error(f"✗ Split {split_num} failed on retry: {retry_e}")
+                        results["split_results"].append({
+                            "split": split_num,
+                            "success": False,
+                            "error": str(retry_e)
+                        })
+                        
+                except Exception as e:
+                    logger.error(f"✗ Split {split_num} failed: {e}")
+                    log_msg(f"❌ Split {split_num} failed: {e}")
+                    results["split_results"].append({
+                        "split": split_num,
+                        "success": False,
+                        "error": str(e)
+                    })
+                    # Continue with remaining splits even if one fails
+            
+            # Consider success if at least one split completed
+            if results["splits_completed"] > 0:
+                results["success"] = True
+                log_msg(f"✅ Completed {results['splits_completed']}/{split_count} splits")
+            else:
+                results["error"] = "All splits failed"
+                
+        except Exception as e:
+            results["error"] = str(e)
+            logger.error(f"❌ Failed to open hedged position: {e}")
+        
+        logger.debug(f"open_hedged_position_split: EXIT with success={results.get('success')}")
+        return results
 
 
 class FundingHunterGUI:
@@ -385,6 +645,10 @@ class FundingHunterGUI:
         self.waiting_for_price_spread = False
         self.price_spread_check_task = None
         self.price_spread_params = None  # Store params: pair, long_ex, short_ex, size, leverage
+        
+        # UI update tasks (to prevent spam and manage recurring updates)
+        self._pair_info_update_task = None
+        self._usdt_update_pending = None
         
         # Build UI
         self._create_menu()
@@ -600,7 +864,9 @@ class FundingHunterGUI:
         
         # Debug mode checkbox
         self.debug_mode = tk.BooleanVar(value=False)
-        ttk.Checkbutton(btn_frame, text="🔍 Debug Mode", variable=self.debug_mode).pack(side=tk.LEFT, padx=10)
+        self.debug_checkbox = ttk.Checkbutton(btn_frame, text="🔍 Debug Mode", variable=self.debug_mode,
+                                               command=self._on_debug_mode_changed)
+        self.debug_checkbox.pack(side=tk.LEFT, padx=10)
         
         self.status_label = ttk.Label(btn_frame, text="⚪ Disconnected")
         self.status_label.pack(side=tk.LEFT, padx=20)
@@ -678,15 +944,33 @@ class FundingHunterGUI:
                                          command=self._load_binance_pairs, state=tk.DISABLED)
         self.load_pairs_btn.pack(side=tk.LEFT, padx=5)
         
-        ttk.Label(pair_frame, text="Leverage:").pack(side=tk.LEFT, padx=10)
+        # Second row: Leverage, Size, Splits
+        settings_frame = ttk.Frame(frame)
+        settings_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(settings_frame, text="Leverage:").pack(side=tk.LEFT, padx=5)
         self.leverage_var = tk.StringVar(value="10")
-        self.leverage_spin = ttk.Spinbox(pair_frame, from_=1, to=100, width=5, textvariable=self.leverage_var)
+        self.leverage_spin = ttk.Spinbox(settings_frame, from_=1, to=100, width=5, textvariable=self.leverage_var)
         self.leverage_spin.pack(side=tk.LEFT, padx=5)
         
-        ttk.Label(pair_frame, text="Size:").pack(side=tk.LEFT, padx=10)
-        self.size_entry = ttk.Entry(pair_frame, width=12)
+        ttk.Label(settings_frame, text="Size:").pack(side=tk.LEFT, padx=10)
+        self.size_entry = ttk.Entry(settings_frame, width=12)
         self.size_entry.insert(0, "0.01")
         self.size_entry.pack(side=tk.LEFT, padx=5)
+        
+        # USDT volume display (calculated from size * price)
+        self.usdt_vol_label = ttk.Label(settings_frame, text="≈ $0.00 USDT", foreground="blue")
+        self.usdt_vol_label.pack(side=tk.LEFT, padx=5)
+        
+        # Bind size entry to update USDT volume on change
+        self.size_entry.bind('<KeyRelease>', self._update_usdt_volume)
+        
+        # Split count for DCA-style opening
+        ttk.Label(settings_frame, text="Splits:").pack(side=tk.LEFT, padx=10)
+        self.split_count_var = tk.StringVar(value="1")
+        self.split_count_combo = ttk.Combobox(settings_frame, textvariable=self.split_count_var, 
+                                               values=["1", "3", "5", "10"], width=4, state='readonly')
+        self.split_count_combo.pack(side=tk.LEFT, padx=5)
         
         # Exchange selection
         ex_frame = ttk.LabelFrame(frame, text="Select Exchanges for Arbitrage", padding="10")
@@ -741,6 +1025,10 @@ class FundingHunterGUI:
         self.monitor_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(option_frame, text="Monitor positions (check every 2s)", 
                        variable=self.monitor_var).pack(anchor=tk.W)
+        
+        self.skip_leverage_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(option_frame, text="Skip leverage set (faster entry)", 
+                       variable=self.skip_leverage_var).pack(anchor=tk.W)
         
         # Threshold settings
         threshold_frame = ttk.Frame(option_frame)
@@ -873,26 +1161,85 @@ class FundingHunterGUI:
         ttk.Button(frame, text="Clear", command=self._clear_logs).pack(side=tk.RIGHT, pady=5)
     
     def _setup_logging(self):
-        """Setup logging to GUI"""
+        """Setup logging to GUI and optionally to file"""
         class GUIHandler(logging.Handler):
-            def __init__(self, text_widget):
+            def __init__(self, text_widget, root):
                 super().__init__()
                 self.text_widget = text_widget
+                self.root = root
+                self._pending_msgs = []
+                self._flush_scheduled = False
             
             def emit(self, record):
                 msg = self.format(record)
-                self.text_widget.after(0, self._append, msg)
+                self._pending_msgs.append(msg)
+                # Batch messages - flush every 100ms instead of immediately
+                if not self._flush_scheduled:
+                    self._flush_scheduled = True
+                    self.root.after(100, self._flush)
             
-            def _append(self, msg):
+            def _flush(self):
+                self._flush_scheduled = False
+                if not self._pending_msgs:
+                    return
+                # Batch all pending messages
+                msgs = self._pending_msgs[:]
+                self._pending_msgs.clear()
                 self.text_widget.configure(state=tk.NORMAL)
-                self.text_widget.insert(tk.END, msg + "\n")
+                for msg in msgs:
+                    self.text_widget.insert(tk.END, msg + "\n")
                 self.text_widget.see(tk.END)
                 self.text_widget.configure(state=tk.DISABLED)
         
-        handler = GUIHandler(self.log_text)
+        handler = GUIHandler(self.log_text, self.root)
         handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logging.root.addHandler(handler)
         logging.root.setLevel(logging.INFO)
+        
+        # Store reference for file handler (will be added when debug mode enabled)
+        self._file_handler = None
+        self._log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+    
+    def _setup_debug_file_logging(self):
+        """Setup file logging when debug mode is enabled"""
+        if self._file_handler:
+            return  # Already setup
+        
+        # Create logs directory if not exists
+        os.makedirs(self._log_dir, exist_ok=True)
+        
+        # Create log file with timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_file = os.path.join(self._log_dir, f"session_{timestamp}.log")
+        
+        # Create file handler
+        self._file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        self._file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s'))
+        self._file_handler.setLevel(logging.DEBUG)
+        
+        # Add to root logger
+        logging.root.addHandler(self._file_handler)
+        logging.root.setLevel(logging.DEBUG)
+        
+        self._log(f"📁 Debug log file: {log_file}")
+    
+    def _remove_debug_file_logging(self):
+        """Remove file logging when debug mode is disabled"""
+        if self._file_handler:
+            logging.root.removeHandler(self._file_handler)
+            self._file_handler.close()
+            self._file_handler = None
+            logging.root.setLevel(logging.INFO)
+    
+    def _on_debug_mode_changed(self):
+        """Handle debug mode checkbox change"""
+        if self.debug_mode.get():
+            self._setup_debug_file_logging()
+            self._log("🔍 Debug mode ENABLED - Logging to file")
+        else:
+            self._log("🔍 Debug mode DISABLED")
+            self._remove_debug_file_logging()
     
     def _start_async_loop(self):
         """Start async loop"""
@@ -987,15 +1334,16 @@ class FundingHunterGUI:
             
             if len(connected) >= 2:
                 self.connected = True
-                self.root.after(0, self._update_ui_connected, connected, balances)
-                self._log(f"Connected to: {', '.join(connected)}")
+                # Use root.after to ensure UI update happens on main thread
+                self.root.after(0, lambda: self._update_ui_connected(connected, balances))
+                self.root.after(0, lambda: self._log(f"Connected to: {', '.join(connected)}"))
             else:
                 self.root.after(0, self._update_ui_disconnected)
-                self._log(f"Need at least 2 exchanges. Connected: {connected}")
-                messagebox.showerror("Error", "Need at least 2 exchanges connected for arbitrage")
+                self.root.after(0, lambda: self._log(f"Need at least 2 exchanges. Connected: {connected}"))
+                self.root.after(0, lambda: messagebox.showerror("Error", "Need at least 2 exchanges connected for arbitrage"))
         except Exception as e:
             self.root.after(0, self._update_ui_disconnected)
-            self._log(f"Connection error: {e}")
+            self.root.after(0, lambda: self._log(f"Connection error: {e}"))
     
     def _update_ui_connected(self, connected, balances):
         """Update UI after connection"""
@@ -1092,17 +1440,20 @@ class FundingHunterGUI:
     
     def _on_load_pairs_complete(self, future):
         """Handle load pairs complete"""
-        self.root.after(0, lambda: self.load_pairs_btn.config(state=tk.NORMAL))
+        def update_ui():
+            self.load_pairs_btn.config(state=tk.NORMAL)
+            try:
+                pairs = future.result()
+                if pairs:
+                    self._update_pair_dropdown(pairs)
+                    self._log(f"✅ Loaded {len(pairs)} pairs from Binance")
+                else:
+                    self._log("❌ No pairs loaded from Binance")
+            except Exception as e:
+                self._log(f"Error loading pairs: {e}")
         
-        try:
-            pairs = future.result()
-            if pairs:
-                self.root.after(0, self._update_pair_dropdown, pairs)
-                self._log(f"✅ Loaded {len(pairs)} pairs from Binance")
-            else:
-                self._log("❌ No pairs loaded from Binance")
-        except Exception as e:
-            self._log(f"Error loading pairs: {e}")
+        # Run on main thread
+        self.root.after(0, update_ui)
     
     def _update_pair_dropdown(self, pairs):
         """Update pair dropdown with new pairs"""
@@ -1137,12 +1488,18 @@ class FundingHunterGUI:
             size = float(self.size_entry.get())
             leverage = int(self.leverage_var.get())
             price_spread_min = float(self.price_spread_threshold.get())
+            split_count = int(self.split_count_var.get())
         except ValueError:
             messagebox.showerror("Error", "Invalid size, leverage, or price spread threshold")
             return
         
         long_ex = self._get_exchange_enum(long_ex_name)
         short_ex = self._get_exchange_enum(short_ex_name)
+        
+        # Cancel any running pair info updates to avoid API conflicts
+        if self._pair_info_update_task:
+            self.root.after_cancel(self._pair_info_update_task)
+            self._pair_info_update_task = None
         
         # Store parameters for continuous checking
         self.price_spread_params = {
@@ -1153,7 +1510,9 @@ class FundingHunterGUI:
             "short_ex_name": short_ex_name,
             "size": size,
             "leverage": leverage,
-            "price_spread_min": price_spread_min
+            "price_spread_min": price_spread_min,
+            "split_count": split_count,
+            "skip_leverage": self.skip_leverage_var.get()
         }
         
         # Start waiting mode
@@ -1182,28 +1541,42 @@ class FundingHunterGUI:
         
         params = self.price_spread_params
         
+        # Thread-safe log callback - define ONCE here
+        def safe_log(msg):
+            self.root.after(0, lambda m=msg: self._log(m))
+        
         async def check_and_open():
             try:
-                # Get current prices from both exchanges
+                # Get current prices from both exchanges with timeout
                 long_client = self.manager.clients.get(params["long_ex"])
                 short_client = self.manager.clients.get(params["short_ex"])
                 
                 if not long_client or not short_client:
-                    self._log("❌ Exchange clients not available")
+                    safe_log("❌ Exchange clients not available")
                     return {"success": False, "error": "Exchange clients not available"}
                 
                 long_symbol = get_exchange_symbol(params["pair"], params["long_ex"])
                 short_symbol = get_exchange_symbol(params["pair"], params["short_ex"])
                 
-                long_price = await long_client.get_mark_price(long_symbol)
-                short_price = await short_client.get_mark_price(short_symbol)
+                # Fetch prices with timeout to prevent hanging
+                try:
+                    long_price, short_price = await asyncio.wait_for(
+                        asyncio.gather(
+                            long_client.get_mark_price(long_symbol),
+                            short_client.get_mark_price(short_symbol)
+                        ),
+                        timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    safe_log("⚠️ Timeout fetching prices, retrying...")
+                    return {"success": False, "waiting": True}
                 
                 # Calculate price spread percentage
                 price_diff = abs(short_price - long_price)
                 avg_price = (long_price + short_price) / 2
                 price_spread_pct = (price_diff / avg_price) * 100
                 
-                self._log(f"📊 Price spread: {price_spread_pct:.4f}% (threshold: {params['price_spread_min']}%) | LONG: ${long_price:,.6f} | SHORT: ${short_price:,.6f}")
+                safe_log(f"📊 Price spread: {price_spread_pct:.4f}% (threshold: {params['price_spread_min']}%) | LONG: ${long_price:,.6f} | SHORT: ${short_price:,.6f}")
                 
                 # Check if spread meets minimum threshold
                 if price_spread_pct < params["price_spread_min"]:
@@ -1211,21 +1584,34 @@ class FundingHunterGUI:
                     return {"success": False, "waiting": True}
                 
                 # Price spread is good, proceed to open position!
-                self._log(f"✅ Price spread threshold met! Opening position now...")
-                self._log(f"Opening: {params['pair']} | Long {params['long_ex_name']} | Short {params['short_ex_name']} | Size: {params['size']}")
+                split_count = params.get("split_count", 1)
+                safe_log(f"✅ Price spread threshold met! Opening position in {split_count} splits...")
+                safe_log(f"Opening: {params['pair']} | Long {params['long_ex_name']} | Short {params['short_ex_name']} | Size: {params['size']} | Splits: {split_count}")
                 
-                result = await self.manager.open_hedged_position(
+                # Callback to start monitoring after first split
+                def on_first_split(size_opened):
+                    self.root.after(0, lambda: self._on_first_split_complete(params, size_opened))
+                
+                result = await self.manager.open_hedged_position_split(
                     params["pair"], 
                     params["long_ex"], 
                     params["short_ex"], 
                     params["size"], 
-                    params["leverage"]
+                    params["leverage"],
+                    split_count=split_count,
+                    delay_between_splits=2.0,  # Reduced from 13s to 2s for faster execution
+                    price_spread_min=params["price_spread_min"],
+                    spread_check_interval=2.0,
+                    max_wait_per_split=3600.0,
+                    log_callback=safe_log,
+                    on_first_split_complete=on_first_split,
+                    skip_leverage_set=params.get("skip_leverage", False)
                 )
                 
                 return result
                 
             except Exception as e:
-                self._log(f"❌ Error: {e}")
+                safe_log(f"❌ Error: {e}")
                 return {"success": False, "error": str(e)}
         
         future = self._run_async(check_and_open())
@@ -1234,55 +1620,113 @@ class FundingHunterGUI:
     
     def _on_price_spread_check_complete(self, future):
         """Handle price spread check result"""
-        try:
-            result = future.result()
-            
-            # Check if just waiting (spread not met yet)
-            if not result.get("success") and result.get("waiting"):
-                # Schedule next check in 2 seconds
-                if self.waiting_for_price_spread:
-                    self.price_spread_check_task = self.root.after(2000, self._check_price_spread_and_open)
-                return
-            
-            # Either success or error - stop waiting mode
-            self.waiting_for_price_spread = False
-            self.open_btn.configure(text="Open Position", state=tk.NORMAL)
-            
-            if result.get("success"):
-                # Position opened successfully!
-                params = self.price_spread_params
-                if not params:
+        logger.debug("_on_price_spread_check_complete: ENTER (callback from async thread)")
+        
+        def update_ui():
+            logger.debug("_on_price_spread_check_complete.update_ui: ENTER (on main thread)")
+            try:
+                # Get result with timeout to prevent blocking
+                result = future.result(timeout=0.1)  # Should already be done
+                logger.debug(f"_on_price_spread_check_complete.update_ui: got result success={result.get('success')}")
+                
+                # Check if just waiting (spread not met yet)
+                if not result.get("success") and result.get("waiting"):
+                    # Schedule next check in 2 seconds
+                    if self.waiting_for_price_spread:
+                        self.price_spread_check_task = self.root.after(2000, self._check_price_spread_and_open)
+                    logger.debug("_on_price_spread_check_complete.update_ui: EXIT (waiting)")
                     return
+                
+                # Either success or error - stop waiting mode
+                self.waiting_for_price_spread = False
+                self.open_btn.configure(text="Open Position", state=tk.NORMAL)
+                
+                if result.get("success"):
+                    # Position opened successfully!
+                    params = self.price_spread_params
+                    if not params:
+                        logger.debug("_on_price_spread_check_complete.update_ui: EXIT (no params)")
+                        return
                     
-                self._log("✅ Position opened successfully!")
+                    splits_completed = result.get("splits_completed", 1)
+                    splits_total = result.get("splits_total", 1)
+                    self._log(f"✅ Position opened successfully! ({splits_completed}/{splits_total} splits completed)")
+                    
+                    # NOW start monitoring after all splits are done
+                    total_size = result.get("total_long_size", params["size"])
+                    self._on_all_splits_complete(params, total_size)
+                    logger.debug("_on_price_spread_check_complete.update_ui: EXIT (called _on_all_splits_complete)")
+                    
+                else:
+                    # Error occurred
+                    error_msg = result.get("error", "Unknown error")
+                    self._log(f"❌ Failed to open position: {error_msg}")
+                    # Schedule messagebox to not block current callback
+                    self.root.after(10, lambda: messagebox.showerror("Error", f"Failed to open position:\n{error_msg}"))
+                    logger.debug("_on_price_spread_check_complete.update_ui: EXIT (error)")
                 
-                # Get initial funding rates and setup position tracking
-                self._setup_position_tracking(
-                    params["pair"], 
-                    params["long_ex"], 
-                    params["short_ex"], 
-                    params["size"]
-                )
-                
-                # Start monitoring
-                if not self.monitoring:
-                    self._start_monitoring()
-                
-            else:
-                # Error occurred
-                error_msg = result.get("error", "Unknown error")
-                self._log(f"❌ Failed to open position: {error_msg}")
-                messagebox.showerror("Error", f"Failed to open position:\n{error_msg}")
+            except Exception as e:
+                self.waiting_for_price_spread = False
+                self.open_btn.configure(text="Open Position", state=tk.NORMAL)
+                self._log(f"❌ Error: {e}")
+                # Schedule messagebox to not block current callback
+                self.root.after(10, lambda err=str(e): messagebox.showerror("Error", err))
+                logger.debug(f"_on_price_spread_check_complete.update_ui: EXIT (exception: {e})")
+        
+        # Run on main thread
+        self.root.after(0, update_ui)
+        logger.debug("_on_price_spread_check_complete: EXIT (scheduled update_ui)")
+    
+    def _on_first_split_complete(self, params, size_opened):
+        """Called after first split completes - just track position, don't start full monitoring yet"""
+        logger.debug("_on_first_split_complete: ENTER")
+        try:
+            # Cancel pair info update to avoid overloading during position
+            if self._pair_info_update_task:
+                self.root.after_cancel(self._pair_info_update_task)
+                self._pair_info_update_task = None
+                logger.debug("_on_first_split_complete: Cancelled pair info update task")
             
+            # Just setup position tracking, DON'T start monitoring yet
+            # Monitoring will start after ALL splits complete to reduce GUI load
+            self._setup_position_tracking(
+                params["pair"], 
+                params["long_ex"], 
+                params["short_ex"], 
+                size_opened
+            )
+            
+            logger.debug("_on_first_split_complete: EXIT")
         except Exception as e:
-            self.waiting_for_price_spread = False
-            self.open_btn.configure(text="Open Position", state=tk.NORMAL)
-            self._log(f"❌ Error: {e}")
-            messagebox.showerror("Error", str(e))
+            logger.error(f"_on_first_split_complete error: {e}")
+    
+    def _on_all_splits_complete(self, params, total_size):
+        """Called after ALL splits complete - now start monitoring"""
+        logger.debug("_on_all_splits_complete: ENTER")
+        try:
+            # Update position size to final total
+            if self.active_position:
+                self.active_position["size"] = total_size
+            
+            # Now start monitoring (delayed to let GUI settle)
+            def start_monitor():
+                if not self.monitoring:
+                    logger.debug("_on_first_split_complete: Starting monitoring")
+                    self._start_monitoring()
+                else:
+                    logger.debug("_on_first_split_complete: Monitoring already active")
+            
+            self.root.after(500, start_monitor)
+            logger.debug("_on_first_split_complete: EXIT")
+        except Exception as e:
+            logger.error(f"_on_first_split_complete: ERROR {e}")
     
     def _setup_position_tracking(self, pair, long_ex, short_ex, size):
         """Setup position tracking after successful open"""
+        logger.debug("_setup_position_tracking: ENTER")
+        
         async def get_initial_funding():
+            logger.debug("_setup_position_tracking.get_initial_funding: ENTER")
             rates = {}
             for ex in [long_ex, short_ex]:
                 client = self.manager.clients.get(ex)
@@ -1293,101 +1737,19 @@ class FundingHunterGUI:
                         rates[ex] = funding_rate.funding_rate
                     except Exception as e:
                         logger.debug(f"Could not get funding rate from {ex.value}: {e}")
+            logger.debug("_setup_position_tracking.get_initial_funding: EXIT")
             return rates
         
         def on_funding_fetched(fut):
-            try:
-                initial_rates = fut.result()
-                long_rate = initial_rates.get(long_ex, 0)
-                short_rate = initial_rates.get(short_ex, 0)
-                initial_net_funding = short_rate - long_rate
-                
-                from datetime import datetime
-                self.active_position = {
-                    "pair": pair,
-                    "long_exchange": long_ex,
-                    "short_exchange": short_ex,
-                    "size": size,
-                    "open_time": datetime.now(timezone.utc),
-                    "total_funding_fees": 0.0,
-                    "last_funding_check": datetime.now(timezone.utc),
-                    # Funding reversal tracking
-                    "initial_long_rate": long_rate,
-                    "initial_short_rate": short_rate,
-                    "initial_net_funding": initial_net_funding,
-                }
-                
-                self._log(f"📊 Initial Funding - LONG: {long_rate*100:.6f}%, SHORT: {short_rate*100:.6f}%, Net: {initial_net_funding*100:.6f}%")
-                self._update_position_display()
-                
-            except Exception as e:
-                logger.error(f"Error fetching initial funding: {e}")
-        
-        future = self._run_async(get_initial_funding())
-        if future:
-            future.add_done_callback(on_funding_fetched)
-    
-    def _on_open_complete(self, future, pair, long_ex, short_ex, size):
-        """Handle open complete"""
-        self.root.after(0, lambda: self.open_btn.config(state=tk.NORMAL))
-        
-        try:
-            result = future.result()
-            if result["success"]:
-                self._log("✅ Position opened successfully!")
-                
-                # Get initial funding rates
-                async def get_initial_funding():
-                    rates = {}
-                    for ex in [long_ex, short_ex]:
-                        client = self.manager.clients.get(ex)
-                        if client:
-                            try:
-                                symbol = get_exchange_symbol(pair, ex)
-                                funding_rate = await client.get_funding_rate(symbol)
-                                rates[ex] = funding_rate.funding_rate
-                            except Exception as e:
-                                logger.debug(f"Could not get funding rate from {ex.value}: {e}")
-                    return rates
-                
-                def on_funding_fetched(fut):
-                    try:
-                        initial_rates = fut.result()
-                        long_rate = initial_rates.get(long_ex, 0)
-                        short_rate = initial_rates.get(short_ex, 0)
-                        initial_net_funding = short_rate - long_rate
-                        
-                        from datetime import datetime
-                        self.active_position = {
-                            "pair": pair,
-                            "long_exchange": long_ex,
-                            "short_exchange": short_ex,
-                            "size": size,
-                            "open_time": datetime.now(timezone.utc),
-                            "total_funding_fees": 0.0,
-                            "last_funding_check": datetime.now(timezone.utc),
-                            # Funding reversal tracking
-                            "initial_long_rate": long_rate,
-                            "initial_short_rate": short_rate,
-                            "initial_net_funding": initial_net_funding,
-                        }
-                        
-                        self._log(f"📊 Initial Funding - LONG: {long_rate*100:.6f}%, SHORT: {short_rate*100:.6f}%, Net: {initial_net_funding*100:.6f}%")
-                        self.root.after(0, self._update_position_display)
-                        
-                        # Start monitoring
-                        if self.monitor_var.get():
-                            self._start_monitoring()
-                            
-                    except Exception as e:
-                        logger.error(f"Error tracking initial funding: {e}")
-                
-                # Fetch initial funding rates
-                funding_future = self._run_async(get_initial_funding())
-                if funding_future:
-                    funding_future.add_done_callback(on_funding_fetched)
-                else:
-                    # Fallback if async fails
+            logger.debug("_setup_position_tracking.on_funding_fetched: ENTER")
+            def update_ui():
+                logger.debug("_setup_position_tracking.update_ui: ENTER")
+                try:
+                    initial_rates = fut.result(timeout=0.1)  # Should already be done
+                    long_rate = initial_rates.get(long_ex, 0)
+                    short_rate = initial_rates.get(short_ex, 0)
+                    initial_net_funding = short_rate - long_rate
+                    
                     from datetime import datetime
                     self.active_position = {
                         "pair": pair,
@@ -1397,18 +1759,117 @@ class FundingHunterGUI:
                         "open_time": datetime.now(timezone.utc),
                         "total_funding_fees": 0.0,
                         "last_funding_check": datetime.now(timezone.utc),
-                        "initial_long_rate": 0,
-                        "initial_short_rate": 0,
-                        "initial_net_funding": 0,
+                        # Funding reversal tracking
+                        "initial_long_rate": long_rate,
+                        "initial_short_rate": short_rate,
+                        "initial_net_funding": initial_net_funding,
                     }
-                    self.root.after(0, self._update_position_display)
-                    if self.monitor_var.get():
-                        self._start_monitoring()
-            else:
-                self._log(f"❌ Failed: {result['error']}")
-                messagebox.showerror("Error", result['error'])
-        except Exception as e:
-            self._log(f"Error: {e}")
+                    
+                    self._log(f"📊 Initial Funding - LONG: {long_rate*100:.6f}%, SHORT: {short_rate*100:.6f}%, Net: {initial_net_funding*100:.6f}%")
+                    self._update_position_display()
+                    logger.debug("_setup_position_tracking.update_ui: EXIT")
+                    
+                except Exception as e:
+                    logger.error(f"Error fetching initial funding: {e}")
+            
+            # Run on main thread
+            self.root.after(0, update_ui)
+            logger.debug("_setup_position_tracking.on_funding_fetched: EXIT")
+        
+        future = self._run_async(get_initial_funding())
+        if future:
+            future.add_done_callback(on_funding_fetched)
+        logger.debug("_setup_position_tracking: EXIT")
+    
+    def _on_open_complete(self, future, pair, long_ex, short_ex, size):
+        """Handle open complete"""
+        def update_ui():
+            self.open_btn.config(state=tk.NORMAL)
+            
+            try:
+                result = future.result()
+                if result["success"]:
+                    self._log("✅ Position opened successfully!")
+                    
+                    # Get initial funding rates
+                    async def get_initial_funding():
+                        rates = {}
+                        for ex in [long_ex, short_ex]:
+                            client = self.manager.clients.get(ex)
+                            if client:
+                                try:
+                                    symbol = get_exchange_symbol(pair, ex)
+                                    funding_rate = await client.get_funding_rate(symbol)
+                                    rates[ex] = funding_rate.funding_rate
+                                except Exception as e:
+                                    logger.debug(f"Could not get funding rate from {ex.value}: {e}")
+                        return rates
+                    
+                    def on_funding_fetched(fut):
+                        def inner_update():
+                            try:
+                                initial_rates = fut.result()
+                                long_rate = initial_rates.get(long_ex, 0)
+                                short_rate = initial_rates.get(short_ex, 0)
+                                initial_net_funding = short_rate - long_rate
+                                
+                                from datetime import datetime
+                                self.active_position = {
+                                    "pair": pair,
+                                    "long_exchange": long_ex,
+                                    "short_exchange": short_ex,
+                                    "size": size,
+                                    "open_time": datetime.now(timezone.utc),
+                                    "total_funding_fees": 0.0,
+                                    "last_funding_check": datetime.now(timezone.utc),
+                                    # Funding reversal tracking
+                                    "initial_long_rate": long_rate,
+                                    "initial_short_rate": short_rate,
+                                    "initial_net_funding": initial_net_funding,
+                                }
+                                
+                                self._log(f"📊 Initial Funding - LONG: {long_rate*100:.6f}%, SHORT: {short_rate*100:.6f}%, Net: {initial_net_funding*100:.6f}%")
+                                self._update_position_display()
+                                
+                                # Start monitoring
+                                if self.monitor_var.get():
+                                    self._start_monitoring()
+                                    
+                            except Exception as e:
+                                logger.error(f"Error tracking initial funding: {e}")
+                        
+                        self.root.after(0, inner_update)
+                    
+                    # Fetch initial funding rates
+                    funding_future = self._run_async(get_initial_funding())
+                    if funding_future:
+                        funding_future.add_done_callback(on_funding_fetched)
+                    else:
+                        # Fallback if async fails
+                        from datetime import datetime
+                        self.active_position = {
+                            "pair": pair,
+                            "long_exchange": long_ex,
+                            "short_exchange": short_ex,
+                            "size": size,
+                            "open_time": datetime.now(timezone.utc),
+                            "total_funding_fees": 0.0,
+                            "last_funding_check": datetime.now(timezone.utc),
+                            "initial_long_rate": 0,
+                            "initial_short_rate": 0,
+                            "initial_net_funding": 0,
+                        }
+                        self._update_position_display()
+                        if self.monitor_var.get():
+                            self._start_monitoring()
+                else:
+                    self._log(f"❌ Failed: {result['error']}")
+                    messagebox.showerror("Error", result['error'])
+            except Exception as e:
+                self._log(f"Error: {e}")
+        
+        # Run on main thread
+        self.root.after(0, update_ui)
     
     def _close_position(self):
         """Close position"""
@@ -1433,21 +1894,25 @@ class FundingHunterGUI:
     
     def _on_close_complete(self, future):
         """Handle close complete"""
-        try:
-            result = future.result()
-            if result["success"]:
-                self._log("✅ Position closed!")
-                self._stop_monitoring()
-                self.active_position = None
-                self.root.after(0, self._clear_position_display)
-                
-                # If auto trading is enabled, it will resume scanning
-                if self.auto_trading_active:
-                    self._log(f"🤖 Auto Trading: Resuming signal scanning...")
-            else:
-                self._log(f"❌ Close failed: {result['error']}")
-        except Exception as e:
-            self._log(f"Error: {e}")
+        def update_ui():
+            try:
+                result = future.result()
+                if result["success"]:
+                    self._log("✅ Position closed!")
+                    self._stop_monitoring()
+                    self.active_position = None
+                    self._clear_position_display()
+                    
+                    # If auto trading is enabled, it will resume scanning
+                    if self.auto_trading_active:
+                        self._log(f"🤖 Auto Trading: Resuming signal scanning...")
+                else:
+                    self._log(f"❌ Close failed: {result['error']}")
+            except Exception as e:
+                self._log(f"Error: {e}")
+        
+        # Run on main thread
+        self.root.after(0, update_ui)
     
     def _start_monitoring(self):
         """Start position monitoring"""
@@ -1456,6 +1921,10 @@ class FundingHunterGUI:
         
         self.monitoring = True
         self._log("Started position monitoring")
+        
+        # Thread-safe log for async context
+        def safe_log(msg):
+            self.root.after(0, lambda: self._log(msg))
         
         async def monitor_loop():
             while self.monitoring and self.active_position:
@@ -1494,7 +1963,7 @@ class FundingHunterGUI:
                     
                     # Check liquidation
                     if result['liquidated']:
-                        self._log(f"⚠️ LIQUIDATION on {result['liquidated'].value}!")
+                        safe_log(f"⚠️ LIQUIDATION on {result['liquidated'].value}!")
                         
                         if self.auto_close_var.get():
                             # Close other side
@@ -1504,7 +1973,7 @@ class FundingHunterGUI:
                                 symbol = get_exchange_symbol(pos['pair'], other_ex)
                                 try:
                                     await client.close_position(symbol)
-                                    self._log(f"Auto-closed position on {other_ex.value}")
+                                    safe_log(f"Auto-closed position on {other_ex.value}")
                                 except:
                                     pass
                         
@@ -1518,7 +1987,7 @@ class FundingHunterGUI:
                         
                         # If auto trading is enabled, it will resume scanning
                         if self.auto_trading_active:
-                            self._log(f"🤖 Auto Trading: Resuming signal scanning after liquidation...")
+                            safe_log(f"🤖 Auto Trading: Resuming signal scanning after liquidation...")
                         
                         break
                     
@@ -1526,8 +1995,8 @@ class FundingHunterGUI:
                     if self.auto_close_reversal_var.get() and 'initial_net_funding' in pos:
                         should_close, reason = await self._check_funding_reversal(pos)
                         if should_close:
-                            self._log(f"🔄 Funding reversal detected: {reason}")
-                            self._log(f"🔄 Auto-closing position...")
+                            safe_log(f"🔄 Funding reversal detected: {reason}")
+                            safe_log(f"🔄 Auto-closing position...")
                             
                             # Close position
                             try:
@@ -1536,7 +2005,7 @@ class FundingHunterGUI:
                                 )
                                 
                                 if close_result["success"]:
-                                    self._log(f"✅ Position auto-closed due to: {reason}")
+                                    safe_log(f"✅ Position auto-closed due to: {reason}")
                                     self.root.after(0, lambda r=reason: messagebox.showinfo(
                                         "Auto-Close", 
                                         f"Position closed:\n{r}"
@@ -1544,12 +2013,12 @@ class FundingHunterGUI:
                                     
                                     # If auto trading is enabled, it will resume scanning
                                     if self.auto_trading_active:
-                                        self._log(f"🤖 Auto Trading: Resuming signal scanning...")
+                                        safe_log(f"🤖 Auto Trading: Resuming signal scanning...")
                                 else:
-                                    self._log(f"❌ Auto-close failed: {close_result['error']}")
+                                    safe_log(f"❌ Auto-close failed: {close_result['error']}")
                                     
                             except Exception as e:
-                                self._log(f"❌ Auto-close error: {e}")
+                                safe_log(f"❌ Auto-close error: {e}")
                             
                             self.monitoring = False
                             self.active_position = None
@@ -1754,6 +2223,10 @@ class FundingHunterGUI:
         self.pos_size_label.config(text="Size: -")
         self.pos_pnl_label.config(text="PnL: $0.00 | Funding: $0.00 | Total: $0.00", foreground='black')
         self.pos_status_label.config(text="Status: No Position", foreground='black')
+        
+        # Restart pair info update loop when position is closed
+        if not self._pair_info_update_task:
+            self._update_pair_info()
     
     def _refresh_funding(self):
         """Refresh funding rates"""
@@ -1831,11 +2304,15 @@ class FundingHunterGUI:
     
     def _on_funding_complete(self, future):
         """Handle funding refresh complete"""
-        try:
-            all_rates = future.result()
-            self.root.after(0, self._update_funding_table, all_rates)
-        except Exception as e:
-            self._log(f"Error: {e}")
+        def update_ui():
+            try:
+                all_rates = future.result()
+                self._update_funding_table(all_rates)
+            except Exception as e:
+                self._log(f"Error: {e}")
+        
+        # Run on main thread
+        self.root.after(0, update_ui)
     
     def _update_funding_table(self, all_rates):
         """Update funding table - sorted by Best Spread (highest to lowest)"""
@@ -1946,10 +2423,12 @@ class FundingHunterGUI:
     def _on_pair_changed(self, event):
         """Handle pair dropdown selection change in Trading Panel"""
         self._update_pair_info()
+        self._update_usdt_volume()
     
     def _on_exchange_changed(self, event):
         """Handle exchange dropdown selection change in Trading Panel"""
         self._update_pair_info()
+        self._update_usdt_volume()
     
     def _toggle_auto_trading(self):
         """Toggle auto trading on/off with Start/Stop button"""
@@ -2199,6 +2678,61 @@ class FundingHunterGUI:
         if future:
             future.add_done_callback(lambda f: None)
     
+    def _update_usdt_volume(self, event=None):
+        """Update USDT volume display based on size and current price"""
+        # Cancel any pending update to prevent spam
+        if hasattr(self, '_usdt_update_pending') and self._usdt_update_pending:
+            self.root.after_cancel(self._usdt_update_pending)
+            self._usdt_update_pending = None
+        
+        # Debounce - wait 500ms before actually fetching
+        self._usdt_update_pending = self.root.after(500, self._do_update_usdt_volume)
+    
+    def _do_update_usdt_volume(self):
+        """Actually update USDT volume (debounced)"""
+        self._usdt_update_pending = None
+        
+        try:
+            size = float(self.size_entry.get())
+        except (ValueError, AttributeError):
+            self.usdt_vol_label.config(text="≈ $0.00 USDT")
+            return
+        
+        # Get cached price from any connected exchange
+        pair = self.pair_combo.get()
+        if not pair or not self.connected:
+            self.usdt_vol_label.config(text="≈ $?.?? USDT")
+            return
+        
+        # Fetch price async
+        async def get_price():
+            for exchange, client in self.manager.clients.items():
+                try:
+                    symbol = get_exchange_symbol(pair, exchange)
+                    price = await client.get_mark_price(symbol)
+                    return price
+                except:
+                    continue
+            return None
+        
+        def on_price(future):
+            try:
+                price = future.result()
+                if price:
+                    usdt_value = size * price
+                    self.root.after(0, lambda: self.usdt_vol_label.config(
+                        text=f"≈ ${usdt_value:,.2f} USDT",
+                        foreground="green" if usdt_value >= 10 else "orange"
+                    ))
+                else:
+                    self.root.after(0, lambda: self.usdt_vol_label.config(text="≈ $?.?? USDT"))
+            except:
+                pass
+        
+        future = self._run_async(get_price())
+        if future:
+            future.add_done_callback(on_price)
+    
     def _update_pair_info(self):
         """Update pair information display with real-time prices and timing"""
         pair = self.pair_combo.get()
@@ -2231,29 +2765,37 @@ class FundingHunterGUI:
             prices = {}
             funding_rates = {}
             
-            # Get prices and funding rates from both exchanges
+            # Get prices and funding rates from both exchanges with timeout
+            tasks = []
             for exchange in [long_ex, short_ex]:
                 client = self.manager.clients.get(exchange)
                 if client:
-                    try:
-                        symbol = get_exchange_symbol(pair, exchange)
-                        mark_price = await client.get_mark_price(symbol)
-                        prices[exchange] = mark_price
-                        
-                        # Try to get funding rate
-                        try:
-                            funding_rate = await client.get_funding_rate(symbol)
-                            funding_rates[exchange] = funding_rate
-                        except:
-                            pass
-                    except Exception as e:
-                        logger.debug(f"Could not get data from {exchange.value}: {e}")
+                    symbol = get_exchange_symbol(pair, exchange)
+                    tasks.append(self._fetch_exchange_data(client, exchange, symbol))
+            
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, dict) and not isinstance(result, Exception):
+                        if 'exchange' in result:
+                            ex = result['exchange']
+                            if 'price' in result:
+                                prices[ex] = result['price']
+                            if 'funding_rate' in result:
+                                funding_rates[ex] = result['funding_rate']
             
             return prices, funding_rates
         
+        async def _timeout_wrapper():
+            try:
+                return await asyncio.wait_for(async_get_prices(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("Timeout fetching pair prices")
+                return {}, {}
+        
         def on_complete(future):
             try:
-                prices, funding_rates = future.result()
+                prices, funding_rates = future.result(timeout=0.1)
                 
                 if len(prices) >= 2:
                     long_price = prices.get(long_ex, 0)
@@ -2328,23 +2870,30 @@ class FundingHunterGUI:
                     # Build funding info display
                     funding_info = ""
                     funding_interval_text = "Every 8 hours"  # Default
+                    long_rate_str = "N/A"
+                    short_rate_str = "N/A"
+                    net_funding_str = "N/A"
+                    
+                    if long_funding:
+                        long_rate = long_funding.funding_rate * 100
+                        long_rate_str = f"{long_rate:+.6f}%"
+                    
+                    if short_funding:
+                        short_rate = short_funding.funding_rate * 100
+                        short_rate_str = f"{short_rate:+.6f}%"
                     
                     if long_funding and short_funding:
                         net_funding = short_funding.funding_rate - long_funding.funding_rate
-                        funding_info = f"\nNet Funding: {net_funding * 100:.6f}% (per 8h)"
+                        net_funding_str = f"{net_funding * 100:+.6f}%"
                         
                         # Use funding interval from the exchanges (they should be the same)
-                        # If different, show the one from the exchange with funding data
-                        interval_hours = long_funding.funding_interval_hours
+                        interval_hours = long_funding.funding_interval_hours or 8
                         if interval_hours == 4:
                             funding_interval_text = "Every 4 hours"
-                            funding_info = f"\nNet Funding: {net_funding * 100:.6f}% (per 4h)"
                         elif interval_hours == 8:
                             funding_interval_text = "Every 8 hours"
-                            funding_info = f"\nNet Funding: {net_funding * 100:.6f}% (per {interval_hours}h)"
                         else:
                             funding_interval_text = f"Every {interval_hours} hours"
-                            funding_info = f"\nNet Funding: {net_funding * 100:.6f}% (per {interval_hours}h)"
                     
                     # Build display text
                     info_text = f"═══ {pair} ═══\n\n"
@@ -2353,11 +2902,14 @@ class FundingHunterGUI:
                     info_text += f"Price Spread: ${price_diff:,.6f} ({price_spread_pct:.3f}%)\n"
                     
                     if is_good_entry:
-                        info_text += f"Price Position: ✅ SHORT higher than LONG (Good)\n"
+                        info_text += f"Price Position: ✅ SHORT > LONG (Good)\n"
                     else:
-                        info_text += f"Price Position: ⚠️ LONG higher than SHORT (Inverted)\n"
+                        info_text += f"Price Position: ⚠️ LONG > SHORT (Inverted)\n"
                     
-                    info_text += f"{funding_info}\n"
+                    info_text += f"─────────────────────────\n"
+                    info_text += f"Funding Rate ({long_display}):  {long_rate_str}\n"
+                    info_text += f"Funding Rate ({short_display}): {short_rate_str}\n"
+                    info_text += f"Net Funding (SHORT-LONG): {net_funding_str}\n"
                     info_text += f"─────────────────────────\n"
                     info_text += f"Next Funding: {time_str}\n"
                     info_text += f"Entry Timing: {entry_status}\n"
@@ -2370,7 +2922,9 @@ class FundingHunterGUI:
                     ))
                     
                     # Schedule next update in 2 seconds for continuous refresh
-                    self.root.after(2000, self._update_pair_info)
+                    # BUT only if no active position (to avoid overloading)
+                    if not self.active_position:
+                        self._pair_info_update_task = self.root.after(2000, self._update_pair_info)
                     
                 else:
                     self.root.after(0, lambda: self.selected_pair_info.config(
@@ -2378,14 +2932,38 @@ class FundingHunterGUI:
                         foreground="red"
                     ))
                     
+            except asyncio.TimeoutError:
+                logger.warning("Timeout in on_complete getting future result")
             except Exception as e:
                 logger.error(f"Error updating pair info: {e}")
                 import traceback
                 traceback.print_exc()
         
-        future = self._run_async(async_get_prices())
+        future = self._run_async(_timeout_wrapper())
         if future:
             future.add_done_callback(on_complete)
+    
+    async def _fetch_exchange_data(self, client, exchange, symbol):
+        """Fetch price and funding rate from a single exchange with timeout"""
+        result = {'exchange': exchange}
+        try:
+            # Use asyncio.wait_for for individual calls
+            price = await asyncio.wait_for(client.get_mark_price(symbol), timeout=8.0)
+            result['price'] = price
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout getting price from {exchange.value}")
+        except Exception as e:
+            logger.debug(f"Could not get price from {exchange.value}: {e}")
+        
+        try:
+            funding_rate = await asyncio.wait_for(client.get_funding_rate(symbol), timeout=8.0)
+            result['funding_rate'] = funding_rate
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout getting funding rate from {exchange.value}")
+        except Exception as e:
+            logger.debug(f"Could not get funding rate from {exchange.value}: {e}")
+        
+        return result
     
     def _update_pair_price_info(self, pair: str, recommendation: str = ""):
         """Fetch and display current price information for the selected pair"""

@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import time
 import json
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode
@@ -56,12 +57,19 @@ class BinanceClient(BaseExchangeClient):
             return balance is not None
         except Exception as e:
             print(f"Binance connection error: {e}")
+            # Close session on failed connection to prevent leak
+            if self._session:
+                await self._session.close()
+                self._session = None
             return False
     
     async def disconnect(self):
         """Disconnect from Binance API"""
         if self._session:
             await self._session.close()
+            # Give time for the underlying connections to close
+            import asyncio
+            await asyncio.sleep(0.25)
             self._session = None
     
     async def _request(
@@ -69,9 +77,10 @@ class BinanceClient(BaseExchangeClient):
         method: str,
         endpoint: str,
         params: Optional[Dict] = None,
-        signed: bool = True
+        signed: bool = True,
+        timeout: float = 15.0
     ) -> Any:
-        """Make API request"""
+        """Make API request with timeout"""
         if self._session is None:
             self._session = aiohttp.ClientSession()
         
@@ -93,14 +102,20 @@ class BinanceClient(BaseExchangeClient):
             print(f"  Params: {json.dumps({k: v for k, v in params.items() if k != 'signature'}, indent=2)}")
             print(f"  Headers: X-MBX-APIKEY: {self.api_key[:8]}...")
         
-        if method == "GET":
-            async with self._session.get(url, headers=headers, params=params) as response:
-                status_code = response.status
-                result = await response.json()
-        else:
-            async with self._session.request(method, url, headers=headers, params=params) as response:
-                status_code = response.status
-                result = await response.json()
+        # Create timeout object
+        req_timeout = aiohttp.ClientTimeout(total=timeout)
+        
+        try:
+            if method == "GET":
+                async with self._session.get(url, headers=headers, params=params, timeout=req_timeout) as response:
+                    status_code = response.status
+                    result = await response.json()
+            else:
+                async with self._session.request(method, url, headers=headers, params=params, timeout=req_timeout) as response:
+                    status_code = response.status
+                    result = await response.json()
+        except asyncio.TimeoutError:
+            raise Exception(f"Binance API request timeout after {timeout}s")
         
         # Debug: Print response
         if self.debug:
