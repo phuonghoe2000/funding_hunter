@@ -385,6 +385,63 @@ class BingXClient(BaseExchangeClient):
             raw_data=order_data
         )
     
+    async def close_position_partial(self, symbol: str, size: float) -> Order:
+        """Close partial position with specific size"""
+        bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
+        
+        position = await self.get_position(bingx_symbol)
+        
+        if not position:
+            raise Exception(f"No position found for {bingx_symbol}")
+        
+        # Round size to appropriate precision
+        size = self._round_quantity(size)
+        
+        close_side = "SELL" if position.side == Side.LONG else "BUY"
+        
+        params = {
+            "symbol": bingx_symbol,
+            "side": close_side,
+            "type": "MARKET",
+            "quantity": str(size),
+            "positionSide": "LONG" if position.side == Side.LONG else "SHORT",
+            "timeInForce": "IOC"
+        }
+        
+        result = await self._request("POST", "/openApi/swap/v2/trade/order", params)
+        
+        if result.get("code") != 0:
+            raise Exception(f"Close order failed: {result.get('msg')}")
+        
+        order_data = result.get("data", {}).get("order", {})
+        
+        return Order(
+            order_id=str(order_data.get("orderId", "")),
+            symbol=bingx_symbol,
+            side=Side.SHORT if position.side == Side.LONG else Side.LONG,
+            order_type=OrderType.MARKET,
+            size=size,
+            price=None,
+            filled_size=float(order_data.get("executedQty", 0)),
+            avg_price=float(order_data.get("avgPrice", 0)),
+            status=order_data.get("status", "NEW"),
+            timestamp=datetime.now(timezone.utc),
+            raw_data=order_data
+        )
+    
+    def _round_quantity(self, quantity: float) -> float:
+        """Round quantity to appropriate precision"""
+        if quantity >= 1000:
+            return round(quantity, 0)
+        elif quantity >= 100:
+            return round(quantity, 1)
+        elif quantity >= 10:
+            return round(quantity, 2)
+        elif quantity >= 1:
+            return round(quantity, 3)
+        else:
+            return round(quantity, 4)
+    
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         """Set leverage for symbol"""
         bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)

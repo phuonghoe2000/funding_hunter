@@ -304,6 +304,101 @@ class MultiExchangeManager:
         
         return results
     
+    async def close_hedged_position_split(
+        self,
+        pair: str,
+        long_exchange: Exchange,
+        short_exchange: Exchange,
+        splits: int = 1,
+        interval_seconds: float = 2.0,
+        progress_callback = None
+    ) -> Dict[str, Any]:
+        """Close hedged position in multiple splits
+        
+        Args:
+            pair: Trading pair
+            long_exchange: Exchange with LONG position
+            short_exchange: Exchange with SHORT position
+            splits: Number of splits to close
+            interval_seconds: Seconds between each split
+            progress_callback: Callback function(split_num, total_splits, message)
+        """
+        results = {"success": False, "error": None, "closed_splits": 0}
+        
+        long_client = self.clients.get(long_exchange)
+        short_client = self.clients.get(short_exchange)
+        
+        if not long_client or not short_client:
+            results["error"] = "Exchange not connected"
+            return results
+        
+        long_symbol = get_exchange_symbol(pair, long_exchange)
+        short_symbol = get_exchange_symbol(pair, short_exchange)
+        
+        try:
+            # Get current positions
+            long_pos = await long_client.get_position(long_symbol)
+            short_pos = await short_client.get_position(short_symbol)
+            
+            if not long_pos and not short_pos:
+                results["error"] = "No positions found to close"
+                return results
+            
+            # Calculate size per split
+            long_total = long_pos.size if long_pos else 0
+            short_total = short_pos.size if short_pos else 0
+            
+            long_per_split = long_total / splits if long_total > 0 else 0
+            short_per_split = short_total / splits if short_total > 0 else 0
+            
+            # Close in splits
+            for i in range(splits):
+                split_num = i + 1
+                is_last = (split_num == splits)
+                
+                if progress_callback:
+                    progress_callback(split_num, splits, f"Closing split {split_num}/{splits}...")
+                
+                close_tasks = []
+                
+                # For last split, close remaining position entirely
+                if is_last:
+                    # Re-check positions for final close
+                    if long_pos:
+                        current_long = await long_client.get_position(long_symbol)
+                        if current_long:
+                            close_tasks.append(long_client.close_position(long_symbol))
+                    if short_pos:
+                        current_short = await short_client.get_position(short_symbol)
+                        if current_short:
+                            close_tasks.append(short_client.close_position(short_symbol))
+                else:
+                    # Close partial amount
+                    if long_per_split > 0:
+                        close_tasks.append(
+                            long_client.close_position_partial(long_symbol, long_per_split)
+                        )
+                    if short_per_split > 0:
+                        close_tasks.append(
+                            short_client.close_position_partial(short_symbol, short_per_split)
+                        )
+                
+                if close_tasks:
+                    await asyncio.gather(*close_tasks)
+                
+                results["closed_splits"] = split_num
+                
+                # Wait before next split (except for last one)
+                if not is_last:
+                    await asyncio.sleep(interval_seconds)
+            
+            results["success"] = True
+            
+        except Exception as e:
+            results["error"] = str(e)
+        
+        return results
+    
     async def _cleanup_partial(self, ex1: Exchange, ex2: Exchange, pair: str):
         """Cleanup partial positions"""
         for ex in [ex1, ex2]:
@@ -318,31 +413,144 @@ class MultiExchangeManager:
                 pass
     
     async def check_positions(self, pair: str, long_ex: Exchange, short_ex: Exchange) -> Dict[str, Any]:
-        """Check positions on both exchanges"""
-        result = {"long": None, "short": None, "liquidated": None}
+        """Check positions on both exchanges with liquidation history verification"""
+        result = {"long": None, "short": None, "liquidated": None, "liquidation_confirmed": False}
         
         try:
             long_client = self.clients.get(long_ex)
             short_client = self.clients.get(short_ex)
             
+            # Get positions with timeout to prevent hanging
             if long_client:
                 symbol = get_exchange_symbol(pair, long_ex)
-                result["long"] = await long_client.get_position(symbol)
+                try:
+                    result["long"] = await asyncio.wait_for(
+                        long_client.get_position(symbol),
+                        timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout getting position from {long_ex.value}")
+                    result["long"] = None
             
             if short_client:
                 symbol = get_exchange_symbol(pair, short_ex)
-                result["short"] = await short_client.get_position(symbol)
+                try:
+                    result["short"] = await asyncio.wait_for(
+                        short_client.get_position(symbol),
+                        timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout getting position from {short_ex.value}")
+                    result["short"] = None
             
-            # Check liquidation
-            if result["long"] is None and result["short"] is not None:
-                result["liquidated"] = long_ex
-            elif result["short"] is None and result["long"] is not None:
-                result["liquidated"] = short_ex
+            # Check liquidation (more robust check)
+            # Position is liquidated if: exists but size = 0, or is None
+            long_exists = result["long"] is not None and result["long"].size > 0
+            short_exists = result["short"] is not None and result["short"].size > 0
+            
+            # Only mark as liquidated if ONE side disappeared while OTHER side still exists
+            # (Not both missing, which could be API error or position never opened)
+            if not long_exists and short_exists:
+                # Verify liquidation by checking history
+                liquidated_confirmed = await self._verify_liquidation(
+                    long_client, get_exchange_symbol(pair, long_ex), long_ex
+                )
+                if liquidated_confirmed:
+                    result["liquidated"] = long_ex
+                    result["liquidation_confirmed"] = True
+                    logger.warning(f"🚨 LIQUIDATION CONFIRMED on {long_ex.value} via history")
+                else:
+                    # Position missing but no liquidation in history - might be API error or manual close
+                    result["liquidated"] = long_ex
+                    result["liquidation_confirmed"] = False
+                    logger.warning(f"⚠️ Position missing on {long_ex.value} (not confirmed via history)")
+                    
+            elif not short_exists and long_exists:
+                # Verify liquidation by checking history
+                liquidated_confirmed = await self._verify_liquidation(
+                    short_client, get_exchange_symbol(pair, short_ex), short_ex
+                )
+                if liquidated_confirmed:
+                    result["liquidated"] = short_ex
+                    result["liquidation_confirmed"] = True
+                    logger.warning(f"🚨 LIQUIDATION CONFIRMED on {short_ex.value} via history")
+                else:
+                    # Position missing but no liquidation in history - might be API error or manual close
+                    result["liquidated"] = short_ex
+                    result["liquidation_confirmed"] = False
+                    logger.warning(f"⚠️ Position missing on {short_ex.value} (not confirmed via history)")
                 
         except Exception as e:
             logger.error(f"Error checking positions: {e}")
         
         return result
+    
+    async def _verify_liquidation(self, client, symbol: str, exchange: Exchange) -> bool:
+        """Verify if liquidation happened by checking income history
+        
+        Returns:
+            True if liquidation confirmed in history, False otherwise
+        """
+        if client is None:
+            return False
+        
+        try:
+            # Try to get liquidation records from income history
+            # Check last 50 records within recent time
+            from exchanges.binance_client import BinanceClient
+            from exchanges.okx_client import OKXClient
+            from exchanges.bingx_client import BingXClient
+            
+            if isinstance(client, BinanceClient):
+                # Binance: check LIQUIDATION income type
+                try:
+                    history = await asyncio.wait_for(
+                        client.get_income_history(income_type="REALIZED_PNL", limit=50, symbol=symbol),
+                        timeout=5.0
+                    )
+                    # Check for liquidation in recent records (last hour)
+                    from datetime import datetime, timedelta
+                    one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000
+                    
+                    for record in history:
+                        # Binance marks liquidation with specific income type or very negative realized PnL
+                        if record.get('time', 0) > one_hour_ago:
+                            income = float(record.get('income', 0))
+                            # Large negative PnL indicates liquidation
+                            if income < -10:  # More than $10 loss suggests liquidation
+                                return True
+                except Exception as e:
+                    logger.debug(f"Could not verify liquidation via Binance history: {e}")
+                    
+            elif isinstance(client, OKXClient):
+                # OKX: has specific liquidation records
+                try:
+                    # OKX get_income_history might have liquidation type
+                    history = await asyncio.wait_for(
+                        client.get_income_history(income_type="liquidation", limit=20),
+                        timeout=5.0
+                    )
+                    # If we get any recent liquidation records, confirm it
+                    if history and len(history) > 0:
+                        return True
+                except Exception as e:
+                    logger.debug(f"Could not verify liquidation via OKX history: {e}")
+                    
+            elif isinstance(client, BingXClient):
+                # BingX: check income history for liquidation
+                try:
+                    # BingX might not have detailed income history API
+                    # Just return False to rely on position check
+                    pass
+                except Exception as e:
+                    logger.debug(f"Could not verify liquidation via BingX history: {e}")
+            
+            # Could not confirm liquidation via history
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error verifying liquidation: {e}")
+            return False
     
     async def scan_all_positions(self) -> Dict[Exchange, List[Any]]:
         """
@@ -1009,6 +1217,10 @@ class FundingHunterGUI:
                                     command=self._close_position, state=tk.DISABLED)
         self.close_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
         
+        self.load_pos_btn = ttk.Button(btn_frame, text="📥 Load Positions", 
+                                       command=self._load_existing_positions, state=tk.DISABLED)
+        self.load_pos_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+        
         # Auto close option
         option_frame = ttk.Frame(frame)
         option_frame.pack(fill=tk.X, pady=5)
@@ -1020,10 +1232,6 @@ class FundingHunterGUI:
         self.auto_close_reversal_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(option_frame, text="Auto-close on funding reversal", 
                        variable=self.auto_close_reversal_var).pack(anchor=tk.W, pady=2)
-        
-        self.monitor_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(option_frame, text="Monitor positions (check every 2s)", 
-                       variable=self.monitor_var).pack(anchor=tk.W)
         
         self.skip_leverage_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(option_frame, text="Skip leverage set (faster entry)", 
@@ -1351,6 +1559,7 @@ class FundingHunterGUI:
         self.disconnect_btn.config(state=tk.NORMAL)
         self.open_btn.config(state=tk.NORMAL)
         self.close_btn.config(state=tk.NORMAL)
+        self.load_pos_btn.config(state=tk.NORMAL)
         self.refresh_funding_btn.config(state=tk.NORMAL)
         self.auto_trade_btn.config(state=tk.NORMAL)
         
@@ -1382,6 +1591,7 @@ class FundingHunterGUI:
         self.disconnect_btn.config(state=tk.DISABLED)
         self.open_btn.config(state=tk.DISABLED)
         self.close_btn.config(state=tk.DISABLED)
+        self.load_pos_btn.config(state=tk.DISABLED)
         self.refresh_funding_btn.config(state=tk.DISABLED)
         self.load_pairs_btn.config(state=tk.DISABLED)
         self.auto_trade_btn.config(state=tk.DISABLED)
@@ -1465,6 +1675,28 @@ class FundingHunterGUI:
         elif pairs:
             self.pair_combo.set(pairs[0])
     
+    def _stop_all_background_tasks(self):
+        """Stop all background tasks to prevent API conflicts when opening position"""
+        # Stop pair info updates
+        if self._pair_info_update_task:
+            self.root.after_cancel(self._pair_info_update_task)
+            self._pair_info_update_task = None
+        
+        # Stop USDT volume update
+        if hasattr(self, '_usdt_update_pending') and self._usdt_update_pending:
+            self.root.after_cancel(self._usdt_update_pending)
+            self._usdt_update_pending = None
+        
+        # Stop auto trading if active
+        if self.auto_trading_active:
+            self._toggle_auto_trading()  # This will stop it
+        
+        # Stop monitoring temporarily
+        if self.monitoring:
+            self._stop_monitoring()
+        
+        logger.info("🛑 Stopped all background tasks")
+    
     def _open_position(self):
         """Open hedged position - starts monitoring price spread and auto-opens when threshold met"""
         if not self.connected:
@@ -1500,10 +1732,8 @@ class FundingHunterGUI:
         long_ex = self._get_exchange_enum(long_ex_name)
         short_ex = self._get_exchange_enum(short_ex_name)
         
-        # Cancel any running pair info updates to avoid API conflicts
-        if self._pair_info_update_task:
-            self.root.after_cancel(self._pair_info_update_task)
-            self._pair_info_update_task = None
+        # STOP ALL BACKGROUND TASKS before opening position
+        self._stop_all_background_tasks()
         
         # Store parameters for continuous checking
         self.price_spread_params = {
@@ -1589,8 +1819,8 @@ class FundingHunterGUI:
                 
                 # Price spread is good, proceed to open position!
                 split_count = params.get("split_count", 1)
-                safe_log(f"✅ Price spread threshold met! Opening position in {split_count} splits...")
-                safe_log(f"Opening: {params['pair']} | Long {params['long_ex_name']} | Short {params['short_ex_name']} | Size: {params['size']} | Splits: {split_count}")
+                safe_log(f"✅ Price spread >= {params['price_spread_min']}%, and price position is good!")
+                safe_log(f"🚀 Opening: {params['pair']} | Long {params['long_ex_name']} | Short {params['short_ex_name']} | Size: {params['size']} | Splits: {split_count}")
                 
                 # Callback to start monitoring after first split
                 def on_first_split(size_opened):
@@ -1834,10 +2064,7 @@ class FundingHunterGUI:
                                 
                                 self._log(f"📊 Initial Funding - LONG: {long_rate*100:.6f}%, SHORT: {short_rate*100:.6f}%, Net: {initial_net_funding*100:.6f}%")
                                 self._update_position_display()
-                                
-                                # Start monitoring
-                                if self.monitor_var.get():
-                                    self._start_monitoring()
+
                                     
                             except Exception as e:
                                 logger.error(f"Error tracking initial funding: {e}")
@@ -1864,8 +2091,7 @@ class FundingHunterGUI:
                             "initial_net_funding": 0,
                         }
                         self._update_position_display()
-                        if self.monitor_var.get():
-                            self._start_monitoring()
+
                 else:
                     self._log(f"❌ Failed: {result['error']}")
                     messagebox.showerror("Error", result['error'])
@@ -1876,26 +2102,269 @@ class FundingHunterGUI:
         self.root.after(0, update_ui)
     
     def _close_position(self):
-        """Close position"""
+        """Close position in splits"""
         if not self.active_position:
             messagebox.showinfo("Info", "No active position")
             return
         
-        if not messagebox.askyesno("Confirm", "Close the hedged position?"):
+        # Get split count from UI (same as open position)
+        try:
+            splits = int(self.split_count_var.get())
+            if splits < 1:
+                splits = 1
+        except:
+            splits = 1
+        
+        confirm_msg = f"Close the hedged position in {splits} split(s)?\n(2 seconds between each split)"
+        if not messagebox.askyesno("Confirm", confirm_msg):
             return
         
         pos = self.active_position
-        self._log(f"Closing position for {pos['pair']}...")
+        self._log(f"📤 Closing position for {pos['pair']} in {splits} split(s)...")
+        
+        # Disable close button during operation
+        self.close_btn.config(state=tk.DISABLED)
+        
+        def progress_callback(split_num, total_splits, message):
+            def update():
+                self._log(f"   🔄 {message}")
+            self.root.after(0, update)
         
         async def async_close():
-            return await self.manager.close_hedged_position(
-                pos['pair'], pos['long_exchange'], pos['short_exchange']
+            return await self.manager.close_hedged_position_split(
+                pos['pair'], 
+                pos['long_exchange'], 
+                pos['short_exchange'],
+                splits=splits,
+                interval_seconds=2.0,
+                progress_callback=progress_callback
             )
         
         future = self._run_async(async_close())
         if future:
             future.add_done_callback(self._on_close_complete)
     
+    def _load_existing_positions(self):
+        """Load existing positions from exchanges and allow monitoring/closing them"""
+        if not self.connected:
+            messagebox.showerror("Error", "Not connected to exchanges")
+            return
+        
+        self._log("🔍 Scanning for existing positions on all exchanges...")
+        self.load_pos_btn.config(state=tk.DISABLED)
+        
+        async def scan_positions():
+            all_positions = await self.manager.scan_all_positions()
+            return all_positions
+        
+        def on_scan_complete(future):
+            def update_ui():
+                self.load_pos_btn.config(state=tk.NORMAL)
+                try:
+                    all_positions = future.result(timeout=0.5)
+                    
+                    # Collect all positions
+                    positions_found = []
+                    for exchange, positions in all_positions.items():
+                        for pos in positions:
+                            positions_found.append({
+                                "exchange": exchange,
+                                "symbol": pos.symbol,
+                                "side": pos.side,
+                                "size": pos.size,
+                                "entry_price": pos.entry_price,
+                                "unrealized_pnl": pos.unrealized_pnl,
+                                "leverage": pos.leverage
+                            })
+                    
+                    if not positions_found:
+                        self._log("📭 No existing positions found on any exchange")
+                        messagebox.showinfo("Load Positions", "No existing positions found")
+                        return
+                    
+                    # Log found positions
+                    self._log(f"📦 Found {len(positions_found)} position(s):")
+                    for p in positions_found:
+                        self._log(f"   • {p['exchange'].value}: {p['symbol']} {p['side'].value.upper()} "
+                                  f"Size: {p['size']} PnL: ${p['unrealized_pnl']:.2f}")
+                    
+                    # Try to match hedged pairs (same symbol on different exchanges with opposite sides)
+                    hedged_pairs = self._find_hedged_pairs(positions_found)
+                    
+                    if hedged_pairs:
+                        self._log(f"🔗 Found {len(hedged_pairs)} potential hedged pair(s)")
+                        # Let user select which pair to load
+                        self._show_position_selector(hedged_pairs, positions_found)
+                    else:
+                        self._log("⚠️ No matching hedged pairs found. Positions may be one-sided.")
+                        # Still show positions for manual selection
+                        self._show_position_selector([], positions_found)
+                        
+                except Exception as e:
+                    self._log(f"❌ Error scanning positions: {e}")
+                    logger.error(f"Error in scan_positions: {e}")
+            
+            self.root.after(0, update_ui)
+        
+        future = self._run_async(scan_positions())
+        if future:
+            future.add_done_callback(on_scan_complete)
+    
+    def _find_hedged_pairs(self, positions):
+        """Find matching hedged pairs from position list"""
+        from config.constants import get_unified_pair, Side
+        
+        hedged_pairs = []
+        used_positions = set()
+        
+        for i, p1 in enumerate(positions):
+            if i in used_positions:
+                continue
+            
+            # Try to find opposite position on another exchange
+            for j, p2 in enumerate(positions):
+                if j in used_positions or j == i:
+                    continue
+                if p1['exchange'] == p2['exchange']:
+                    continue
+                
+                # Check if same symbol and opposite sides
+                # Need to convert symbols to unified format for comparison
+                try:
+                    pair1 = get_unified_pair(p1['symbol'], p1['exchange'])
+                    pair2 = get_unified_pair(p2['symbol'], p2['exchange'])
+                except:
+                    continue
+                
+                if pair1 == pair2 and p1['side'] != p2['side']:
+                    # Found a hedged pair!
+                    long_pos = p1 if p1['side'] == Side.LONG else p2
+                    short_pos = p2 if p1['side'] == Side.LONG else p1
+                    
+                    hedged_pairs.append({
+                        "pair": pair1,
+                        "long": long_pos,
+                        "short": short_pos,
+                        "total_pnl": p1['unrealized_pnl'] + p2['unrealized_pnl']
+                    })
+                    used_positions.add(i)
+                    used_positions.add(j)
+                    break
+        
+        return hedged_pairs
+    
+    def _show_position_selector(self, hedged_pairs, all_positions):
+        """Show dialog to select position to load"""
+        # Create selection dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Load Position")
+        dialog.geometry("600x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        ttk.Label(dialog, text="Select a position to monitor:", font=('Arial', 11, 'bold')).pack(pady=10)
+        
+        # Listbox for positions
+        listbox = tk.Listbox(dialog, width=80, height=15, font=('Courier', 9))
+        listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        position_data = []
+        
+        # Add hedged pairs first
+        if hedged_pairs:
+            listbox.insert(tk.END, "=== HEDGED PAIRS ===")
+            position_data.append(None)  # Separator
+            
+            for hp in hedged_pairs:
+                text = f"  {hp['pair']}: LONG {hp['long']['exchange'].value} / SHORT {hp['short']['exchange'].value} | PnL: ${hp['total_pnl']:.2f}"
+                listbox.insert(tk.END, text)
+                position_data.append({"type": "hedged", "data": hp})
+        
+        # Add individual positions
+        listbox.insert(tk.END, "")
+        position_data.append(None)
+        listbox.insert(tk.END, "=== INDIVIDUAL POSITIONS ===")
+        position_data.append(None)
+        
+        for p in all_positions:
+            text = f"  {p['exchange'].value}: {p['symbol']} {p['side'].value.upper()} Size: {p['size']:.4f} PnL: ${p['unrealized_pnl']:.2f}"
+            listbox.insert(tk.END, text)
+            position_data.append({"type": "single", "data": p})
+        
+        def on_load():
+            selection = listbox.curselection()
+            if not selection:
+                messagebox.showwarning("Warning", "Please select a position")
+                return
+            
+            idx = selection[0]
+            selected = position_data[idx]
+            
+            if selected is None:
+                messagebox.showwarning("Warning", "Please select a valid position, not a separator")
+                return
+            
+            dialog.destroy()
+            
+            if selected["type"] == "hedged":
+                self._load_hedged_position(selected["data"])
+            else:
+                self._log(f"⚠️ Single position selected - cannot monitor as hedged pair")
+                self._log(f"   {selected['data']['exchange'].value}: {selected['data']['symbol']} {selected['data']['side'].value}")
+        
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+        
+        ttk.Button(btn_frame, text="Load & Monitor", command=on_load).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+    
+    def _load_hedged_position(self, hedged_pair):
+        """Load a hedged position and start monitoring"""
+        pair = hedged_pair["pair"]
+        long_pos = hedged_pair["long"]
+        short_pos = hedged_pair["short"]
+        
+        long_ex = long_pos["exchange"]
+        short_ex = short_pos["exchange"]
+        
+        # Use average size (should be similar for hedged positions)
+        size = (long_pos["size"] + short_pos["size"]) / 2
+        
+        self._log(f"📥 Loading hedged position: {pair}")
+        self._log(f"   LONG: {long_ex.value} Size: {long_pos['size']}")
+        self._log(f"   SHORT: {short_ex.value} Size: {short_pos['size']}")
+        
+        # Setup position tracking
+        from datetime import datetime
+        self.active_position = {
+            "pair": pair,
+            "long_exchange": long_ex,
+            "short_exchange": short_ex,
+            "size": size,
+            "open_time": datetime.now(timezone.utc),  # We don't know actual open time
+            "total_funding_fees": 0.0,
+            "last_funding_check": datetime.now(timezone.utc),
+            "initial_long_rate": 0,
+            "initial_short_rate": 0,
+            "initial_net_funding": 0,
+            "loaded_position": True  # Mark as loaded (not opened by us)
+        }
+        
+        # Update UI
+        self._update_position_display()
+        
+        # Update exchange selectors
+        exchange_name_map = {Exchange.OKX: "OKX", Exchange.BINANCE: "Binance", Exchange.BINGX: "BingX"}
+        self.long_exchange.set(exchange_name_map.get(long_ex, ""))
+        self.short_exchange.set(exchange_name_map.get(short_ex, ""))
+        
+        # Set pair in combo
+        if pair in list(self.pair_combo['values']):
+            self.pair_combo.set(pair)
+        
+        self._log(f"✅ Position loaded! You can now monitor or close it.")
+
+
     def _on_close_complete(self, future):
         """Handle close complete"""
         def update_ui():
@@ -1931,6 +2400,8 @@ class FundingHunterGUI:
             self.root.after(0, lambda: self._log(msg))
         
         async def monitor_loop():
+            last_pnl_update = datetime.now(timezone.utc)
+            
             while self.monitoring and self.active_position:
                 try:
                     pos = self.active_position
@@ -1958,12 +2429,15 @@ class FundingHunterGUI:
                     # Total PnL = Unrealized PnL + Funding Fees
                     total_pnl = unrealized_pnl + funding_fees
                     
-                    # Update display with detailed breakdown
-                    self.root.after(0, lambda u=unrealized_pnl, f=funding_fees, t=total_pnl: 
-                        self.pos_pnl_label.config(
-                            text=f"PnL: ${u:.6f} | Funding: ${f:.6f} | Total: ${t:.6f}",
-                            foreground='green' if t >= 0 else 'red'
-                        ))
+                    # Update PnL display only every 60 seconds to reduce API calls
+                    time_since_pnl_update = (now - last_pnl_update).total_seconds()
+                    if time_since_pnl_update >= 60:
+                        self.root.after(0, lambda u=unrealized_pnl, f=funding_fees, t=total_pnl: 
+                            self.pos_pnl_label.config(
+                                text=f"PnL: ${u:.6f} | Funding: ${f:.6f} | Total: ${t:.6f}",
+                                foreground='green' if t >= 0 else 'red'
+                            ))
+                        last_pnl_update = now
                     
                     # Check liquidation
                     if result['liquidated']:
@@ -2113,7 +2587,7 @@ class FundingHunterGUI:
             # Check 3: Spread dropped significantly (>70% reduction)
             if abs(initial_net_funding) > 0:
                 spread_reduction = 1 - (abs(current_net_funding) / abs(initial_net_funding))
-                if spread_reduction > 0.70:  # 70% drop
+                if spread_reduction > 0.97:  # 70% drop
                     reason = (
                         f"Spread dropped by {spread_reduction*100:.1f}%\n"
                         f"Initial: {abs(initial_net_funding)*100:.6f}%\n"

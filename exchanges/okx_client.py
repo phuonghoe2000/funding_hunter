@@ -351,6 +351,61 @@ class OKXClient(BaseExchangeClient):
             raw_data=order_info
         )
     
+    async def close_position_partial(self, symbol: str, size: float) -> Order:
+        """Close partial position with specific size"""
+        okx_symbol = symbol if "-SWAP" in symbol else get_exchange_symbol(symbol, Exchange.OKX)
+        
+        position = await self.get_position(okx_symbol)
+        
+        if not position:
+            raise Exception(f"No position found for {okx_symbol}")
+        
+        # Round size to appropriate precision
+        size = self._round_quantity(size)
+        
+        close_side = Side.SHORT if position.side == Side.LONG else Side.LONG
+        
+        order_data = {
+            "instId": okx_symbol,
+            "tdMode": "cross",
+            "side": "sell" if position.side == Side.LONG else "buy",
+            "ordType": "market",
+            "sz": str(size),
+            "posSide": "long" if position.side == Side.LONG else "short",
+            "reduceOnly": "true"
+        }
+        
+        result = await self._request("POST", "/api/v5/trade/order", data=order_data)
+        
+        order_info = result["data"][0]
+        
+        return Order(
+            order_id=order_info["ordId"],
+            symbol=okx_symbol,
+            side=close_side,
+            order_type=OrderType.MARKET,
+            size=size,
+            price=None,
+            filled_size=0,
+            avg_price=0,
+            status="submitted",
+            timestamp=datetime.now(timezone.utc),
+            raw_data=order_info
+        )
+    
+    def _round_quantity(self, quantity: float) -> float:
+        """Round quantity to appropriate precision"""
+        if quantity >= 1000:
+            return round(quantity, 0)
+        elif quantity >= 100:
+            return round(quantity, 1)
+        elif quantity >= 10:
+            return round(quantity, 2)
+        elif quantity >= 1:
+            return round(quantity, 3)
+        else:
+            return round(quantity, 4)
+    
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         """Set leverage for symbol"""
         okx_symbol = symbol if "-SWAP" in symbol else get_exchange_symbol(symbol, Exchange.OKX)

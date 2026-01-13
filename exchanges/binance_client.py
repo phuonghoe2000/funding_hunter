@@ -89,6 +89,7 @@ class BinanceClient(BaseExchangeClient):
         
         if signed:
             params["timestamp"] = self._get_timestamp()
+            params["recvWindow"] = 60000  # Increase to 60 seconds for slow connections
             params["signature"] = self._sign(params)
         
         headers = self._get_headers()
@@ -324,6 +325,59 @@ class BinanceClient(BaseExchangeClient):
             timestamp=datetime.fromtimestamp(result.get("updateTime", time.time() * 1000) / 1000, tz=timezone.utc),
             raw_data=result
         )
+    
+    async def close_position_partial(self, symbol: str, size: float) -> Order:
+        """Close partial position with specific size"""
+        binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
+        
+        position = await self.get_position(binance_symbol)
+        
+        if not position:
+            raise Exception(f"No position found for {binance_symbol}")
+        
+        # Round size to appropriate precision
+        size = self._round_quantity(binance_symbol, size)
+        
+        close_side = "SELL" if position.side == Side.LONG else "BUY"
+        
+        params = {
+            "symbol": binance_symbol,
+            "side": close_side,
+            "type": "MARKET",
+            "quantity": size,
+            "positionSide": "LONG" if position.side == Side.LONG else "SHORT"
+        }
+        
+        result = await self._request("POST", "/fapi/v1/order", params)
+        
+        return Order(
+            order_id=str(result["orderId"]),
+            symbol=binance_symbol,
+            side=Side.SHORT if position.side == Side.LONG else Side.LONG,
+            order_type=OrderType.MARKET,
+            size=size,
+            price=None,
+            filled_size=float(result.get("executedQty", 0)),
+            avg_price=float(result.get("avgPrice", 0)),
+            status=result.get("status", "NEW"),
+            timestamp=datetime.fromtimestamp(result.get("updateTime", time.time() * 1000) / 1000, tz=timezone.utc),
+            raw_data=result
+        )
+    
+    def _round_quantity(self, symbol: str, quantity: float) -> float:
+        """Round quantity to appropriate precision for symbol"""
+        # Most symbols use 3 decimal places, some use more
+        # This is a simplified approach
+        if quantity >= 1000:
+            return round(quantity, 0)
+        elif quantity >= 100:
+            return round(quantity, 1)
+        elif quantity >= 10:
+            return round(quantity, 2)
+        elif quantity >= 1:
+            return round(quantity, 3)
+        else:
+            return round(quantity, 4)
     
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         """Set leverage for symbol"""

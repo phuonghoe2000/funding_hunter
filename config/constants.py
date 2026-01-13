@@ -132,9 +132,18 @@ def get_unified_pair(symbol: str, exchange: Exchange) -> str:
     
     # Parse symbol if not in map
     if exchange == Exchange.OKX:
+        # OKX format: BTC-USDT-SWAP -> BTC/USDT
         parts = symbol.replace("-SWAP", "").split("-")
         return f"{parts[0]}/{parts[1]}"
+    elif exchange == Exchange.BINGX:
+        # BingX format: BTC-USDT -> BTC/USDT
+        parts = symbol.split("-")
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+        # Fallback: assume USDT pair
+        base = symbol.replace("USDT", "").replace("-", "")
+        return f"{base}/USDT"
     else:  # Binance
-        # Assume USDT pair
+        # Binance format: BTCUSDT -> BTC/USDT
         base = symbol.replace("USDT", "")
         return f"{base}/USDT"
