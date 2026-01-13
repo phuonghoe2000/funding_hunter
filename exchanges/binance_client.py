@@ -446,6 +446,20 @@ class BinanceClient(BaseExchangeClient):
         
         return float(result.get("markPrice", 0))
     
+    async def get_order_book(self, symbol: str, limit: int = 20) -> Dict[str, Any]:
+        """Get order book (depth)
+        
+        Returns:
+            Dict with 'bids' and 'asks' - each is list of [price, quantity]
+        """
+        binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
+        
+        result = await self._request("GET", "/fapi/v1/depth", {"symbol": binance_symbol, "limit": limit}, signed=False)
+        return {
+            "bids": [[float(price), float(qty)] for price, qty in result["bids"]],
+            "asks": [[float(price), float(qty)] for price, qty in result["asks"]]
+        }
+    
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
         """Get ticker data"""
         binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)

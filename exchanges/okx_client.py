@@ -466,6 +466,24 @@ class OKXClient(BaseExchangeClient):
         
         raise Exception(f"No mark price data for {okx_symbol}")
     
+    async def get_order_book(self, symbol: str, limit: int = 20) -> Dict[str, Any]:
+        """Get order book (depth)
+        
+        Returns:
+            Dict with 'bids' and 'asks' - each is list of [price, quantity]
+        """
+        okx_symbol = symbol if "-SWAP" in symbol else get_exchange_symbol(symbol, Exchange.OKX)
+        
+        result = await self._request("GET", "/api/v5/market/books", {"instId": okx_symbol, "sz": str(limit)})
+        
+        if result["data"]:
+            data = result["data"][0]
+            return {
+                "bids": [[float(b[0]), float(b[1])] for b in data["bids"]],
+                "asks": [[float(a[0]), float(a[1])] for a in data["asks"]]
+            }
+        return {"bids": [], "asks": []}
+    
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
         """Get ticker data"""
         okx_symbol = symbol if "-SWAP" in symbol else get_exchange_symbol(symbol, Exchange.OKX)

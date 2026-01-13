@@ -498,6 +498,25 @@ class BingXClient(BaseExchangeClient):
         
         raise Exception(f"No mark price data for {bingx_symbol}")
     
+    async def get_order_book(self, symbol: str, limit: int = 20) -> Dict[str, Any]:
+        """Get order book (depth)
+        
+        Returns:
+            Dict with 'bids' and 'asks' - each is list of [price, quantity]
+        """
+        bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
+        
+        result = await self._request("GET", "/openApi/swap/v2/quote/depth",
+                                     {"symbol": bingx_symbol, "limit": limit}, signed=False)
+        
+        if result.get("code") == 0 and result.get("data"):
+            data = result["data"]
+            return {
+                "bids": [[float(b["p"]), float(b["v"])] for b in data.get("bids", [])],
+                "asks": [[float(a["p"]), float(a["v"])] for a in data.get("asks", [])]
+            }
+        return {"bids": [], "asks": []}
+    
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
         """Get ticker data"""
         bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)

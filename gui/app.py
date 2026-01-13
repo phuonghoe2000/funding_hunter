@@ -646,20 +646,55 @@ class MultiExchangeManager:
         size_per_split = total_size / split_count
         
         async def check_spread() -> tuple[bool, float, float, float]:
-            """Check if current spread meets threshold. Returns (is_ok, spread_pct, long_price, short_price)"""
+            """Check if current spread meets threshold using order book (bid/ask prices).
+            
+            Returns (is_ok, spread_pct, long_ask_price, short_bid_price)
+            
+            Logic: 
+            - LONG (BUY market) will fill at ASK price (sellers)
+            - SHORT (SELL market) will fill at BID price (buyers)
+            - Real spread = ASK(long_exchange) - BID(short_exchange)
+            """
             try:
-                # Add timeout to prevent hanging
-                long_price, short_price = await asyncio.wait_for(
+                # Get order books with timeout
+                long_book, short_book = await asyncio.wait_for(
                     asyncio.gather(
-                        long_client.get_mark_price(long_symbol),
-                        short_client.get_mark_price(short_symbol)
+                        long_client.get_order_book(long_symbol, limit=10),
+                        short_client.get_order_book(short_symbol, limit=10)
                     ),
                     timeout=10.0
                 )
-                price_diff = abs(short_price - long_price)
-                avg_price = (long_price + short_price) / 2
+                
+                # Get best ask (lowest sell price) from LONG exchange
+                # This is the price we'll pay when buying (opening LONG)
+                if not long_book.get("asks") or len(long_book["asks"]) == 0:
+                    logger.warning(f"No asks in order book for {long_symbol}")
+                    return (False, 0.0, 0.0, 0.0)
+                long_ask_price = long_book["asks"][0][0]  # Best ask [price, qty]
+                
+                # Get best bid (highest buy price) from SHORT exchange
+                # This is the price we'll receive when selling (opening SHORT)
+                if not short_book.get("bids") or len(short_book["bids"]) == 0:
+                    logger.warning(f"No bids in order book for {short_symbol}")
+                    return (False, 0.0, 0.0, 0.0)
+                short_bid_price = short_book["bids"][0][0]  # Best bid [price, qty]
+                
+                # Calculate real spread: what we pay (ASK) vs what we get (BID)
+                # Positive spread = profitable (we can buy low and sell high)
+                # Negative spread = losing trade (buying high, selling low)
+                price_diff = short_bid_price - long_ask_price
+                
+                # If spread is negative, it means we'd be buying at higher price than selling
+                # This is a losing trade, should not proceed
+                if price_diff < 0:
+                    logger.warning(f"Negative spread detected: LONG ASK ${long_ask_price:.2f} > SHORT BID ${short_bid_price:.2f}")
+                    return (False, price_diff, long_ask_price, short_bid_price)
+                
+                avg_price = (long_ask_price + short_bid_price) / 2
                 spread_pct = (price_diff / avg_price) * 100
-                return (spread_pct >= price_spread_min, spread_pct, long_price, short_price)
+                
+                return (spread_pct >= price_spread_min, spread_pct, long_ask_price, short_bid_price)
+                
             except asyncio.TimeoutError:
                 logger.warning("Timeout checking spread")
                 return (False, 0.0, 0.0, 0.0)
@@ -843,11 +878,6 @@ class FundingHunterGUI:
         self.active_position = None  # Store active position info
         self._monitor_task = None
         self.cached_funding_rates = {}  # Cache funding rates for quick access
-        
-        # Auto trading state
-        self.auto_trading_active = False
-        self.auto_trade_check_task = None
-        self.last_auto_trade_check = None
         
         # Price spread waiting state (for manual open position)
         self.waiting_for_price_spread = False
@@ -1252,49 +1282,6 @@ class FundingHunterGUI:
         self.min_spread_threshold.insert(0, "0.01")  # 0.01% = 1 basis point
         self.min_spread_threshold.pack(side=tk.LEFT, padx=3)
         ttk.Label(threshold_frame, text="%").pack(side=tk.LEFT)
-        
-        # Auto Trading section - COMPACT DESIGN
-        auto_trade_frame = ttk.LabelFrame(option_frame, text="🤖 Auto Trading", padding="3")
-        auto_trade_frame.pack(fill=tk.X, pady=5)
-        
-        # Row 1: All settings in one line
-        settings_row = ttk.Frame(auto_trade_frame)
-        settings_row.pack(fill=tk.X, pady=2)
-        
-        ttk.Label(settings_row, text="Vol:").pack(side=tk.LEFT, padx=2)
-        self.auto_volume_entry = ttk.Entry(settings_row, width=6)
-        self.auto_volume_entry.insert(0, "100")
-        self.auto_volume_entry.pack(side=tk.LEFT, padx=1)
-        ttk.Label(settings_row, text="USDT").pack(side=tk.LEFT, padx=2)
-        
-        ttk.Label(settings_row, text="Lev:").pack(side=tk.LEFT, padx=(5,2))
-        self.auto_leverage_entry = ttk.Entry(settings_row, width=4)
-        self.auto_leverage_entry.insert(0, "10")
-        self.auto_leverage_entry.pack(side=tk.LEFT, padx=1)
-        ttk.Label(settings_row, text="x").pack(side=tk.LEFT, padx=2)
-        
-        ttk.Label(settings_row, text="MinSpread:").pack(side=tk.LEFT, padx=(5,2))
-        self.auto_min_spread_entry = ttk.Entry(settings_row, width=5)
-        self.auto_min_spread_entry.insert(0, "0.02")
-        self.auto_min_spread_entry.pack(side=tk.LEFT, padx=1)
-        ttk.Label(settings_row, text="%").pack(side=tk.LEFT, padx=2)
-        
-        ttk.Label(settings_row, text="MaxHrs:").pack(side=tk.LEFT, padx=(5,2))
-        self.auto_max_hours_entry = ttk.Entry(settings_row, width=3)
-        self.auto_max_hours_entry.insert(0, "2")
-        self.auto_max_hours_entry.pack(side=tk.LEFT, padx=1)
-        ttk.Label(settings_row, text="h").pack(side=tk.LEFT, padx=2)
-        
-        # Row 2: Button and Status
-        control_row = ttk.Frame(auto_trade_frame)
-        control_row.pack(fill=tk.X, pady=2)
-        
-        self.auto_trade_btn = ttk.Button(control_row, text="🚀 Start", 
-                                         command=self._toggle_auto_trading, state=tk.DISABLED, width=12)
-        self.auto_trade_btn.pack(side=tk.LEFT, padx=2)
-        
-        self.auto_trade_status = ttk.Label(control_row, text="Stopped", foreground="gray", font=('Arial', 8))
-        self.auto_trade_status.pack(side=tk.LEFT, padx=5)
     
     def _create_funding_frame(self, parent):
         """Create funding rates panel"""
@@ -1561,7 +1548,6 @@ class FundingHunterGUI:
         self.close_btn.config(state=tk.NORMAL)
         self.load_pos_btn.config(state=tk.NORMAL)
         self.refresh_funding_btn.config(state=tk.NORMAL)
-        self.auto_trade_btn.config(state=tk.NORMAL)
         
         # Enable load pairs button if Binance is connected
         if "Binance" in connected:
@@ -1594,7 +1580,6 @@ class FundingHunterGUI:
         self.load_pos_btn.config(state=tk.DISABLED)
         self.refresh_funding_btn.config(state=tk.DISABLED)
         self.load_pairs_btn.config(state=tk.DISABLED)
-        self.auto_trade_btn.config(state=tk.DISABLED)
         self.connected = False
     
     def _disconnect(self):
@@ -1792,25 +1777,46 @@ class FundingHunterGUI:
                 long_symbol = get_exchange_symbol(params["pair"], params["long_ex"])
                 short_symbol = get_exchange_symbol(params["pair"], params["short_ex"])
                 
-                # Fetch prices with timeout to prevent hanging
+                # Fetch order books to calculate real spread (bid/ask based)
                 try:
-                    long_price, short_price = await asyncio.wait_for(
+                    long_book, short_book = await asyncio.wait_for(
                         asyncio.gather(
-                            long_client.get_mark_price(long_symbol),
-                            short_client.get_mark_price(short_symbol)
+                            long_client.get_order_book(long_symbol, limit=10),
+                            short_client.get_order_book(short_symbol, limit=10)
                         ),
                         timeout=10.0
                     )
+                    
+                    # Get best ask from LONG exchange (price we pay when buying)
+                    if not long_book.get("asks") or len(long_book["asks"]) == 0:
+                        safe_log("⚠️ No asks in order book, retrying...")
+                        return {"success": False, "waiting": True}
+                    long_ask_price = long_book["asks"][0][0]
+                    
+                    # Get best bid from SHORT exchange (price we receive when selling)
+                    if not short_book.get("bids") or len(short_book["bids"]) == 0:
+                        safe_log("⚠️ No bids in order book, retrying...")
+                        return {"success": False, "waiting": True}
+                    short_bid_price = short_book["bids"][0][0]
+                    
                 except asyncio.TimeoutError:
-                    safe_log("⚠️ Timeout fetching prices, retrying...")
+                    safe_log("⚠️ Timeout fetching order books, retrying...")
                     return {"success": False, "waiting": True}
                 
-                # Calculate price spread percentage
-                price_diff = abs(short_price - long_price)
-                avg_price = (long_price + short_price) / 2
+                # Calculate real price spread (BID - ASK)
+                # Positive spread = profitable (sell high, buy low)
+                # Negative spread = losing trade (buy high, sell low)
+                price_diff = short_bid_price - long_ask_price
+                
+                # Reject negative spread immediately
+                if price_diff < 0:
+                    safe_log(f"❌ Negative spread: SHORT BID ${short_bid_price:,.6f} < LONG ASK ${long_ask_price:,.6f} → Would lose ${abs(price_diff):,.6f} per unit")
+                    return {"success": False, "waiting": True}
+                
+                avg_price = (long_ask_price + short_bid_price) / 2
                 price_spread_pct = (price_diff / avg_price) * 100
                 
-                safe_log(f"📊 Price spread: {price_spread_pct:.4f}% (threshold: {params['price_spread_min']}%) | LONG: ${long_price:,.6f} | SHORT: ${short_price:,.6f}")
+                safe_log(f"📊 Real spread (OI): {price_spread_pct:.4f}% (threshold: {params['price_spread_min']}%) | LONG ASK: ${long_ask_price:,.6f} | SHORT BID: ${short_bid_price:,.6f}")
                 
                 # Check if spread meets minimum threshold
                 if price_spread_pct < params["price_spread_min"]:
@@ -2907,254 +2913,6 @@ class FundingHunterGUI:
         """Handle exchange dropdown selection change in Trading Panel"""
         self._update_pair_info()
         self._update_usdt_volume()
-    
-    def _toggle_auto_trading(self):
-        """Toggle auto trading on/off with Start/Stop button"""
-        # Check current state
-        if self.auto_trading_active:
-            # Currently running - STOP it
-            self.auto_trading_active = False
-            self.auto_trade_status.config(text="Stopped", foreground="gray")
-            self.auto_trade_btn.config(text="🚀 Start")
-            self._log("🛑 Auto Trading STOPPED")
-            
-            # Stop check loop
-            if self.auto_trade_check_task:
-                self.root.after_cancel(self.auto_trade_check_task)
-                self.auto_trade_check_task = None
-        else:
-            # Currently stopped - START it
-            # Validation
-            if not self.connected:
-                self._log("❌ Cannot start auto trading: Not connected to exchanges")
-                return
-            
-            if self.active_position:
-                self._log("❌ Cannot start auto trading: Active position exists. Close it first.")
-                return
-            
-            try:
-                volume = float(self.auto_volume_entry.get())
-                leverage = int(self.auto_leverage_entry.get())
-                min_spread = float(self.auto_min_spread_entry.get())
-                max_hours = float(self.auto_max_hours_entry.get())
-                
-                if volume <= 0 or leverage <= 0 or min_spread < 0 or max_hours <= 0:
-                    raise ValueError("Invalid values")
-                    
-            except ValueError:
-                self._log("❌ Invalid auto trading settings. Please check your inputs.")
-                return
-            
-            # Enable auto trading
-            self.auto_trading_active = True
-            self.auto_trade_status.config(text="Scanning...", foreground="green")
-            self.auto_trade_btn.config(text="🛑 Stop")
-            self._log(f"🤖 Auto Trading STARTED | Scan: 2s | Vol: {volume} USDT | Lev: {leverage}x | MinSpread: {min_spread}% | MaxHrs: {max_hours}h")
-            
-            # Start auto trading check loop
-            self._start_auto_trading_check()
-    
-    def _start_auto_trading_check(self):
-        """Start the auto trading signal check loop"""
-        if not self.auto_trading_active:
-            return
-        
-        # Check for trading signal
-        self._check_auto_trading_signal()
-        
-        # Schedule next check in 2 seconds (for price spread monitoring)
-        self.auto_trade_check_task = self.root.after(2000, self._start_auto_trading_check)
-    
-    def _check_auto_trading_signal(self):
-        """Check if current market conditions meet auto trading criteria"""
-        if not self.auto_trading_active or not self.connected:
-            return
-        
-        # Don't open new position if one already exists
-        if self.active_position:
-            self._log("⏸️  Auto Trading: Position already active, waiting...")
-            return
-        
-        # Get auto trading settings
-        try:
-            min_spread_threshold = float(self.auto_min_spread_entry.get()) / 100  # Convert to decimal
-            max_hours_before_funding = float(self.auto_max_hours_entry.get())
-        except ValueError:
-            self._log("❌ Invalid auto trading settings")
-            return
-        
-        # Check funding rates table for best opportunity
-        if not self.cached_funding_rates:
-            self._log("⏸️  Auto Trading: No funding rates available yet")
-            return
-        
-        # Find best opportunity from cached funding rates
-        best_pair = None
-        best_spread = 0
-        best_long_ex = None
-        best_short_ex = None
-        best_long_rate = None
-        best_short_rate = None
-        
-        for pair, rates in self.cached_funding_rates.items():
-            rate_values = {}
-            if Exchange.OKX in rates:
-                rate_values[Exchange.OKX] = rates[Exchange.OKX].funding_rate
-            if Exchange.BINANCE in rates:
-                rate_values[Exchange.BINANCE] = rates[Exchange.BINANCE].funding_rate
-            if Exchange.BINGX in rates:
-                rate_values[Exchange.BINGX] = rates[Exchange.BINGX].funding_rate
-            
-            if len(rate_values) >= 2:
-                sorted_rates = sorted(rate_values.items(), key=lambda x: x[1])
-                lowest_ex, lowest_rate = sorted_rates[0]
-                highest_ex, highest_rate = sorted_rates[-1]
-                spread = highest_rate - lowest_rate
-                
-                if spread > best_spread:
-                    best_spread = spread
-                    best_pair = pair
-                    best_long_ex = lowest_ex
-                    best_short_ex = highest_ex
-                    best_long_rate = lowest_rate
-                    best_short_rate = highest_rate
-        
-        # Check if best opportunity meets criteria
-        if not best_pair or best_spread < min_spread_threshold or not best_long_ex or not best_short_ex:
-            self._log(f"⏸️  Auto Trading: No pair meets min spread ({min_spread_threshold*100:.3f}%). Best: {best_spread*100:.3f}%")
-            return
-        
-        # Check timing - need to verify hours until funding
-        async def check_timing_and_open():
-            try:
-                # Type check
-                if not best_long_ex or not best_short_ex:
-                    return False
-                    
-                # Get funding rate to check next funding time
-                long_client = self.manager.clients.get(best_long_ex)
-                if not long_client:
-                    return False
-                
-                symbol = get_exchange_symbol(best_pair, best_long_ex)
-                funding_rate_obj = await long_client.get_funding_rate(symbol)
-                
-                # Calculate hours until funding
-                from datetime import datetime, timezone
-                now = datetime.now(timezone.utc)
-                next_funding_time = funding_rate_obj.next_funding_time
-                time_until_funding = next_funding_time - now
-                hours_until = time_until_funding.total_seconds() / 3600
-                
-                if hours_until > max_hours_before_funding:
-                    self._log(f"⏸️  Auto Trading: Too early ({hours_until:.1f}h until funding). Waiting...")
-                    return False
-                
-                # Check price spread threshold before opening
-                short_client = self.manager.clients.get(best_short_ex)
-                if not short_client:
-                    return False
-                
-                long_symbol = get_exchange_symbol(best_pair, best_long_ex)
-                short_symbol = get_exchange_symbol(best_pair, best_short_ex)
-                
-                # Get prices from both exchanges
-                long_price = await long_client.get_mark_price(long_symbol)
-                short_price = await short_client.get_mark_price(short_symbol)
-                
-                # Calculate price spread percentage
-                price_diff = abs(short_price - long_price)
-                avg_price = (long_price + short_price) / 2
-                price_spread_pct = (price_diff / avg_price) * 100
-                
-                # Get price spread threshold from UI
-                try:
-                    price_spread_min = float(self.price_spread_threshold.get())
-                except:
-                    price_spread_min = 0.05  # Default 0.05%
-                
-                if price_spread_pct < price_spread_min:
-                    self._log(f"⏸️  Auto Trading: Price spread too small ({price_spread_pct:.3f}% < {price_spread_min}%). Waiting...")
-                    return False
-                
-                # All conditions met - open position!
-                self._log(f"✅ Auto Trading SIGNAL DETECTED!")
-                self._log(f"   Pair: {best_pair} | Funding Spread: {best_spread*100:.3f}% | Price Spread: {price_spread_pct:.3f}% | Hours: {hours_until:.1f}h")
-                
-                if best_long_rate is not None and best_short_rate is not None:
-                    self._log(f"   LONG: {best_long_ex.value} ({best_long_rate*100:.4f}%) | SHORT: {best_short_ex.value} ({best_short_rate*100:.4f}%)")
-                
-                # Auto-populate the trading panel
-                self.root.after(0, lambda: self._auto_populate_and_open(best_pair, best_long_ex, best_short_ex))
-                
-                return True
-                
-            except Exception as e:
-                logger.error(f"Error checking timing: {e}")
-                return False
-        
-        # Run async check
-        future = self._run_async(check_timing_and_open())
-        if future:
-            future.add_done_callback(lambda f: None)  # Just log any errors
-    
-    def _auto_populate_and_open(self, pair: str, long_ex: Exchange, short_ex: Exchange):
-        """Auto-populate trading panel and open position"""
-        if not long_ex or not short_ex:
-            self._log("❌ Invalid exchanges")
-            return
-            
-        # Set pair
-        self.pair_combo.set(pair)
-        
-        # Set exchanges
-        exchange_display_map = {Exchange.OKX: "OKX", Exchange.BINANCE: "Binance", Exchange.BINGX: "BingX"}
-        self.long_exchange.set(exchange_display_map[long_ex])
-        self.short_exchange.set(exchange_display_map[short_ex])
-        
-        # Set leverage from auto trading settings
-        leverage = self.auto_leverage_entry.get()
-        self.leverage_var.set(leverage)
-        
-        # Calculate size based on volume (USDT) and leverage
-        # Size = Volume / Price
-        # We need to get current price first
-        async def get_price_and_open():
-            try:
-                long_client = self.manager.clients.get(long_ex)
-                if not long_client:
-                    self._log("❌ Cannot get client for auto trading")
-                    return
-                    
-                symbol = get_exchange_symbol(pair, long_ex)
-                price = await long_client.get_mark_price(symbol)
-                
-                # Calculate size in base currency
-                volume_usdt = float(self.auto_volume_entry.get())
-                leverage_val = int(leverage)
-                
-                # Total position value = volume_usdt * leverage
-                # Size in base currency = total_value / price
-                total_value = volume_usdt * leverage_val
-                size = total_value / price
-                
-                self._log(f"💡 Calculated size: {size:.4f} {pair.split('/')[0]} (Price: ${price:,.2f}, Volume: {volume_usdt} USDT, Leverage: {leverage_val}x)")
-                
-                # Set size
-                self.root.after(0, lambda: self.size_entry.delete(0, tk.END))
-                self.root.after(0, lambda: self.size_entry.insert(0, f"{size:.4f}"))
-                
-                # Trigger position open
-                self.root.after(0, lambda: self._log(f"🤖 Auto Trading: Opening position..."))
-                self.root.after(0, self._open_position)
-                
-            except Exception as e:
-                self._log(f"❌ Auto Trading: Failed to calculate size: {e}")
-        
-        future = self._run_async(get_price_and_open())
-        if future:
-            future.add_done_callback(lambda f: None)
     
     def _update_usdt_volume(self, event=None):
         """Update USDT volume display based on size and current price"""
