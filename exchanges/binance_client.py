@@ -512,6 +512,24 @@ class BinanceClient(BaseExchangeClient):
         
         return result
     
+    async def get_recent_orders(self, symbol: str, limit: int = 10) -> List[Dict]:
+        """Get recent orders for a symbol
+        
+        Args:
+            symbol: Trading pair symbol
+            limit: Maximum number of orders to return
+            
+        Returns:
+            List of recent orders with status, side, time, etc.
+        """
+        params = {
+            "symbol": symbol,
+            "limit": limit
+        }
+        
+        result = await self._request("GET", "/fapi/v1/allOrders", params)
+        return result
+    
     def get_exchange_name(self) -> str:
         """Get exchange name"""
         return "Binance"

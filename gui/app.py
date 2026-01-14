@@ -413,8 +413,13 @@ class MultiExchangeManager:
                 pass
     
     async def check_positions(self, pair: str, long_ex: Exchange, short_ex: Exchange) -> Dict[str, Any]:
-        """Check positions on both exchanges with liquidation history verification"""
-        result = {"long": None, "short": None, "liquidated": None, "liquidation_confirmed": False}
+        """Check positions on both exchanges
+        
+        Returns:
+            Dict with 'long', 'short' positions and 'one_side_missing' flag
+            Note: Does NOT determine liquidation - caller should retry to confirm
+        """
+        result = {"long": None, "short": None, "one_side_missing": None}
         
         try:
             long_client = self.clients.get(long_ex)
@@ -443,114 +448,21 @@ class MultiExchangeManager:
                     logger.warning(f"Timeout getting position from {short_ex.value}")
                     result["short"] = None
             
-            # Check liquidation (more robust check)
-            # Position is liquidated if: exists but size = 0, or is None
+            # Check if one side is missing (potential liquidation)
             long_exists = result["long"] is not None and result["long"].size > 0
             short_exists = result["short"] is not None and result["short"].size > 0
             
-            # Only mark as liquidated if ONE side disappeared while OTHER side still exists
-            # (Not both missing, which could be API error or position never opened)
+            # Flag which side is missing (if any)
             if not long_exists and short_exists:
-                # Verify liquidation by checking history
-                liquidated_confirmed = await self._verify_liquidation(
-                    long_client, get_exchange_symbol(pair, long_ex), long_ex
-                )
-                if liquidated_confirmed:
-                    result["liquidated"] = long_ex
-                    result["liquidation_confirmed"] = True
-                    logger.warning(f"🚨 LIQUIDATION CONFIRMED on {long_ex.value} via history")
-                else:
-                    # Position missing but no liquidation in history - might be API error or manual close
-                    result["liquidated"] = long_ex
-                    result["liquidation_confirmed"] = False
-                    logger.warning(f"⚠️ Position missing on {long_ex.value} (not confirmed via history)")
-                    
+                result["one_side_missing"] = long_ex
             elif not short_exists and long_exists:
-                # Verify liquidation by checking history
-                liquidated_confirmed = await self._verify_liquidation(
-                    short_client, get_exchange_symbol(pair, short_ex), short_ex
-                )
-                if liquidated_confirmed:
-                    result["liquidated"] = short_ex
-                    result["liquidation_confirmed"] = True
-                    logger.warning(f"🚨 LIQUIDATION CONFIRMED on {short_ex.value} via history")
-                else:
-                    # Position missing but no liquidation in history - might be API error or manual close
-                    result["liquidated"] = short_ex
-                    result["liquidation_confirmed"] = False
-                    logger.warning(f"⚠️ Position missing on {short_ex.value} (not confirmed via history)")
+                result["one_side_missing"] = short_ex
+            # If both missing or both exist, one_side_missing = None
                 
         except Exception as e:
             logger.error(f"Error checking positions: {e}")
         
         return result
-    
-    async def _verify_liquidation(self, client, symbol: str, exchange: Exchange) -> bool:
-        """Verify if liquidation happened by checking income history
-        
-        Returns:
-            True if liquidation confirmed in history, False otherwise
-        """
-        if client is None:
-            return False
-        
-        try:
-            # Try to get liquidation records from income history
-            # Check last 50 records within recent time
-            from exchanges.binance_client import BinanceClient
-            from exchanges.okx_client import OKXClient
-            from exchanges.bingx_client import BingXClient
-            
-            if isinstance(client, BinanceClient):
-                # Binance: check LIQUIDATION income type
-                try:
-                    history = await asyncio.wait_for(
-                        client.get_income_history(income_type="REALIZED_PNL", limit=50, symbol=symbol),
-                        timeout=5.0
-                    )
-                    # Check for liquidation in recent records (last hour)
-                    from datetime import datetime, timedelta
-                    one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000
-                    
-                    for record in history:
-                        # Binance marks liquidation with specific income type or very negative realized PnL
-                        if record.get('time', 0) > one_hour_ago:
-                            income = float(record.get('income', 0))
-                            # Large negative PnL indicates liquidation
-                            if income < -10:  # More than $10 loss suggests liquidation
-                                return True
-                except Exception as e:
-                    logger.debug(f"Could not verify liquidation via Binance history: {e}")
-                    
-            elif isinstance(client, OKXClient):
-                # OKX: has specific liquidation records
-                try:
-                    # OKX get_income_history might have liquidation type
-                    history = await asyncio.wait_for(
-                        client.get_income_history(income_type="liquidation", limit=20),
-                        timeout=5.0
-                    )
-                    # If we get any recent liquidation records, confirm it
-                    if history and len(history) > 0:
-                        return True
-                except Exception as e:
-                    logger.debug(f"Could not verify liquidation via OKX history: {e}")
-                    
-            elif isinstance(client, BingXClient):
-                # BingX: check income history for liquidation
-                try:
-                    # BingX might not have detailed income history API
-                    # Just return False to rely on position check
-                    pass
-                except Exception as e:
-                    logger.debug(f"Could not verify liquidation via BingX history: {e}")
-            
-            # Could not confirm liquidation via history
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error verifying liquidation: {e}")
-            return False
     
     async def scan_all_positions(self) -> Dict[Exchange, List[Any]]:
         """
@@ -653,7 +565,8 @@ class MultiExchangeManager:
             Logic: 
             - LONG (BUY market) will fill at ASK price (sellers)
             - SHORT (SELL market) will fill at BID price (buyers)
-            - Real spread = ASK(long_exchange) - BID(short_exchange)
+            - Spread = (SHORT_BID - LONG_ASK) / avg_price * 100
+            - For funding arbitrage, negative spread is OK since we profit from funding fees
             """
             try:
                 # Get order books with timeout
@@ -679,20 +592,15 @@ class MultiExchangeManager:
                     return (False, 0.0, 0.0, 0.0)
                 short_bid_price = short_book["bids"][0][0]  # Best bid [price, qty]
                 
-                # Calculate real spread: what we pay (ASK) vs what we get (BID)
-                # Positive spread = profitable (we can buy low and sell high)
-                # Negative spread = losing trade (buying high, selling low)
+                # Calculate spread percentage
+                # Positive = profitable on entry, Negative = loss on entry (but OK for funding arb)
                 price_diff = short_bid_price - long_ask_price
-                
-                # If spread is negative, it means we'd be buying at higher price than selling
-                # This is a losing trade, should not proceed
-                if price_diff < 0:
-                    logger.warning(f"Negative spread detected: LONG ASK ${long_ask_price:.2f} > SHORT BID ${short_bid_price:.2f}")
-                    return (False, price_diff, long_ask_price, short_bid_price)
-                
                 avg_price = (long_ask_price + short_bid_price) / 2
                 spread_pct = (price_diff / avg_price) * 100
                 
+                # For funding arbitrage, we allow negative spread
+                # User sets price_spread_min to control minimum acceptable spread
+                # If price_spread_min = -0.1, allows up to -0.1% spread
                 return (spread_pct >= price_spread_min, spread_pct, long_ask_price, short_bid_price)
                 
             except asyncio.TimeoutError:
@@ -1251,6 +1159,10 @@ class FundingHunterGUI:
                                        command=self._load_existing_positions, state=tk.DISABLED)
         self.load_pos_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
         
+        self.monitor_btn = ttk.Button(btn_frame, text="👁 Start Monitor", 
+                                      command=self._toggle_monitoring, state=tk.DISABLED)
+        self.monitor_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+        
         # Auto close option
         option_frame = ttk.Frame(frame)
         option_frame.pack(fill=tk.X, pady=5)
@@ -1672,10 +1584,6 @@ class FundingHunterGUI:
             self.root.after_cancel(self._usdt_update_pending)
             self._usdt_update_pending = None
         
-        # Stop auto trading if active
-        if self.auto_trading_active:
-            self._toggle_auto_trading()  # This will stop it
-        
         # Stop monitoring temporarily
         if self.monitoring:
             self._stop_monitoring()
@@ -1805,18 +1713,17 @@ class FundingHunterGUI:
                 
                 # Calculate real price spread (BID - ASK)
                 # Positive spread = profitable (sell high, buy low)
-                # Negative spread = losing trade (buy high, sell low)
+                # Negative spread = acceptable for funding arbitrage (profit from funding fees)
                 price_diff = short_bid_price - long_ask_price
-                
-                # Reject negative spread immediately
-                if price_diff < 0:
-                    safe_log(f"❌ Negative spread: SHORT BID ${short_bid_price:,.6f} < LONG ASK ${long_ask_price:,.6f} → Would lose ${abs(price_diff):,.6f} per unit")
-                    return {"success": False, "waiting": True}
                 
                 avg_price = (long_ask_price + short_bid_price) / 2
                 price_spread_pct = (price_diff / avg_price) * 100
                 
-                safe_log(f"📊 Real spread (OI): {price_spread_pct:.4f}% (threshold: {params['price_spread_min']}%) | LONG ASK: ${long_ask_price:,.6f} | SHORT BID: ${short_bid_price:,.6f}")
+                # Show spread info with appropriate indicator
+                if price_spread_pct < 0:
+                    safe_log(f"📊 Real spread (OI): {price_spread_pct:.4f}% ⚠️ NEGATIVE (threshold: {params['price_spread_min']}%) | LONG ASK: ${long_ask_price:,.6f} | SHORT BID: ${short_bid_price:,.6f}")
+                else:
+                    safe_log(f"📊 Real spread (OI): {price_spread_pct:.4f}% (threshold: {params['price_spread_min']}%) | LONG ASK: ${long_ask_price:,.6f} | SHORT BID: ${short_bid_price:,.6f}")
                 
                 # Check if spread meets minimum threshold
                 if price_spread_pct < params["price_spread_min"]:
@@ -1941,25 +1848,25 @@ class FundingHunterGUI:
             logger.error(f"_on_first_split_complete error: {e}")
     
     def _on_all_splits_complete(self, params, total_size):
-        """Called after ALL splits complete - now start monitoring"""
+        """Called after ALL splits complete"""
         logger.debug("_on_all_splits_complete: ENTER")
         try:
             # Update position size to final total
             if self.active_position:
                 self.active_position["size"] = total_size
             
-            # Now start monitoring (delayed to let GUI settle)
-            def start_monitor():
-                if not self.monitoring:
-                    logger.debug("_on_first_split_complete: Starting monitoring")
-                    self._start_monitoring()
-                else:
-                    logger.debug("_on_first_split_complete: Monitoring already active")
+            # Monitoring disabled by default - user can manually start if needed
+            # def start_monitor():
+            #     if not self.monitoring:
+            #         logger.debug("_on_all_splits_complete: Starting monitoring")
+            #         self._start_monitoring()
+            #     else:
+            #         logger.debug("_on_all_splits_complete: Monitoring already active")
+            # self.root.after(500, start_monitor)
             
-            self.root.after(500, start_monitor)
-            logger.debug("_on_first_split_complete: EXIT")
+            logger.debug("_on_all_splits_complete: EXIT")
         except Exception as e:
-            logger.error(f"_on_first_split_complete: ERROR {e}")
+            logger.error(f"_on_all_splits_complete: ERROR {e}")
     
     def _setup_position_tracking(self, pair, long_ex, short_ex, size):
         """Setup position tracking after successful open"""
@@ -2406,11 +2313,15 @@ class FundingHunterGUI:
             self.root.after(0, lambda: self._log(msg))
         
         async def monitor_loop():
-            last_pnl_update = datetime.now(timezone.utc)
+            last_pnl_update = None  # None = update immediately on first run
+            liquidation_check_count = 0  # Counter for liquidation confirmation
+            liquidation_suspect_exchange = None  # Which exchange is suspected
+            safe_log("📊 Monitor loop started...")
             
             while self.monitoring and self.active_position:
                 try:
                     pos = self.active_position
+                    # Don't log every check - too spammy
                     result = await self.manager.check_positions(
                         pos['pair'], pos['long_exchange'], pos['short_exchange']
                     )
@@ -2419,6 +2330,11 @@ class FundingHunterGUI:
                     long_pnl = result['long'].unrealized_pnl if result['long'] else 0
                     short_pnl = result['short'].unrealized_pnl if result['short'] else 0
                     unrealized_pnl = long_pnl + short_pnl
+                    
+                    # Update active_position with latest data
+                    pos['unrealized_pnl'] = unrealized_pnl
+                    pos['long_pnl'] = long_pnl
+                    pos['short_pnl'] = short_pnl
                     
                     # Get funding fees (every 30 seconds to avoid rate limit)
                     from datetime import timedelta
@@ -2435,9 +2351,11 @@ class FundingHunterGUI:
                     # Total PnL = Unrealized PnL + Funding Fees
                     total_pnl = unrealized_pnl + funding_fees
                     
-                    # Update PnL display only every 60 seconds to reduce API calls
-                    time_since_pnl_update = (now - last_pnl_update).total_seconds()
-                    if time_since_pnl_update >= 60:
+                    # Update PnL display (first time immediately, then every 10 seconds)
+                    should_update_pnl = (last_pnl_update is None) or ((now - last_pnl_update).total_seconds() >= 10)
+                    if should_update_pnl:
+                        # Only log to console, don't spam GUI log
+                        logger.debug(f"PnL: ${unrealized_pnl:.4f} | Funding: ${funding_fees:.4f} | Total: ${total_pnl:.4f}")
                         self.root.after(0, lambda u=unrealized_pnl, f=funding_fees, t=total_pnl: 
                             self.pos_pnl_label.config(
                                 text=f"PnL: ${u:.6f} | Funding: ${f:.6f} | Total: ${t:.6f}",
@@ -2445,35 +2363,100 @@ class FundingHunterGUI:
                             ))
                         last_pnl_update = now
                     
-                    # Check liquidation
-                    if result['liquidated']:
-                        safe_log(f"⚠️ LIQUIDATION on {result['liquidated'].value}!")
+                    # Check liquidation with retry logic (3 consecutive checks)
+                    missing_ex = result.get('one_side_missing')
+                    
+                    if missing_ex:
+                        # One side is missing - potential liquidation
+                        if liquidation_suspect_exchange == missing_ex:
+                            # Same exchange missing again
+                            liquidation_check_count += 1
+                            safe_log(f"⚠️ Position missing on {missing_ex.value} (check {liquidation_check_count}/3)...")
+                        else:
+                            # Different exchange or first time
+                            liquidation_suspect_exchange = missing_ex
+                            liquidation_check_count = 1
+                            safe_log(f"⚠️ Position missing on {missing_ex.value} (check 1/3)...")
                         
-                        if self.auto_close_var.get():
-                            # Close other side
-                            other_ex = pos['short_exchange'] if result['liquidated'] == pos['long_exchange'] else pos['long_exchange']
-                            client = self.manager.clients.get(other_ex)
+                        # Wait 2 seconds before next check
+                        await asyncio.sleep(2)
+                        
+                        # After 3 consecutive checks, check order history to determine cause
+                        if liquidation_check_count >= 3:
+                            # Check if user manually closed position
+                            client = self.manager.clients.get(missing_ex)
+                            symbol = get_exchange_symbol(pos['pair'], missing_ex)
+                            was_manual_close = False
+                            
                             if client:
-                                symbol = get_exchange_symbol(pos['pair'], other_ex)
                                 try:
-                                    await client.close_position(symbol)
-                                    safe_log(f"Auto-closed position on {other_ex.value}")
-                                except:
-                                    pass
+                                    # Get recent orders to check if position was manually closed
+                                    recent_orders = await client.get_recent_orders(symbol, limit=5)
+                                    
+                                    # Check for recent close order (within last 30 seconds)
+                                    import time
+                                    now_ms = int(time.time() * 1000)
+                                    thirty_sec_ago = now_ms - 30000
+                                    
+                                    for order in recent_orders:
+                                        # Get order time (different field names per exchange)
+                                        order_time = int(order.get('time') or order.get('updateTime') or order.get('cTime') or order.get('ts') or 0)
+                                        
+                                        if order_time > thirty_sec_ago:
+                                            # Recent order found - check if it was a close order
+                                            order_status = str(order.get('status') or order.get('state') or '').upper()
+                                            if order_status in ['FILLED', 'filled', 'live']:
+                                                was_manual_close = True
+                                                safe_log(f"📋 Found recent order - position was manually closed")
+                                                break
+                                except Exception as e:
+                                    logger.debug(f"Could not check order history: {e}")
+                            
+                            if was_manual_close:
+                                # User manually closed - just update state, don't show liquidation warning
+                                safe_log(f"✅ Position on {missing_ex.value} was closed manually")
+                                self.monitoring = False
+                                self.active_position = None
+                                self.root.after(0, self._clear_position_display)
+                                break
+                            else:
+                                # No recent close order - likely liquidation
+                                safe_log(f"🚨 LIQUIDATION CONFIRMED on {missing_ex.value}!")
+                                
+                                if self.auto_close_var.get():
+                                    # Close other side
+                                    other_ex = pos['short_exchange'] if missing_ex == pos['long_exchange'] else pos['long_exchange']
+                                    other_client = self.manager.clients.get(other_ex)
+                                    if other_client:
+                                        other_symbol = get_exchange_symbol(pos['pair'], other_ex)
+                                        try:
+                                            await other_client.close_position(other_symbol)
+                                            safe_log(f"Auto-closed position on {other_ex.value}")
+                                        except:
+                                            pass
+                                
+                                self.root.after(0, lambda ex=missing_ex: messagebox.showwarning(
+                                    "Liquidation", 
+                                    f"Position liquidated on {ex.value}!"
+                                ))
+                                self.monitoring = False
+                                self.active_position = None
+                                self.root.after(0, self._clear_position_display)
+                                
+                                # If auto trading is enabled, it will resume scanning
+                                if self.auto_trading_active:
+                                    safe_log(f"🤖 Auto Trading: Resuming signal scanning after liquidation...")
+                                
+                                break
                         
-                        self.root.after(0, lambda: messagebox.showwarning(
-                            "Liquidation", 
-                            f"Position liquidated on {result['liquidated'].value}!"
-                        ))
-                        self.monitoring = False
-                        self.active_position = None
-                        self.root.after(0, self._clear_position_display)
-                        
-                        # If auto trading is enabled, it will resume scanning
-                        if self.auto_trading_active:
-                            safe_log(f"🤖 Auto Trading: Resuming signal scanning after liquidation...")
-                        
-                        break
+                        # Continue to next iteration (don't sleep again, already waited 2s)
+                        continue
+                    else:
+                        # Both positions exist - reset liquidation counter
+                        if liquidation_check_count > 0:
+                            safe_log(f"✅ Position recovered on {liquidation_suspect_exchange.value}")
+                        liquidation_check_count = 0
+                        liquidation_suspect_exchange = None
                     
                     # Check funding reversal (if enabled)
                     if self.auto_close_reversal_var.get() and 'initial_net_funding' in pos:
@@ -2513,13 +2496,32 @@ class FundingHunterGUI:
                     
                 except Exception as e:
                     logger.error(f"Monitor error: {e}")
+                    # Don't spam GUI with errors, just log to console
                     await asyncio.sleep(2)
         
-        self._run_async(monitor_loop())
+        # Debug log for scheduling
+        logger.debug(f"Scheduling monitor loop... (loop exists: {self.loop is not None})")
+        future = self._run_async(monitor_loop())
+        if not future:
+            self._log("❌ Failed to schedule monitor loop - no event loop!")
     
     def _stop_monitoring(self):
         """Stop monitoring"""
         self.monitoring = False
+        self._log("⏹ Monitoring stopped")
+        self.monitor_btn.config(text="👁 Start Monitor")
+    
+    def _toggle_monitoring(self):
+        """Toggle monitoring on/off"""
+        if not self.active_position:
+            messagebox.showwarning("Warning", "No active position to monitor")
+            return
+        
+        if self.monitoring:
+            self._stop_monitoring()
+        else:
+            self._start_monitoring()
+            self.monitor_btn.config(text="⏹ Stop Monitor")
     
     async def _check_funding_reversal(self, position: Dict[str, Any]) -> tuple[bool, str]:
         """
@@ -2698,6 +2700,8 @@ class FundingHunterGUI:
             self.pos_short_label.config(text=f"Short: {pos['short_exchange'].value}")
             self.pos_size_label.config(text=f"Size: {pos['size']}")
             self.pos_status_label.config(text="Status: OPEN", foreground='green')
+            # Enable monitor button when position exists
+            self.monitor_btn.config(state=tk.NORMAL)
     
     def _clear_position_display(self):
         """Clear position display"""
@@ -2707,6 +2711,8 @@ class FundingHunterGUI:
         self.pos_size_label.config(text="Size: -")
         self.pos_pnl_label.config(text="PnL: $0.00 | Funding: $0.00 | Total: $0.00", foreground='black')
         self.pos_status_label.config(text="Status: No Position", foreground='black')
+        # Disable monitor button and reset text
+        self.monitor_btn.config(text="👁 Start Monitor", state=tk.DISABLED)
         
         # Restart pair info update loop when position is closed
         if not self._pair_info_update_task:
@@ -2998,10 +3004,10 @@ class FundingHunterGUI:
                                         long_display: str, short_display: str):
         """Fetch real-time prices for the two selected exchanges and update display"""
         async def async_get_prices():
-            prices = {}
+            result_data = {}
             funding_rates = {}
             
-            # Get prices and funding rates from both exchanges with timeout
+            # Get order books, prices and funding rates from both exchanges with timeout
             tasks = []
             for exchange in [long_ex, short_ex]:
                 client = self.manager.clients.get(exchange)
@@ -3015,12 +3021,12 @@ class FundingHunterGUI:
                     if isinstance(result, dict) and not isinstance(result, Exception):
                         if 'exchange' in result:
                             ex = result['exchange']
-                            if 'price' in result:
-                                prices[ex] = result['price']
+                            # Store full result data (order_book, price, funding_rate)
+                            result_data[ex] = result
                             if 'funding_rate' in result:
                                 funding_rates[ex] = result['funding_rate']
             
-            return prices, funding_rates
+            return result_data, funding_rates
         
         async def _timeout_wrapper():
             try:
@@ -3031,20 +3037,39 @@ class FundingHunterGUI:
         
         def on_complete(future):
             try:
-                prices, funding_rates = future.result(timeout=0.1)
+                result_data, funding_rates = future.result(timeout=0.1)
                 
-                if len(prices) >= 2:
-                    long_price = prices.get(long_ex, 0)
-                    short_price = prices.get(short_ex, 0)
+                if len(result_data) >= 2:
+                    long_data = result_data.get(long_ex, {})
+                    short_data = result_data.get(short_ex, {})
                     
-                    # Calculate price spread
-                    price_diff = abs(short_price - long_price)
+                    # Extract order book or fallback to mark price
+                    long_order_book = long_data.get('order_book')
+                    short_order_book = short_data.get('order_book')
+                    
+                    # Get real execution prices from order book
+                    if long_order_book and long_order_book.get('asks') and len(long_order_book['asks']) > 0:
+                        long_price = long_order_book['asks'][0][0]  # ASK price (we buy here)
+                        long_price_type = "ASK"
+                    else:
+                        long_price = long_data.get('price', 0)
+                        long_price_type = "Mark"
+                    
+                    if short_order_book and short_order_book.get('bids') and len(short_order_book['bids']) > 0:
+                        short_price = short_order_book['bids'][0][0]  # BID price (we sell here)
+                        short_price_type = "BID"
+                    else:
+                        short_price = short_data.get('price', 0)
+                        short_price_type = "Mark"
+                    
+                    # Calculate price spread (BID - ASK)
+                    # Positive = profitable (sell high at BID, buy low at ASK)
+                    # Negative = losing (buy high, sell low)
+                    price_diff = short_price - long_price
                     price_spread_pct = (price_diff / long_price * 100) if long_price > 0 else 0
                     
                     # Determine if spread is good for entry
-                    # Price difference should ideally favor our position
-                    # For hedged position: we want to buy low (LONG) and sell high (SHORT)
-                    is_good_entry = short_price > long_price  # SHORT price should be higher
+                    is_good_entry = price_diff > 0
                     
                     # Get funding rates to determine next funding time from API
                     from datetime import datetime, timezone, timedelta
@@ -3131,16 +3156,34 @@ class FundingHunterGUI:
                         else:
                             funding_interval_text = f"Every {interval_hours} hours"
                     
-                    # Build display text
+                    # Build display text with order book info
                     info_text = f"═══ {pair} ═══\n\n"
-                    info_text += f"LONG  ({long_display}):  ${long_price:,.6f}\n"
-                    info_text += f"SHORT ({short_display}): ${short_price:,.6f}\n\n"
-                    info_text += f"Price Spread: ${price_diff:,.6f} ({price_spread_pct:.3f}%)\n"
+                    info_text += f"LONG  ({long_display}):  ${long_price:,.6f} [{long_price_type}]\n"
+                    
+                    # Show top 3 ASKs for LONG if available
+                    if long_order_book and long_order_book.get('asks'):
+                        asks = long_order_book['asks'][:3]
+                        for i, (price, qty) in enumerate(asks):
+                            info_text += f"  ASK{i+1}: ${price:,.6f} x {qty:.4f}\n"
+                    
+                    info_text += f"\nSHORT ({short_display}): ${short_price:,.6f} [{short_price_type}]\n"
+                    
+                    # Show top 3 BIDs for SHORT if available
+                    if short_order_book and short_order_book.get('bids'):
+                        bids = short_order_book['bids'][:3]
+                        for i, (price, qty) in enumerate(bids):
+                            info_text += f"  BID{i+1}: ${price:,.6f} x {qty:.4f}\n"
+                    
+                    info_text += "\n"
+                    
+                    # Display spread with sign (positive = good, negative = bad)
+                    spread_sign = "+" if price_diff >= 0 else ""
+                    info_text += f"Real Spread (OI): {spread_sign}${price_diff:,.6f} ({spread_sign}{price_spread_pct:.3f}%)\n"
                     
                     if is_good_entry:
-                        info_text += f"Price Position: ✅ SHORT > LONG (Good)\n"
+                        info_text += f"Entry Signal: ✅ BID > ASK (Profitable!)\n"
                     else:
-                        info_text += f"Price Position: ⚠️ LONG > SHORT (Inverted)\n"
+                        info_text += f"Entry Signal: ❌ BID < ASK (Would Lose!)\n"
                     
                     info_text += f"─────────────────────────\n"
                     info_text += f"Funding Rate ({long_display}):  {long_rate_str}\n"
@@ -3180,10 +3223,20 @@ class FundingHunterGUI:
             future.add_done_callback(on_complete)
     
     async def _fetch_exchange_data(self, client, exchange, symbol):
-        """Fetch price and funding rate from a single exchange with timeout"""
+        """Fetch order book, mark price and funding rate from a single exchange with timeout"""
         result = {'exchange': exchange}
+        
+        # Fetch order book for real execution prices
         try:
-            # Use asyncio.wait_for for individual calls
+            order_book = await asyncio.wait_for(client.get_order_book(symbol, limit=5), timeout=8.0)
+            result['order_book'] = order_book
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout getting order book from {exchange.value}")
+        except Exception as e:
+            logger.debug(f"Could not get order book from {exchange.value}: {e}")
+        
+        # Fetch mark price as fallback
+        try:
             price = await asyncio.wait_for(client.get_mark_price(symbol), timeout=8.0)
             result['price'] = price
         except asyncio.TimeoutError:

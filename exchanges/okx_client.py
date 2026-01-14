@@ -554,6 +554,31 @@ class OKXClient(BaseExchangeClient):
             print(f"Error getting OKX income history: {e}")
             return []
     
+    async def get_recent_orders(self, symbol: str, limit: int = 10) -> List[Dict]:
+        """Get recent orders for a symbol
+        
+        Args:
+            symbol: Trading pair symbol (e.g., BTC-USDT-SWAP)
+            limit: Maximum number of orders to return
+            
+        Returns:
+            List of recent orders
+        """
+        okx_symbol = symbol if "-SWAP" in symbol else get_exchange_symbol(symbol.replace("USDT", ""), Exchange.OKX)
+        
+        params = {
+            "instType": "SWAP",
+            "instId": okx_symbol,
+            "limit": str(limit)
+        }
+        
+        try:
+            result = await self._request("GET", "/api/v5/trade/orders-history-archive", params)
+            return result.get("data", [])
+        except Exception as e:
+            print(f"Error getting OKX order history: {e}")
+            return []
+    
     def get_exchange_name(self) -> str:
         """Get exchange name"""
         return "OKX"

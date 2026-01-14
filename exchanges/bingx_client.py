@@ -6,6 +6,7 @@ import hashlib
 import time
 import json
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode
@@ -14,6 +15,8 @@ import aiohttp
 from config.settings import BingXConfig
 from config.constants import Side, OrderType, PositionStatus, Exchange, get_exchange_symbol
 from .base import BaseExchangeClient, Position, Order, FundingRate, Balance
+
+logger = logging.getLogger(__name__)
 
 
 class BingXClient(BaseExchangeClient):
@@ -509,12 +512,40 @@ class BingXClient(BaseExchangeClient):
         result = await self._request("GET", "/openApi/swap/v2/quote/depth",
                                      {"symbol": bingx_symbol, "limit": limit}, signed=False)
         
+        # Debug log raw response
+        logger.debug(f"BingX order book raw response for {bingx_symbol}: {result}")
+        
         if result.get("code") == 0 and result.get("data"):
             data = result["data"]
-            return {
-                "bids": [[float(b["p"]), float(b["v"])] for b in data.get("bids", [])],
-                "asks": [[float(a["p"]), float(a["v"])] for a in data.get("asks", [])]
-            }
+            
+            # Parse bids and asks - BingX format is {"p": price, "v": volume}
+            bids = []
+            asks = []
+            
+            # Check if bids/asks exist and parse them
+            if "bids" in data:
+                for b in data["bids"]:
+                    if isinstance(b, dict):
+                        bids.append([float(b.get("p", 0)), float(b.get("v", 0))])
+                    elif isinstance(b, list) and len(b) >= 2:
+                        bids.append([float(b[0]), float(b[1])])
+            
+            if "asks" in data:
+                for a in data["asks"]:
+                    if isinstance(a, dict):
+                        asks.append([float(a.get("p", 0)), float(a.get("v", 0))])
+                    elif isinstance(a, list) and len(a) >= 2:
+                        asks.append([float(a[0]), float(a[1])])
+            
+            logger.debug(f"BingX parsed - Bids: {len(bids)}, Asks: {len(asks)}")
+            if bids:
+                logger.debug(f"BingX top bid: {bids[0]}")
+            if asks:
+                logger.debug(f"BingX top ask: {asks[0]}")
+            
+            return {"bids": bids, "asks": asks}
+        
+        logger.warning(f"BingX order book failed: {result}")
         return {"bids": [], "asks": []}
     
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
@@ -590,6 +621,32 @@ class BingXClient(BaseExchangeClient):
             return income_list
         except Exception as e:
             print(f"Error getting BingX income history: {e}")
+            return []
+    
+    async def get_recent_orders(self, symbol: str, limit: int = 10) -> List[Dict]:
+        """Get recent orders for a symbol
+        
+        Args:
+            symbol: Trading pair symbol (e.g., BTC-USDT)
+            limit: Maximum number of orders to return
+            
+        Returns:
+            List of recent orders
+        """
+        bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol.replace("USDT", ""), Exchange.BINGX)
+        
+        params = {
+            "symbol": bingx_symbol,
+            "limit": str(limit)
+        }
+        
+        try:
+            result = await self._request("GET", "/openApi/swap/v2/trade/allOrders", params)
+            if result.get("code") == 0:
+                return result.get("data", {}).get("orders", [])
+            return []
+        except Exception as e:
+            print(f"Error getting BingX order history: {e}")
             return []
     
     def get_exchange_name(self) -> str:
