@@ -505,7 +505,8 @@ class MultiExchangeManager:
         max_wait_per_split: float = 300.0,
         log_callback = None,
         on_first_split_complete = None,
-        skip_leverage_set: bool = False
+        skip_leverage_set: bool = False,
+        cancel_event: Optional[threading.Event] = None
     ) -> Dict[str, Any]:
         """
         Open hedged position in multiple splits (DCA style)
@@ -525,6 +526,7 @@ class MultiExchangeManager:
             log_callback: Optional callback function for logging to GUI
             on_first_split_complete: Optional callback called after first split completes (to start monitoring)
             skip_leverage_set: Skip setting leverage (use if leverage already set)
+            cancel_event: Optional threading.Event to signal cancellation (thread-safe)
         
         Returns:
             Dict with success status and details
@@ -534,6 +536,10 @@ class MultiExchangeManager:
             if log_callback:
                 log_callback(msg)
         
+        def is_cancelled() -> bool:
+            """Check if cancellation was requested"""
+            return cancel_event is not None and cancel_event.is_set()
+        
         results = {
             "success": False, 
             "splits_completed": 0,
@@ -541,7 +547,8 @@ class MultiExchangeManager:
             "total_long_size": 0,
             "total_short_size": 0,
             "error": None,
-            "split_results": []
+            "split_results": [],
+            "cancelled": False
         }
         
         if long_exchange not in self.clients or short_exchange not in self.clients:
@@ -629,15 +636,34 @@ class MultiExchangeManager:
             for i in range(split_count):
                 split_num = i + 1
                 
+                # Check for cancellation before each split
+                if is_cancelled():
+                    log_msg(f"🛑 Cancelled before split {split_num}/{split_count}")
+                    results["cancelled"] = True
+                    results["error"] = "Cancelled by user"
+                    if results["splits_completed"] > 0:
+                        results["success"] = True
+                    return results
+                
                 # Yield to event loop briefly to keep GUI responsive
                 await asyncio.sleep(0.01)
                 
                 # Check spread before each split (except first one which was already checked)
-                if i > 0 and price_spread_min > 0:
+                # Always check spread regardless of threshold being positive or negative
+                if i > 0:
                     log_msg(f"⏳ Split {split_num}/{split_count}: Waiting for spread threshold ({price_spread_min}%)...")
                     wait_start = asyncio.get_event_loop().time()
                     
                     while True:
+                        # Check for cancellation while waiting for spread
+                        if is_cancelled():
+                            log_msg(f"🛑 Cancelled while waiting for spread (split {split_num}/{split_count})")
+                            results["cancelled"] = True
+                            results["error"] = "Cancelled by user"
+                            if results["splits_completed"] > 0:
+                                results["success"] = True
+                            return results
+                        
                         is_ok, spread_pct, long_price, short_price = await check_spread()
                         
                         if is_ok:
@@ -791,6 +817,7 @@ class FundingHunterGUI:
         self.waiting_for_price_spread = False
         self.price_spread_check_task = None
         self.price_spread_params = None  # Store params: pair, long_ex, short_ex, size, leverage
+        self.split_cancel_event: Optional[threading.Event] = None  # For cancelling splits mid-execution (thread-safe)
         
         # UI update tasks (to prevent spam and manage recurring updates)
         self._pair_info_update_task = None
@@ -1652,11 +1679,17 @@ class FundingHunterGUI:
         self._check_price_spread_and_open()
     
     def _cancel_price_spread_wait(self):
-        """Cancel waiting for price spread"""
+        """Cancel waiting for price spread and/or running splits"""
         self.waiting_for_price_spread = False
         if self.price_spread_check_task:
             self.root.after_cancel(self.price_spread_check_task)
             self.price_spread_check_task = None
+        
+        # Signal cancellation to running splits
+        if self.split_cancel_event:
+            self.split_cancel_event.set()
+            self._log("🛑 Cancel signal sent to running splits...")
+        
         self.price_spread_params = None
         self.open_btn.configure(text="Open Position", state=tk.NORMAL)
         self._log("🛑 Cancelled waiting for price spread")
@@ -1735,6 +1768,9 @@ class FundingHunterGUI:
                 safe_log(f"✅ Price spread >= {params['price_spread_min']}%, and price position is good!")
                 safe_log(f"🚀 Opening: {params['pair']} | Long {params['long_ex_name']} | Short {params['short_ex_name']} | Size: {params['size']} | Splits: {split_count}")
                 
+                # Create cancel event for this split session (use threading.Event for thread-safety)
+                self.split_cancel_event = threading.Event()
+                
                 # Callback to start monitoring after first split
                 def on_first_split(size_opened):
                     self.root.after(0, lambda: self._on_first_split_complete(params, size_opened))
@@ -1752,8 +1788,12 @@ class FundingHunterGUI:
                     max_wait_per_split=3600.0,
                     log_callback=safe_log,
                     on_first_split_complete=on_first_split,
-                    skip_leverage_set=params.get("skip_leverage", False)
+                    skip_leverage_set=params.get("skip_leverage", False),
+                    cancel_event=self.split_cancel_event
                 )
+                
+                # Clear cancel event after done
+                self.split_cancel_event = None
                 
                 return result
                 
