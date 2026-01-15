@@ -311,7 +311,11 @@ class MultiExchangeManager:
         short_exchange: Exchange,
         splits: int = 1,
         interval_seconds: float = 2.0,
-        progress_callback = None
+        price_spread_min: float = -100.0,
+        spread_check_interval: float = 2.0,
+        max_wait_per_split: float = 3600.0,
+        progress_callback = None,
+        cancel_event: Optional[threading.Event] = None
     ) -> Dict[str, Any]:
         """Close hedged position in multiple splits
         
@@ -321,9 +325,27 @@ class MultiExchangeManager:
             short_exchange: Exchange with SHORT position
             splits: Number of splits to close
             interval_seconds: Seconds between each split
+            price_spread_min: Minimum price spread % required before closing each split
+            spread_check_interval: Seconds between spread checks when waiting
+            max_wait_per_split: Maximum seconds to wait for spread per split
             progress_callback: Callback function(split_num, total_splits, message)
+            cancel_event: Optional threading.Event to signal cancellation
         """
-        results = {"success": False, "error": None, "closed_splits": 0}
+        def log_msg(msg: str):
+            logger.info(msg)
+            if progress_callback:
+                progress_callback(0, 0, msg)
+        
+        def is_cancelled() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+            
+        results = {
+            "success": False, 
+            "error": None, 
+            "closed_splits": 0,
+            "splits_total": splits,
+            "cancelled": False
+        }
         
         long_client = self.clients.get(long_exchange)
         short_client = self.clients.get(short_exchange)
@@ -335,8 +357,42 @@ class MultiExchangeManager:
         long_symbol = get_exchange_symbol(pair, long_exchange)
         short_symbol = get_exchange_symbol(pair, short_exchange)
         
+        async def check_spread_for_close() -> tuple[bool, float, float, float]:
+            """Check if current spread meets threshold for CLOSING.
+            
+            Logic: 
+            - We SELL the LONG position -> fills at BID
+            - We BUY the SHORT position -> fills at ASK
+            - Spread = (LONG_BID - SHORT_ASK) / avg * 100
+            """
+            try:
+                long_book, short_book = await asyncio.wait_for(
+                    asyncio.gather(
+                        long_client.get_order_book(long_symbol, limit=10),
+                        short_client.get_order_book(short_symbol, limit=10)
+                    ),
+                    timeout=10.0
+                )
+                
+                if not long_book.get("bids") or len(long_book["bids"]) == 0:
+                    return (False, 0.0, 0.0, 0.0)
+                long_bid_price = long_book["bids"][0][0]
+                
+                if not short_book.get("asks") or len(short_book["asks"]) == 0:
+                    return (False, 0.0, 0.0, 0.0)
+                short_ask_price = short_book["asks"][0][0]
+                
+                price_diff = long_bid_price - short_ask_price
+                avg_price = (long_bid_price + short_ask_price) / 2
+                spread_pct = (price_diff / avg_price) * 100
+                
+                return (spread_pct >= price_spread_min, spread_pct, long_bid_price, short_ask_price)
+                
+            except Exception as e:
+                logger.error(f"Error checking spread for close: {e}")
+                return (False, 0.0, 0.0, 0.0)
+        
         try:
-            # Get current positions
             long_pos = await long_client.get_position(long_symbol)
             short_pos = await short_client.get_position(short_symbol)
             
@@ -344,58 +400,88 @@ class MultiExchangeManager:
                 results["error"] = "No positions found to close"
                 return results
             
-            # Calculate size per split
             long_total = long_pos.size if long_pos else 0
             short_total = short_pos.size if short_pos else 0
             
             long_per_split = long_total / splits if long_total > 0 else 0
             short_per_split = short_total / splits if short_total > 0 else 0
             
-            # Close in splits
             for i in range(splits):
                 split_num = i + 1
                 is_last = (split_num == splits)
+                
+                if is_cancelled():
+                    log_msg(f"🛑 Cancelled before split {split_num}/{splits}")
+                    results["cancelled"] = True
+                    if results["closed_splits"] > 0:
+                        results["success"] = True
+                    return results
+                
+                # Check spread if threshold set
+                if price_spread_min > -99.0:
+                    log_msg(f"⏳ Split {split_num}: Waiting for spread >= {price_spread_min}%...")
+                    wait_start = asyncio.get_event_loop().time()
+                    
+                    while True:
+                        if is_cancelled():
+                            log_msg("🛑 Cancelled waiting for spread")
+                            results["cancelled"] = True
+                            if results["closed_splits"] > 0:
+                                results["success"] = True
+                            return results
+                            
+                        is_ok, spread_pct, long_bid, short_ask = await check_spread_for_close()
+                        
+                        if is_ok:
+                            log_msg(f"✅ Split {split_num}: Spread {spread_pct:.4f}% >= {price_spread_min}% - Closing...")
+                            break
+                        
+                        elapsed = asyncio.get_event_loop().time() - wait_start
+                        if max_wait_per_split > 0 and elapsed >= max_wait_per_split:
+                            log_msg(f"⚠️ Timeout waiting for spread. Proceeding to close.")
+                            break
+                        
+                        log_msg(f"📊 Close Spread: {spread_pct:.4f}% < {price_spread_min}% | L_BID: ${long_bid:,.4f} | S_ASK: ${short_ask:,.4f}")
+                        await asyncio.sleep(spread_check_interval)
                 
                 if progress_callback:
                     progress_callback(split_num, splits, f"Closing split {split_num}/{splits}...")
                 
                 close_tasks = []
                 
-                # For last split, close remaining position entirely
                 if is_last:
-                    # Re-check positions for final close
                     if long_pos:
-                        current_long = await long_client.get_position(long_symbol)
-                        if current_long:
-                            close_tasks.append(long_client.close_position(long_symbol))
+                        try:
+                            current_long = await long_client.get_position(long_symbol)
+                            if current_long and current_long.size > 0:
+                                close_tasks.append(long_client.close_position(long_symbol))
+                        except: pass
                     if short_pos:
-                        current_short = await short_client.get_position(short_symbol)
-                        if current_short:
-                            close_tasks.append(short_client.close_position(short_symbol))
+                        try:
+                            current_short = await short_client.get_position(short_symbol)
+                            if current_short and current_short.size > 0:
+                                close_tasks.append(short_client.close_position(short_symbol))
+                        except: pass
                 else:
-                    # Close partial amount
                     if long_per_split > 0:
-                        close_tasks.append(
-                            long_client.close_position_partial(long_symbol, long_per_split)
-                        )
+                        close_tasks.append(long_client.close_position_partial(long_symbol, long_per_split))
                     if short_per_split > 0:
-                        close_tasks.append(
-                            short_client.close_position_partial(short_symbol, short_per_split)
-                        )
+                        close_tasks.append(short_client.close_position_partial(short_symbol, short_per_split))
                 
                 if close_tasks:
                     await asyncio.gather(*close_tasks)
                 
                 results["closed_splits"] = split_num
                 
-                # Wait before next split (except for last one)
-                if not is_last:
+                if not is_last and interval_seconds > 0:
+                    log_msg(f"⏳ Waiting {interval_seconds}s before next split...")
                     await asyncio.sleep(interval_seconds)
             
             results["success"] = True
             
         except Exception as e:
             results["error"] = str(e)
+            logger.error(f"Error closing position: {e}")
         
         return results
     
@@ -1194,15 +1280,15 @@ class FundingHunterGUI:
         option_frame = ttk.Frame(frame)
         option_frame.pack(fill=tk.X, pady=5)
         
-        self.auto_close_var = tk.BooleanVar(value=True)
+        self.auto_close_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(option_frame, text="Auto-close other side on liquidation", 
                        variable=self.auto_close_var).pack(anchor=tk.W)
         
-        self.auto_close_reversal_var = tk.BooleanVar(value=True)
+        self.auto_close_reversal_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(option_frame, text="Auto-close on funding reversal", 
                        variable=self.auto_close_reversal_var).pack(anchor=tk.W, pady=2)
         
-        self.skip_leverage_var = tk.BooleanVar(value=False)
+        self.skip_leverage_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(option_frame, text="Skip leverage set (faster entry)", 
                        variable=self.skip_leverage_var).pack(anchor=tk.W)
         
@@ -2055,33 +2141,46 @@ class FundingHunterGUI:
         self.root.after(0, update_ui)
     
     def _close_position(self):
-        """Close position in splits"""
+        """Close position in splits with spread check"""
         if not self.active_position:
             messagebox.showinfo("Info", "No active position")
             return
         
-        # Get split count from UI (same as open position)
+        # If already waiting, this is a CANCEL action
+        if getattr(self, 'waiting_for_close', False):
+            self._cancel_close_process()
+            return
+
         try:
             splits = int(self.split_count_var.get())
-            if splits < 1:
-                splits = 1
+            if splits < 1: splits = 1
+            
+            # Use same threshold input as open position
+            price_spread_min = float(self.price_spread_threshold.get())
         except:
             splits = 1
+            price_spread_min = -100.0  # Default to ignore
         
-        confirm_msg = f"Close the hedged position in {splits} split(s)?\n(2 seconds between each split)"
+        confirm_msg = f"Close position in {splits} split(s)?\nSpread threshold: {price_spread_min}%\n(Check every 2s)"
         if not messagebox.askyesno("Confirm", confirm_msg):
             return
         
         pos = self.active_position
         self._log(f"📤 Closing position for {pos['pair']} in {splits} split(s)...")
         
-        # Disable close button during operation
-        self.close_btn.config(state=tk.DISABLED)
+        # STOP ALL BACKGROUND TASKS
+        self._stop_all_background_tasks()
+        
+        # Update UI state
+        self.waiting_for_close = True
+        self.close_btn.configure(text="🛑 Cancel Close", state=tk.NORMAL)
+        self.open_btn.configure(state=tk.DISABLED) # Disable open while closing
+        
+        # Create cancel event
+        self.split_cancel_event = threading.Event()
         
         def progress_callback(split_num, total_splits, message):
-            def update():
-                self._log(f"   🔄 {message}")
-            self.root.after(0, update)
+            self.root.after(0, lambda: self._log(f"   {message}"))
         
         async def async_close():
             return await self.manager.close_hedged_position_split(
@@ -2090,12 +2189,25 @@ class FundingHunterGUI:
                 pos['short_exchange'],
                 splits=splits,
                 interval_seconds=2.0,
-                progress_callback=progress_callback
+                price_spread_min=price_spread_min,
+                spread_check_interval=2.0,
+                progress_callback=progress_callback,
+                cancel_event=self.split_cancel_event
             )
         
         future = self._run_async(async_close())
         if future:
             future.add_done_callback(self._on_close_complete)
+            
+    def _cancel_close_process(self):
+        """Cancel the closing process"""
+        if self.split_cancel_event:
+            self.split_cancel_event.set()
+            self._log("🛑 Sending cancel signal to close process...")
+        
+        self.waiting_for_close = False
+        self.close_btn.configure(text="🛑 Close Position", state=tk.NORMAL) # Will be effectively reset in _on_close_complete
+
     
     def _load_existing_positions(self):
         """Load existing positions from exchanges and allow monitoring/closing them"""
@@ -2321,8 +2433,17 @@ class FundingHunterGUI:
     def _on_close_complete(self, future):
         """Handle close complete"""
         def update_ui():
+            self.waiting_for_close = False
+            self.close_btn.configure(text="🛑 Close Position", state=tk.NORMAL)
+            self.open_btn.configure(state=tk.NORMAL)
+            
             try:
                 result = future.result()
+                
+                if result.get("cancelled"):
+                    self._log("🛑 Close process cancelled")
+                    return
+                
                 if result["success"]:
                     self._log("✅ Position closed!")
                     self._stop_monitoring()
@@ -2330,10 +2451,12 @@ class FundingHunterGUI:
                     self._clear_position_display()
                     
                     # If auto trading is enabled, it will resume scanning
-                    if self.auto_trading_active:
+                    if getattr(self, 'auto_trading_active', False):
                         self._log(f"🤖 Auto Trading: Resuming signal scanning...")
                 else:
-                    self._log(f"❌ Close failed: {result['error']}")
+                    self._log(f"❌ Close failed: {result.get('error', 'Unknown error')}")
+                    # If partially closed, we should keep the position active but maybe update size?
+                    # For now just leave as is, user can check or retry
             except Exception as e:
                 self._log(f"Error: {e}")
         
