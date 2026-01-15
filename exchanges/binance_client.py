@@ -19,13 +19,208 @@ from .base import BaseExchangeClient, Position, Order, FundingRate, Balance
 class BinanceClient(BaseExchangeClient):
     """Binance Futures API Client"""
     
+    
     def __init__(self, config: BinanceConfig, debug: bool = False):
         super().__init__(config.api_key, config.secret_key)
         self.config = config
         self.base_url = config.base_url
         self._session: Optional[aiohttp.ClientSession] = None
         self.debug = debug
+        
+        # WebSocket state
+        from .websocket_manager import WebSocketManager
+        self.ws_manager = WebSocketManager(config.ws_url)
+        self.ws_manager.add_callback(self._handle_ws_message)
+        self._listen_key = None
+        self._listen_key_timer = None
+        
+        # Caches
+        self._ticker_cache: Dict[str, Dict] = {}  # symbol -> {bid, ask, time}
+        self._position_cache: Dict[str, Position] = {} # symbol -> Position
+        self._order_cache: Dict[str, Order] = {} # order_id -> Order
+        
+    async def connect(self) -> bool:
+        """Connect to Binance API and WS"""
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        
+        try:
+            balance = await self.get_balance()
+            
+            # Start User Stream (ListenKey)
+            await self.start_user_stream()
+            
+            return balance is not None
+        except Exception as e:
+            print(f"Binance connection error: {e}")
+            if self._session:
+                await self._session.close()
+                self._session = None
+            return False
+            
+    async def disconnect(self):
+        """Disconnect from Binance API"""
+        if self._listen_key_timer:
+            self._listen_key_timer.cancel()
+            
+        await self.ws_manager.disconnect()
+        
+        if self._session:
+            await self._session.close()
+            import asyncio
+            await asyncio.sleep(0.25)
+            self._session = None
+            
+    async def start_user_stream(self):
+        """Start User Data Stream"""
+        try:
+            # Get Listen Key
+            res = await self._request("POST", "/fapi/v1/listenKey", signed=True)
+            self._listen_key = res["listenKey"]
+            logger.info(f"Binance ListenKey: {self._listen_key}")
+            
+            # Update WS URL with ListenKey (Binance User Stream specific)
+            # Binance separates Base WS URL and User Stream, but typically we can append
+            # For this simple implementation, we might need a separate WS connection 
+            # or just one if we can multiplex. 
+            # Binance Futures typically: wss://fstream.binance.com/ws/<listenKey> for User
+            # And wss://fstream.binance.com/ws/bnbusdt@bookTicker for Market
+            # They CAN be combined: wss://fstream.binance.com/stream?streams=<listenKey>/bnbusdt@bookTicker
+            
+            # Re-init WS Manager with multiplex URL structure
+            base_ws = self.config.ws_url + "/stream?streams=" + self._listen_key
+            self.ws_manager.url = base_ws
+            
+            await self.ws_manager.connect()
+            
+            # Schedule Keepalive (every 30 mins)
+            self._schedule_listen_key_keepalive()
+            
+        except Exception as e:
+            logger.error(f"Failed to start user stream: {e}")
+
+    def _schedule_listen_key_keepalive(self):
+        async def keepalive():
+            while True:
+                await asyncio.sleep(1800)  # 30 mins
+                try:
+                    await self._request("PUT", "/fapi/v1/listenKey", signed=True)
+                    logger.debug("Binance ListenKey refreshed")
+                except Exception as e:
+                    logger.error(f"Binance ListenKey refresh failed: {e}")
+                    
+        self._listen_key_timer = asyncio.create_task(keepalive())
+
+    async def subscribe_book_ticker(self, symbol: str):
+        """Subscribe to best bid/ask for symbol via WS"""
+        binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
+        # Stream name needs to be lowercase for Binance
+        stream_name = f"{binance_symbol.lower()}@bookTicker"
+        
+        payload = {
+            "method": "SUBSCRIBE",
+            "params": [stream_name],
+            "id": int(time.time())
+        }
+        await self.ws_manager.subscribe(payload)
+        logger.info(f"Subscribed to {stream_name}")
+
+    def _handle_ws_message(self, msg: Dict):
+        """Process incoming WS messages"""
+        # Determine message type
+        stream = msg.get("stream", "")
+        data = msg.get("data", msg)
+        
+        # 1. Book Ticker (Spread updates)
+        if "@bookTicker" in stream:
+            # {"u":400900217,"s":"BNBUSDT","b":"25.35190","B":"31.21","a":"25.36520","A":"40.66"...}
+            symbol = data.get("s")
+            try:
+                self._ticker_cache[symbol] = {
+                    "bid": float(data.get("b", 0)),
+                    "bid_qty": float(data.get("B", 0)),
+                    "ask": float(data.get("a", 0)),
+                    "ask_qty": float(data.get("A", 0)),
+                    "time": time.time()
+                }
+            except Exception as e:
+                logger.error(f"Error parsing bookTicker: {e}")
+                 
+        # 2. User Data Update (ORDER_TRADE_UPDATE, ACCOUNT_UPDATE)
+        event_type = data.get("e")
+        
+        if event_type == "ACCOUNT_UPDATE":
+            # Position updates
+            update_data = data.get("a", {})
+            positions = update_data.get("P", [])
+            for p in positions:
+                symbol = p.get("s")
+                amt = float(p.get("pa", 0))
+                entry = float(p.get("ep", 0))
+                upnl = float(p.get("up", 0))
+                
+                # Check if we have this position in cache or create new
+                if amt == 0:
+                    if symbol in self._position_cache:
+                        del self._position_cache[symbol]
+                else:
+                    side = Side.LONG if amt > 0 else Side.SHORT
+                    
+                    # Update cache
+                    self._position_cache[symbol] = Position(
+                        symbol=symbol,
+                        side=side,
+                        size=abs(amt),
+                        entry_price=entry,
+                        mark_price=0, 
+                        liquidation_price=0, 
+                        unrealized_pnl=upnl,
+                        leverage=1,
+                        status=PositionStatus.OPEN,
+                        timestamp=datetime.now(timezone.utc),
+                        raw_data=p
+                    )
+
+        elif event_type == "ORDER_TRADE_UPDATE":
+            # Order status update
+            o = data.get("o", {})
+            symbol = o.get("s")
+            status = o.get("X") # NEW, FILLED, CANCELED
+            order_id = str(o.get("i"))
+            
+            logger.info(f"WS: Order {order_id} ({symbol}) update: {status}")
+
+    async def get_mark_price(self, symbol: str) -> float:
+        """Get current mark price"""
+        binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
+        
+        result = await self._request("GET", "/fapi/v1/premiumIndex", {"symbol": binance_symbol}, signed=False)
+        
+        return float(result.get("markPrice", 0))
     
+    async def get_order_book(self, symbol: str, limit: int = 20) -> Dict[str, Any]:
+        """Get order book (depth)"""
+        binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
+        
+        # 1. OPTIMIZATION: Check Ticker Cache for Best Bid/Ask
+        # If we have recent data from WS, return it as a 1-depth orderbook
+        # This is sufficient for spread checking which only looks at bids[0] and asks[0]
+        if binance_symbol in self._ticker_cache:
+            ticker = self._ticker_cache[binance_symbol]
+            # Check if cache is fresh (e.g. < 5s)
+            if time.time() - ticker.get("time", 0) < 5.0:
+                 return {
+                     "bids": [[ticker["bid"], ticker["bid_qty"]]],
+                     "asks": [[ticker["ask"], ticker["ask_qty"]]]
+                 }
+        
+        # 2. Fallback to REST
+        result = await self._request("GET", "/fapi/v1/depth", {"symbol": binance_symbol, "limit": limit}, signed=False)
+        return {
+            "bids": [[float(price), float(qty)] for price, qty in result["bids"]],
+            "asks": [[float(price), float(qty)] for price, qty in result["asks"]]
+        }
+
     def _get_timestamp(self) -> int:
         """Get current timestamp in milliseconds"""
         return int(time.time() * 1000)
@@ -47,30 +242,7 @@ class BinanceClient(BaseExchangeClient):
             "Content-Type": "application/json"
         }
     
-    async def connect(self) -> bool:
-        """Connect to Binance API"""
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-        
-        try:
-            balance = await self.get_balance()
-            return balance is not None
-        except Exception as e:
-            print(f"Binance connection error: {e}")
-            # Close session on failed connection to prevent leak
-            if self._session:
-                await self._session.close()
-                self._session = None
-            return False
-    
-    async def disconnect(self):
-        """Disconnect from Binance API"""
-        if self._session:
-            await self._session.close()
-            # Give time for the underlying connections to close
-            import asyncio
-            await asyncio.sleep(0.25)
-            self._session = None
+
     
     async def _request(
         self,
@@ -154,9 +326,16 @@ class BinanceClient(BaseExchangeClient):
         return Balance(currency=currency, total=0, available=0, frozen=0)
     
     async def get_position(self, symbol: str) -> Optional[Position]:
-        """Get position for symbol"""
+        """Get position for symbol (Check CACHE then REST)"""
         binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
         
+        # 1. Check Cache
+        if self.ws_manager.is_connected and binance_symbol in self._position_cache:
+            # We can optionally check if cache is stale here, e.g. > 10s
+            # For now, rely on WS push
+            return self._position_cache[binance_symbol]
+
+        # 2. Fallback to REST
         result = await self._request("GET", "/fapi/v2/positionRisk", {"symbol": binance_symbol})
         
         for pos_data in result:

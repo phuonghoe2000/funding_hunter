@@ -22,13 +22,26 @@ logger = logging.getLogger(__name__)
 class BingXClient(BaseExchangeClient):
     """BingX Futures API Client"""
     
+    
     def __init__(self, config: 'BingXConfig', debug: bool = False):
         super().__init__(config.api_key, config.secret_key)
         self.config = config
         self.base_url = config.base_url
         self._session: Optional[aiohttp.ClientSession] = None
         self.debug = debug
-    
+        
+        # WebSocket state
+        from .websocket_manager import WebSocketManager
+        self.ws_manager = WebSocketManager(config.ws_url)
+        self.ws_manager.add_callback(self._handle_ws_message)
+        self._listen_key = None
+        self._listen_key_timer = None
+        
+        # Caches
+        self._ticker_cache: Dict[str, Dict] = {}
+        self._position_cache: Dict[str, Position] = {}
+        self._order_cache: Dict[str, Order] = {}
+        
     def _get_timestamp(self) -> int:
         """Get current timestamp in milliseconds"""
         return int(time.time() * 1000)
@@ -65,23 +78,177 @@ class BingXClient(BaseExchangeClient):
         
         try:
             balance = await self.get_balance()
+            
+            # Start User Stream (ListenKey)
+            await self.start_user_stream()
+            
             return balance is not None
         except Exception as e:
             print(f"BingX connection error: {e}")
-            # Close session on failed connection to prevent leak
             if self._session:
                 await self._session.close()
                 self._session = None
             return False
-    
+            
     async def disconnect(self):
         """Disconnect from BingX API"""
+        if self._listen_key_timer:
+            self._listen_key_timer.cancel()
+            
+        await self.ws_manager.disconnect()
+        
         if self._session:
             await self._session.close()
             # Give time for the underlying connections to close
             import asyncio
             await asyncio.sleep(0.25)
             self._session = None
+            
+    async def start_user_stream(self):
+        """Start User Data Stream"""
+        try:
+            # Get Listen Key
+            res = await self._request("POST", "/openApi/swap/v2/user/listenKey")
+            if res.get("code") == 0:
+                self._listen_key = res["data"]["listenKey"]
+                logger.info(f"BingX ListenKey: {self._listen_key}")
+                
+                # BingX User Stream: append listenKey to URL
+                self.ws_manager.url = f"{self.config.ws_url}?listenKey={self._listen_key}"
+                
+                await self.ws_manager.connect()
+                
+                # Start Heartbeat & Keepalive
+                self._schedule_listen_key_keepalive()
+                self._start_heartbeat_loop()
+            else:
+                logger.error(f"BingX ListenKey failed: {res}")
+                
+        except Exception as e:
+            logger.error(f"Failed to start user stream: {e}")
+
+    def _schedule_listen_key_keepalive(self):
+        # BingX ListenKey valid for 60 mins, refresh every 30 mins
+        async def keepalive():
+            while True:
+                await asyncio.sleep(1800)
+                try:
+                    await self._request("PUT", "/openApi/swap/v2/user/listenKey", {"listenKey": self._listen_key})
+                    logger.debug("BingX ListenKey refreshed")
+                except Exception as e:
+                    logger.error(f"BingX ListenKey refresh failed: {e}")
+        self._listen_key_timer = asyncio.create_task(keepalive())
+
+    def _start_heartbeat_loop(self):
+        # BingX requires Ping "{"ping": <timestamp>}" every 30s
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    ts = int(time.time() * 1000)
+                    await self.ws_manager.send_json({"ping": ts})
+                except Exception as e:
+                    pass # Ignore send errors, manager handles reconnect
+        
+        asyncio.create_task(heartbeat())
+
+    async def subscribe_depth(self, symbol: str):
+        """Subscribe to depth for symbol"""
+        bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
+        # BingX depth topic: "push.depth"
+        # Payload: {"id": "...", "reqType": "sub", "dataType": f"{symbol}@depth10"}
+        
+        payload = {
+            "id": str(int(time.time() * 1000)),
+            "reqType": "sub",
+            "dataType": f"{bingx_symbol}@depth5" # depth5 is enough for top of book
+        }
+        await self.ws_manager.subscribe(payload)
+        logger.info(f"Subscribed to {bingx_symbol}@depth5")
+
+    def _handle_ws_message(self, msg: Dict):
+        """Process incoming WS messages"""
+        # 1. Heartbeat Pong (ignore)
+        if "pong" in msg:
+            return
+            
+        # 2. Ping (Respond with Pong? Docs say server pushes Pong, maybe we need to pong back if server pings?)
+        if "ping" in msg:
+            asyncio.create_task(self.ws_manager.send_json({"pong": msg["ping"]}))
+            return
+
+        # 3. Data Format: {"code": 0, "dataType": "...", "data": ...}
+        if msg.get("code") != 0:
+            return
+            
+        data_type = msg.get("dataType", "")
+        data = msg.get("data")
+        
+        if not data:
+            return
+
+        # Market Data (Depth)
+        if "@depth" in data_type:
+            # {"asks": [["price", "qty"]...], "bids": [...]}
+            # DataType format: "BTC-USDT@depth5"
+            symbol = data_type.split("@")[0]
+            
+            # Simple conversion to float
+            bids = [[float(p), float(q)] for p, q in data.get("bids", [])]
+            asks = [[float(p), float(q)] for p, q in data.get("asks", [])]
+            
+            if bids and asks:
+                self._ticker_cache[symbol] = {
+                    "bid": bids[0][0],
+                    "bid_qty": bids[0][1],
+                    "ask": asks[0][0],
+                    "ask_qty": asks[0][1],
+                    "time": time.time(),
+                    "full_depth": {"bids": bids, "asks": asks} # Store full depth to use in get_order_book
+                }
+
+        # User Data (Order/Position)
+        # Channel names usually: "listenKey" related events
+        # BingX User Stream event types: "ORDER", "ACCOUNT_UPDATE" (check specific structure)
+        # Structure: {"e": "ORDER", "E": 123456, "o": {...}}
+        event_type = data.get("e")
+        
+        if event_type == "ACCOUNT_UPDATE":
+             # Position Update
+             # "a": {"B": [...], "P": [...]}
+             update_data = data.get("a", {})
+             for p in update_data.get("P", []):
+                 symbol = p.get("s")
+                 amt = float(p.get("pa", 0))
+                 entry = float(p.get("ep", 0))
+                 upnl = float(p.get("up", 0))
+                 
+                 side = Side.LONG if amt > 0 else Side.SHORT
+                 if amt == 0:
+                     if symbol in self._position_cache:
+                         del self._position_cache[symbol]
+                 else:
+                     self._position_cache[symbol] = Position(
+                        symbol=symbol,
+                        side=side,
+                        size=abs(amt),
+                        entry_price=entry,
+                        mark_price=0,
+                        liquidation_price=0,
+                        unrealized_pnl=upnl,
+                        leverage=1,
+                        status=PositionStatus.OPEN,
+                        timestamp=datetime.now(timezone.utc),
+                        raw_data=p
+                     )
+                     logger.info(f"BingX WS Pos: {symbol} {amt}")
+
+        elif event_type == "ORDER":
+             # Order Update
+             o = data.get("o", {})
+             oid = str(o.get("i"))
+             status = o.get("X")
+             logger.info(f"BingX WS Order {oid}: {status}")
     
     async def _request(
         self,
@@ -181,10 +348,14 @@ class BingXClient(BaseExchangeClient):
         return Balance(currency=currency, total=0, available=0, frozen=0)
     
     async def get_position(self, symbol: str) -> Optional[Position]:
-        """Get position for symbol"""
-        # Convert to BingX symbol format if needed
+        """Get position for symbol (Check CACHE then REST)"""
         bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
         
+        # 1. Check Cache
+        if self.ws_manager.is_connected and bingx_symbol in self._position_cache:
+            return self._position_cache[bingx_symbol]
+
+        # 2. Fallback to REST
         result = await self._request("GET", "/openApi/swap/v2/user/positions", {"symbol": bingx_symbol})
         
         if result.get("code") == 0 and result.get("data"):
@@ -195,14 +366,12 @@ class BingXClient(BaseExchangeClient):
                     if pos_amt == 0:
                         continue
                     
-                    # BingX returns positionSide: "LONG" or "SHORT" in hedge mode
                     pos_side = pos_data.get("positionSide", "")
                     if pos_side == "LONG":
                         side = Side.LONG
                     elif pos_side == "SHORT":
                         side = Side.SHORT
                     else:
-                        # Fallback: use positionAmt sign (for one-way mode)
                         side = Side.LONG if pos_amt > 0 else Side.SHORT
                     
                     return Position(
@@ -502,27 +671,31 @@ class BingXClient(BaseExchangeClient):
         raise Exception(f"No mark price data for {bingx_symbol}")
     
     async def get_order_book(self, symbol: str, limit: int = 20) -> Dict[str, Any]:
-        """Get order book (depth)
-        
-        Returns:
-            Dict with 'bids' and 'asks' - each is list of [price, quantity]
-        """
+        """Get order book (depth)"""
         bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
         
+        # 1. OPTIMIZATION: Check Ticker Cache
+        if bingx_symbol in self._ticker_cache:
+            ticker = self._ticker_cache[bingx_symbol]
+            if time.time() - ticker.get("time", 0) < 5.0 and "full_depth" in ticker:
+                # Return the cached full depth
+                # Just take needed limit
+                full = ticker["full_depth"]
+                return {
+                    "bids": full["bids"][:limit],
+                    "asks": full["asks"][:limit]
+                }
+        
+        # 2. Fallback to REST
         result = await self._request("GET", "/openApi/swap/v2/quote/depth",
                                      {"symbol": bingx_symbol, "limit": limit}, signed=False)
-        
-        # Debug log raw response
-        logger.debug(f"BingX order book raw response for {bingx_symbol}: {result}")
         
         if result.get("code") == 0 and result.get("data"):
             data = result["data"]
             
-            # Parse bids and asks - BingX format is {"p": price, "v": volume}
             bids = []
             asks = []
             
-            # Check if bids/asks exist and parse them
             if "bids" in data:
                 for b in data["bids"]:
                     if isinstance(b, dict):
@@ -537,15 +710,8 @@ class BingXClient(BaseExchangeClient):
                     elif isinstance(a, list) and len(a) >= 2:
                         asks.append([float(a[0]), float(a[1])])
             
-            logger.debug(f"BingX parsed - Bids: {len(bids)}, Asks: {len(asks)}")
-            if bids:
-                logger.debug(f"BingX top bid: {bids[0]}")
-            if asks:
-                logger.debug(f"BingX top ask: {asks[0]}")
-            
             return {"bids": bids, "asks": asks}
         
-        logger.warning(f"BingX order book failed: {result}")
         return {"bids": [], "asks": []}
     
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:

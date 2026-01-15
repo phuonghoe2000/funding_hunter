@@ -78,6 +78,27 @@ class MultiExchangeManager:
             except Exception as e:
                 logger.error(f"Error getting funding rate from {exchange.value}: {e}")
         return rates
+        
+    async def subscribe_market_data(self, pair: str, *exchanges: Exchange):
+        """Subscribe to market data for the pair on specified exchanges"""
+        for exchange in exchanges:
+            client = self.clients.get(exchange)
+            if not client: continue
+            
+            try:
+                # Determine correct subscription method based on client features
+                symbol = get_exchange_symbol(pair, exchange)
+                
+                # Binance supports bookTicker (best bid/ask)
+                if hasattr(client, 'subscribe_book_ticker'):
+                    await client.subscribe_book_ticker(symbol)
+                # BingX supports depth (we implement depth5 for top of book)
+                elif hasattr(client, 'subscribe_depth'):
+                    await client.subscribe_depth(symbol)
+                # OKX or others might be different (skipped for now)
+                
+            except Exception as e:
+                logger.error(f"Failed to subscribe to {pair} on {exchange.value}: {e}")
     
     async def open_hedged_position(
         self,
@@ -1761,6 +1782,9 @@ class FundingHunterGUI:
         self._log(f"⏳ Waiting for price spread >= {price_spread_min}% on {pair}...")
         self._log(f"   Checking every 2 seconds. Click 'Cancel' to stop.")
         
+        # Subscribe to WS Market Data for this pair on both exchanges
+        self._run_async(self.manager.subscribe_market_data(pair, long_ex, short_ex))
+        
         # Start price spread monitoring loop
         self._check_price_spread_and_open()
     
@@ -2181,6 +2205,9 @@ class FundingHunterGUI:
         
         def progress_callback(split_num, total_splits, message):
             self.root.after(0, lambda: self._log(f"   {message}"))
+        
+        # Subscribe to WS Market Data for this pair on both exchanges
+        self._run_async(self.manager.subscribe_market_data(pos['pair'], pos['long_exchange'], pos['short_exchange']))
         
         async def async_close():
             return await self.manager.close_hedged_position_split(
