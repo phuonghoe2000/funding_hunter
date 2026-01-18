@@ -6,6 +6,7 @@ import hashlib
 import time
 import json
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode
@@ -14,6 +15,8 @@ import aiohttp
 from config.settings import BinanceConfig
 from config.constants import Side, OrderType, PositionStatus, Exchange, get_exchange_symbol
 from .base import BaseExchangeClient, Position, Order, FundingRate, Balance
+
+logger = logging.getLogger(__name__)
 
 
 class BinanceClient(BaseExchangeClient):
@@ -330,7 +333,7 @@ class BinanceClient(BaseExchangeClient):
         binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
         
         # 1. Check Cache
-        if self.ws_manager.is_connected and binance_symbol in self._position_cache:
+        if self.ws_manager.connected and binance_symbol in self._position_cache:
             # We can optionally check if cache is stale here, e.g. > 10s
             # For now, rely on WS push
             return self._position_cache[binance_symbol]
@@ -616,28 +619,6 @@ class BinanceClient(BaseExchangeClient):
                 ))
         
         return funding_rates
-    
-    async def get_mark_price(self, symbol: str) -> float:
-        """Get current mark price"""
-        binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
-        
-        result = await self._request("GET", "/fapi/v1/premiumIndex", {"symbol": binance_symbol}, signed=False)
-        
-        return float(result.get("markPrice", 0))
-    
-    async def get_order_book(self, symbol: str, limit: int = 20) -> Dict[str, Any]:
-        """Get order book (depth)
-        
-        Returns:
-            Dict with 'bids' and 'asks' - each is list of [price, quantity]
-        """
-        binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
-        
-        result = await self._request("GET", "/fapi/v1/depth", {"symbol": binance_symbol, "limit": limit}, signed=False)
-        return {
-            "bids": [[float(price), float(qty)] for price, qty in result["bids"]],
-            "asks": [[float(price), float(qty)] for price, qty in result["asks"]]
-        }
     
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
         """Get ticker data"""

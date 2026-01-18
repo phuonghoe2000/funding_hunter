@@ -516,19 +516,33 @@ class OKXClient(BaseExchangeClient):
             print(f"Error setting position mode: {e}")
             return False
     
-    async def get_income_history(self, symbol: Optional[str] = None, limit: int = 100) -> List[Dict]:
-        """Get income history (funding fees, etc.)
+    async def get_income_history(self, symbol: Optional[str] = None, limit: int = 100, income_type: str = "FUNDING_FEE") -> List[Dict]:
+        """Get income history (funding fees, realized PnL, commissions, etc.)
         
         Args:
             symbol: OKX symbol (e.g., BTC-USDT-SWAP), optional
             limit: Maximum number of records to return
+            income_type: Type of income - "FUNDING_FEE", "REALIZED_PNL", or "COMMISSION"
             
         Returns:
             List of income records with keys: symbol, income, time, type
+            
+        OKX bill types:
+            1 = Fee (trading commission)
+            2 = Trade (realized PnL from closing positions)
+            8 = Funding fee
         """
+        # Map income type to OKX bill type
+        bill_type_map = {
+            "FUNDING_FEE": "8",
+            "REALIZED_PNL": "2",
+            "COMMISSION": "1"
+        }
+        bill_type = bill_type_map.get(income_type, "8")
+        
         params = {
             "instType": "SWAP",
-            "type": "8",  # 8 = funding fee
+            "type": bill_type,
             "limit": str(limit)
         }
         
@@ -542,11 +556,19 @@ class OKXClient(BaseExchangeClient):
             # Transform to common format
             income_list = []
             for item in result.get("data", []):
+                # For commission, use 'fee' field; for PnL use 'pnl'; for funding use 'balChg'
+                if income_type == "COMMISSION":
+                    amount = float(item.get("fee", 0))
+                elif income_type == "REALIZED_PNL":
+                    amount = float(item.get("pnl", 0))
+                else:
+                    amount = float(item.get("balChg", 0))
+                    
                 income_list.append({
                     "symbol": item.get("instId", ""),
-                    "income": float(item.get("balChg", 0)),  # Balance change (can be positive or negative)
+                    "income": amount,
                     "time": int(item.get("ts", 0)),  # Timestamp in milliseconds
-                    "type": "FUNDING_FEE"
+                    "type": income_type
                 })
             
             return income_list

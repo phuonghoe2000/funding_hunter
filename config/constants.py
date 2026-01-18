@@ -9,6 +9,7 @@ class Exchange(Enum):
     OKX = "okx"
     BINANCE = "binance"
     BINGX = "bingx"
+    GATE = "gate"
 
 
 class Side(Enum):
@@ -59,59 +60,69 @@ SYMBOL_MAP = {
     "BTC/USDT": {
         Exchange.OKX: "BTC-USDT-SWAP",
         Exchange.BINANCE: "BTCUSDT",
-        Exchange.BINGX: "BTC-USDT"
+        Exchange.BINGX: "BTC-USDT",
+        Exchange.GATE: "BTC_USDT"
     },
     "ETH/USDT": {
         Exchange.OKX: "ETH-USDT-SWAP",
         Exchange.BINANCE: "ETHUSDT",
-        Exchange.BINGX: "ETH-USDT"
+        Exchange.BINGX: "ETH-USDT",
+        Exchange.GATE: "ETH_USDT"
     },
     "SOL/USDT": {
         Exchange.OKX: "SOL-USDT-SWAP",
         Exchange.BINANCE: "SOLUSDT",
-        Exchange.BINGX: "SOL-USDT"
+        Exchange.BINGX: "SOL-USDT",
+        Exchange.GATE: "SOL_USDT"
     },
     "XRP/USDT": {
         Exchange.OKX: "XRP-USDT-SWAP",
         Exchange.BINANCE: "XRPUSDT",
-        Exchange.BINGX: "XRP-USDT"
+        Exchange.BINGX: "XRP-USDT",
+        Exchange.GATE: "XRP_USDT"
     },
     "DOGE/USDT": {
         Exchange.OKX: "DOGE-USDT-SWAP",
         Exchange.BINANCE: "DOGEUSDT",
-        Exchange.BINGX: "DOGE-USDT"
+        Exchange.BINGX: "DOGE-USDT",
+        Exchange.GATE: "DOGE_USDT"
     },
     "ADA/USDT": {
         Exchange.OKX: "ADA-USDT-SWAP",
         Exchange.BINANCE: "ADAUSDT",
-        Exchange.BINGX: "ADA-USDT"
+        Exchange.BINGX: "ADA-USDT",
+        Exchange.GATE: "ADA_USDT"
     },
     "AVAX/USDT": {
         Exchange.OKX: "AVAX-USDT-SWAP",
         Exchange.BINANCE: "AVAXUSDT",
-        Exchange.BINGX: "AVAX-USDT"
+        Exchange.BINGX: "AVAX-USDT",
+        Exchange.GATE: "AVAX_USDT"
     },
     "LINK/USDT": {
         Exchange.OKX: "LINK-USDT-SWAP",
         Exchange.BINANCE: "LINKUSDT",
-        Exchange.BINGX: "LINK-USDT"
+        Exchange.BINGX: "LINK-USDT",
+        Exchange.GATE: "LINK_USDT"
     },
     "DOT/USDT": {
         Exchange.OKX: "DOT-USDT-SWAP",
         Exchange.BINANCE: "DOTUSDT",
-        Exchange.BINGX: "DOT-USDT"
+        Exchange.BINGX: "DOT-USDT",
+        Exchange.GATE: "DOT_USDT"
     },
     "MATIC/USDT": {
         Exchange.OKX: "MATIC-USDT-SWAP",
         Exchange.BINANCE: "MATICUSDT",
-        Exchange.BINGX: "MATIC-USDT"
+        Exchange.BINGX: "MATIC-USDT",
+        Exchange.GATE: "MATIC_USDT"
     },
 }
 
 
 def get_exchange_symbol(pair: str, exchange: Exchange) -> str:
     """Get exchange-specific symbol from unified pair"""
-    if pair in SYMBOL_MAP:
+    if pair in SYMBOL_MAP and exchange in SYMBOL_MAP[pair]:
         return SYMBOL_MAP[pair][exchange]
     
     # Generate symbol if not in map
@@ -120,6 +131,8 @@ def get_exchange_symbol(pair: str, exchange: Exchange) -> str:
         return f"{base}-{quote}-SWAP"
     elif exchange == Exchange.BINGX:
         return f"{base}-{quote}"
+    elif exchange == Exchange.GATE:
+        return f"{base}_{quote}"
     else:  # Binance
         return f"{base}{quote}"
 
@@ -127,7 +140,7 @@ def get_exchange_symbol(pair: str, exchange: Exchange) -> str:
 def get_unified_pair(symbol: str, exchange: Exchange) -> str:
     """Get unified pair from exchange-specific symbol"""
     for pair, symbols in SYMBOL_MAP.items():
-        if symbols[exchange] == symbol:
+        if exchange in symbols and symbols[exchange] == symbol:
             return pair
     
     # Parse symbol if not in map
@@ -143,6 +156,12 @@ def get_unified_pair(symbol: str, exchange: Exchange) -> str:
         # Fallback: assume USDT pair
         base = symbol.replace("USDT", "").replace("-", "")
         return f"{base}/USDT"
+    elif exchange == Exchange.GATE:
+        # Gate format: BTC_USDT -> BTC/USDT
+        parts = symbol.split("_")
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+        return f"{symbol}/USDT"
     else:  # Binance
         # Binance format: BTCUSDT -> BTC/USDT
         base = symbol.replace("USDT", "")

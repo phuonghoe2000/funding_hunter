@@ -352,7 +352,7 @@ class BingXClient(BaseExchangeClient):
         bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
         
         # 1. Check Cache
-        if self.ws_manager.is_connected and bingx_symbol in self._position_cache:
+        if self.ws_manager.connected and bingx_symbol in self._position_cache:
             return self._position_cache[bingx_symbol]
 
         # 2. Fallback to REST
@@ -737,7 +737,8 @@ class BingXClient(BaseExchangeClient):
     async def set_position_mode(self, hedge_mode: bool = True) -> bool:
         """Set position mode (hedge or one-way)"""
         try:
-            await self._request("POST", "/openApi/swap/v2/trade/positionSide/dual", {
+            # Note: BingX uses v1 endpoint for position mode, not v2
+            await self._request("POST", "/openApi/swap/v1/positionSide/dual", {
                 "dualSidePosition": "true" if hedge_mode else "false"
             })
             return True
@@ -748,18 +749,31 @@ class BingXClient(BaseExchangeClient):
             print(f"Error setting position mode: {e}")
             return False
     
-    async def get_income_history(self, symbol: Optional[str] = None, limit: int = 100) -> List[Dict]:
-        """Get income history (funding fees, etc.)
+    async def get_income_history(self, symbol: Optional[str] = None, limit: int = 100, income_type: str = "FUNDING_FEE") -> List[Dict]:
+        """Get income history (funding fees, realized PnL, trading fees, etc.)
         
         Args:
             symbol: BingX symbol (e.g., BTC-USDT), optional
             limit: Maximum number of records to return
+            income_type: Type of income - "FUNDING_FEE", "REALIZED_PNL", or "COMMISSION"
             
         Returns:
             List of income records with keys: symbol, income, time, type
+            
+        BingX valid incomeTypes:
+            TRANSFER, REALIZED_PNL, FUNDING_FEE, TRADING_FEE, 
+            INSURANCE_CLEAR, TRIAL_FUND, ADL, SYSTEM_DEDUCTION, GTD_PRICE
         """
+        # Map common names to BingX API names
+        income_type_map = {
+            "COMMISSION": "TRADING_FEE",  # Map COMMISSION to BingX's TRADING_FEE
+            "FUNDING_FEE": "FUNDING_FEE",
+            "REALIZED_PNL": "REALIZED_PNL"
+        }
+        bingx_income_type = income_type_map.get(income_type, income_type)
+        
         params = {
-            "incomeType": "FUNDING_FEE",
+            "incomeType": bingx_income_type,
             "limit": str(limit)
         }
         
@@ -781,7 +795,7 @@ class BingXClient(BaseExchangeClient):
                             "symbol": item.get("symbol", ""),
                             "income": float(item.get("income", 0)),
                             "time": int(item.get("time", 0)),  # Timestamp in milliseconds
-                            "type": "FUNDING_FEE"
+                            "type": income_type
                         })
             
             return income_list

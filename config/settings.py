@@ -67,6 +67,27 @@ class BingXConfig:
 
 
 @dataclass
+class GateConfig:
+    """Gate.io API Configuration"""
+    api_key: str = ""
+    secret_key: str = ""
+    # Gate.io has testnet but we use mainnet by default
+    testnet: bool = False
+    
+    @property
+    def base_url(self) -> str:
+        if self.testnet:
+            return "https://fx-api-testnet.gateio.ws"
+        return "https://api.gateio.ws"
+    
+    @property
+    def ws_url(self) -> str:
+        if self.testnet:
+            return "wss://fx-ws-testnet.gateio.ws/v4/ws/usdt"
+        return "wss://fx-ws.gateio.ws/v4/ws/usdt"
+
+
+@dataclass
 class TradingConfig:
     """Trading parameters"""
     # Default leverage
@@ -98,6 +119,7 @@ class Settings:
         self.okx = OKXConfig()
         self.binance = BinanceConfig()
         self.bingx = BingXConfig()
+        self.gate = GateConfig()
         self.trading = TradingConfig()
     
     def load_from_env(self):
@@ -116,6 +138,10 @@ class Settings:
         # BingX
         self.bingx.api_key = os.getenv("BINGX_API_KEY", "")
         self.bingx.secret_key = os.getenv("BINGX_SECRET_KEY", "")
+        
+        # Gate.io
+        self.gate.api_key = os.getenv("GATE_API_KEY", "")
+        self.gate.secret_key = os.getenv("GATE_SECRET_KEY", "")
         
         # Trading
         self.trading.default_leverage = int(os.getenv("DEFAULT_LEVERAGE", "10"))

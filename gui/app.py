@@ -17,6 +17,7 @@ from config.constants import POPULAR_PAIRS, Side, Exchange, get_exchange_symbol
 from exchanges.okx_client import OKXClient
 from exchanges.binance_client import BinanceClient
 from exchanges.bingx_client import BingXClient
+from exchanges.gate_client import GateClient
 from exchanges.base import BaseExchangeClient, FundingRate
 
 logger = logging.getLogger(__name__)
@@ -638,7 +639,14 @@ class MultiExchangeManager:
         Returns:
             Dict with success status and details
         """
-        def log_msg(msg: str):
+        def log_msg(msg: str, force: bool = False):
+            """Log message - use force=True for important messages"""
+            logger.info(msg)
+            if log_callback and force:
+                log_callback(msg)
+        
+        def log_important(msg: str):
+            """Always log to both logger and GUI"""
             logger.info(msg)
             if log_callback:
                 log_callback(msg)
@@ -737,15 +745,20 @@ class MultiExchangeManager:
                         timeout=15.0
                     )
                 except asyncio.TimeoutError:
-                    log_msg("⚠️ Timeout setting leverage, continuing anyway...")
+                    log_important("⚠️ Timeout setting leverage, continuing anyway...")
+            
+            # Determine log frequency based on split count
+            # For many splits, only log every N splits to reduce GUI spam
+            log_every = 1 if split_count <= 10 else (5 if split_count <= 50 else 10)
             
             # Open positions in splits
             for i in range(split_count):
                 split_num = i + 1
+                should_log_this_split = (split_num == 1 or split_num == split_count or split_num % log_every == 0)
                 
                 # Check for cancellation before each split
                 if is_cancelled():
-                    log_msg(f"🛑 Cancelled before split {split_num}/{split_count}")
+                    log_important(f"🛑 Cancelled before split {split_num}/{split_count}")
                     results["cancelled"] = True
                     results["error"] = "Cancelled by user"
                     if results["splits_completed"] > 0:
@@ -758,13 +771,15 @@ class MultiExchangeManager:
                 # Check spread before each split (except first one which was already checked)
                 # Always check spread regardless of threshold being positive or negative
                 if i > 0:
-                    log_msg(f"⏳ Split {split_num}/{split_count}: Waiting for spread threshold ({price_spread_min}%)...")
+                    # Only log waiting message for first few splits or every N splits
+                    if should_log_this_split:
+                        log_important(f"⏳ Split {split_num}/{split_count}: Checking spread...")
                     wait_start = asyncio.get_event_loop().time()
                     
                     while True:
                         # Check for cancellation while waiting for spread
                         if is_cancelled():
-                            log_msg(f"🛑 Cancelled while waiting for spread (split {split_num}/{split_count})")
+                            log_important(f"🛑 Cancelled while waiting for spread (split {split_num}/{split_count})")
                             results["cancelled"] = True
                             results["error"] = "Cancelled by user"
                             if results["splits_completed"] > 0:
@@ -774,23 +789,26 @@ class MultiExchangeManager:
                         is_ok, spread_pct, long_price, short_price = await check_spread()
                         
                         if is_ok:
-                            log_msg(f"✅ Split {split_num}: Spread {spread_pct:.4f}% >= {price_spread_min}% - Opening...")
+                            # Only log spread OK for important splits
+                            log_msg(f"✅ Split {split_num}: Spread {spread_pct:.4f}% OK", force=should_log_this_split)
                             break
                         
                         # Check timeout
                         elapsed = asyncio.get_event_loop().time() - wait_start
                         if max_wait_per_split > 0 and elapsed >= max_wait_per_split:
-                            log_msg(f"⚠️ Split {split_num}: Timeout waiting for spread ({elapsed:.0f}s). Skipping remaining splits.")
+                            log_important(f"⚠️ Split {split_num}: Timeout waiting for spread ({elapsed:.0f}s). Skipping remaining splits.")
                             results["error"] = f"Timeout waiting for spread at split {split_num}"
                             # Return with whatever splits we completed
                             if results["splits_completed"] > 0:
                                 results["success"] = True
                             return results
                         
-                        log_msg(f"📊 Split {split_num}: Spread {spread_pct:.4f}% < {price_spread_min}% | LONG: ${long_price:,.4f} | SHORT: ${short_price:,.4f} | Waiting...")
+                        # Don't log every spread check - too spammy
+                        log_msg(f"📊 Split {split_num}: Spread {spread_pct:.4f}% < {price_spread_min}%", force=False)
                         await asyncio.sleep(spread_check_interval)
                 
-                log_msg(f"🔄 Opening split {split_num}/{split_count} (size: {size_per_split})...")
+                # Only log opening message for important splits
+                log_msg(f"🔄 Opening split {split_num}/{split_count} (size: {size_per_split})...", force=should_log_this_split)
                 
                 try:
                     # Open both sides simultaneously for this split with timeout
@@ -812,7 +830,8 @@ class MultiExchangeManager:
                         "short_order": short_order.order_id if short_order else None
                     })
                     
-                    log_msg(f"✓ Split {split_num}/{split_count} completed")
+                    # Only log completion for important splits
+                    log_msg(f"✓ Split {split_num}/{split_count} completed", force=should_log_this_split)
                     
                     # Call callback after first split to start monitoring
                     if split_num == 1 and on_first_split_complete:
@@ -821,13 +840,12 @@ class MultiExchangeManager:
                         except Exception as e:
                             logger.error(f"Error in on_first_split_complete callback: {e}")
                     
-                    # Delay between splits (except for last one)
+                    # Delay between splits (except for last one) - don't log delay
                     if i < split_count - 1:
-                        log_msg(f"⏳ Waiting {delay_between_splits}s before next split...")
                         await asyncio.sleep(delay_between_splits)
                 
                 except asyncio.TimeoutError:
-                    log_msg(f"⚠️ Split {split_num} timeout - retrying once...")
+                    log_important(f"⚠️ Split {split_num} timeout - retrying once...")
                     # Retry once on timeout
                     try:
                         long_order, short_order = await asyncio.wait_for(
@@ -846,7 +864,7 @@ class MultiExchangeManager:
                             "long_order": long_order.order_id if long_order else None,
                             "short_order": short_order.order_id if short_order else None
                         })
-                        log_msg(f"✓ Split {split_num}/{split_count} completed (retry)")
+                        log_msg(f"✓ Split {split_num}/{split_count} completed (retry)", force=should_log_this_split)
                         
                         if split_num == 1 and on_first_split_complete:
                             try:
@@ -866,7 +884,7 @@ class MultiExchangeManager:
                         
                 except Exception as e:
                     logger.error(f"✗ Split {split_num} failed: {e}")
-                    log_msg(f"❌ Split {split_num} failed: {e}")
+                    log_important(f"❌ Split {split_num} failed: {e}")
                     results["split_results"].append({
                         "split": split_num,
                         "success": False,
@@ -877,7 +895,7 @@ class MultiExchangeManager:
             # Consider success if at least one split completed
             if results["splits_completed"] > 0:
                 results["success"] = True
-                log_msg(f"✅ Completed {results['splits_completed']}/{split_count} splits")
+                log_important(f"✅ Completed {results['splits_completed']}/{split_count} splits")
             else:
                 results["error"] = "All splits failed"
                 
@@ -979,6 +997,11 @@ class FundingHunterGUI:
                     "secret": self.bingx_secret.get(),
                     "enabled": self.bingx_enabled.get()
                 },
+                "gate": {
+                    "api_key": self.gate_api_key.get(),
+                    "secret": self.gate_secret.get(),
+                    "enabled": self.gate_enabled.get()
+                },
                 "trading": {
                     "leverage": self.leverage_var.get(),
                     "size": self.size_entry.get(),
@@ -1032,6 +1055,14 @@ class FundingHunterGUI:
                 self.bingx_secret.delete(0, tk.END)
                 self.bingx_secret.insert(0, config["bingx"].get("secret", ""))
                 self.bingx_enabled.set(config["bingx"].get("enabled", False))
+            
+            # Gate.io
+            if "gate" in config:
+                self.gate_api_key.delete(0, tk.END)
+                self.gate_api_key.insert(0, config["gate"].get("api_key", ""))
+                self.gate_secret.delete(0, tk.END)
+                self.gate_secret.insert(0, config["gate"].get("secret", ""))
+                self.gate_enabled.set(config["gate"].get("enabled", False))
             
             # Trading settings
             if "trading" in config:
@@ -1132,6 +1163,23 @@ class FundingHunterGUI:
         self.bingx_enabled = tk.BooleanVar(value=False)
         ttk.Checkbutton(bingx_frame, text="Enable", variable=self.bingx_enabled).grid(row=0, column=5, padx=5)
         
+        # Gate.io Tab
+        gate_frame = ttk.Frame(notebook, padding="10")
+        notebook.add(gate_frame, text="Gate.io")
+        
+        ttk.Label(gate_frame, text="API Key:").grid(row=0, column=0, padx=5, pady=2, sticky='e')
+        self.gate_api_key = ttk.Entry(gate_frame, width=40, show="*")
+        self.gate_api_key.grid(row=0, column=1, padx=5, pady=2)
+        
+        ttk.Label(gate_frame, text="Secret:").grid(row=0, column=2, padx=5, pady=2, sticky='e')
+        self.gate_secret = ttk.Entry(gate_frame, width=40, show="*")
+        self.gate_secret.grid(row=0, column=3, padx=5, pady=2)
+        
+        ttk.Label(gate_frame, text="(No Testnet)", foreground='gray').grid(row=0, column=4, padx=10)
+        
+        self.gate_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(gate_frame, text="Enable", variable=self.gate_enabled).grid(row=0, column=5, padx=5)
+        
         # Connection buttons
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=tk.X, pady=10)
@@ -1166,6 +1214,10 @@ class FundingHunterGUI:
         ttk.Label(self.balance_frame, text="BingX:").pack(side=tk.LEFT, padx=2)
         self.bingx_balance_label = ttk.Label(self.balance_frame, text="$0.00")
         self.bingx_balance_label.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(self.balance_frame, text="Gate:").pack(side=tk.LEFT, padx=2)
+        self.gate_balance_label = ttk.Label(self.balance_frame, text="$0.00")
+        self.gate_balance_label.pack(side=tk.LEFT, padx=5)
     
     def _create_trading_frame(self, parent):
         """Create trading panel with scrollbar"""
@@ -1255,7 +1307,7 @@ class FundingHunterGUI:
         ex_frame = ttk.LabelFrame(frame, text="Select Exchanges for Arbitrage", padding="10")
         ex_frame.pack(fill=tk.X, pady=10)
         
-        exchanges = ["OKX", "Binance", "BingX"]
+        exchanges = ["OKX", "Binance", "BingX", "Gate.io"]
         
         ttk.Label(ex_frame, text="LONG Exchange:", style='Header.TLabel').grid(row=0, column=0, padx=5, pady=5, sticky='e')
         self.long_exchange = ttk.Combobox(ex_frame, values=exchanges, width=12, state='readonly')
@@ -1342,22 +1394,24 @@ class FundingHunterGUI:
         self.refresh_funding_btn.pack(side=tk.LEFT, padx=5)
         
         # Funding table
-        columns = ("Pair", "OKX", "Binance", "BingX", "Best Spread", "Recommendation")
+        columns = ("Pair", "OKX", "Binance", "BingX", "Gate", "Best Spread", "Recommendation")
         self.funding_tree = ttk.Treeview(frame, columns=columns, show="headings", height=10)
         
         self.funding_tree.heading("Pair", text="Pair")
         self.funding_tree.heading("OKX", text="OKX Rate")
         self.funding_tree.heading("Binance", text="Binance Rate")
         self.funding_tree.heading("BingX", text="BingX Rate")
+        self.funding_tree.heading("Gate", text="Gate Rate")
         self.funding_tree.heading("Best Spread", text="Best Spread")
         self.funding_tree.heading("Recommendation", text="Recommendation")
         
         self.funding_tree.column("Pair", width=80)
-        self.funding_tree.column("OKX", width=90)
-        self.funding_tree.column("Binance", width=90)
-        self.funding_tree.column("BingX", width=90)
-        self.funding_tree.column("Best Spread", width=90)
-        self.funding_tree.column("Recommendation", width=150)
+        self.funding_tree.column("OKX", width=85)
+        self.funding_tree.column("Binance", width=85)
+        self.funding_tree.column("BingX", width=85)
+        self.funding_tree.column("Gate", width=85)
+        self.funding_tree.column("Best Spread", width=85)
+        self.funding_tree.column("Recommendation", width=140)
         
         self.funding_tree.pack(fill=tk.BOTH, expand=True, pady=5)
         
@@ -1502,7 +1556,8 @@ class FundingHunterGUI:
         mapping = {
             "OKX": Exchange.OKX,
             "Binance": Exchange.BINANCE,
-            "BingX": Exchange.BINGX
+            "BingX": Exchange.BINGX,
+            "Gate.io": Exchange.GATE
         }
         return mapping.get(name, Exchange.OKX)
     
@@ -1562,6 +1617,19 @@ class FundingHunterGUI:
                 if await self.manager.connect_exchange(Exchange.BINGX, client):
                     connected.append("BingX")
         
+        # Gate.io
+        if self.gate_enabled.get():
+            gate_key = self.gate_api_key.get().strip()
+            gate_secret = self.gate_secret.get().strip()
+            
+            if gate_key and gate_secret:
+                settings.gate.api_key = gate_key
+                settings.gate.secret_key = gate_secret
+                
+                client = GateClient(settings.gate, debug=self.debug_mode.get())
+                if await self.manager.connect_exchange(Exchange.GATE, client):
+                    connected.append("Gate.io")
+        
         # Get balances
         balances = await self.manager.get_all_balances()
         
@@ -1606,6 +1674,8 @@ class FundingHunterGUI:
             self.binance_balance_label.config(text=f"${balances[Exchange.BINANCE].available:.6f}")
         if Exchange.BINGX in balances:
             self.bingx_balance_label.config(text=f"${balances[Exchange.BINGX].available:.6f}")
+        if Exchange.GATE in balances:
+            self.gate_balance_label.config(text=f"${balances[Exchange.GATE].available:.6f}")
         
         # Update exchange dropdowns
         available = connected  # Use exchange names directly from connected list
@@ -2347,17 +2417,19 @@ class FundingHunterGUI:
     
     def _show_position_selector(self, hedged_pairs, all_positions):
         """Show dialog to select position to load"""
+        from datetime import timedelta
+        
         # Create selection dialog
         dialog = tk.Toplevel(self.root)
         dialog.title("Load Position")
-        dialog.geometry("600x400")
+        dialog.geometry("600x500")
         dialog.transient(self.root)
         dialog.grab_set()
         
         ttk.Label(dialog, text="Select a position to monitor:", font=('Arial', 11, 'bold')).pack(pady=10)
         
         # Listbox for positions
-        listbox = tk.Listbox(dialog, width=80, height=15, font=('Courier', 9))
+        listbox = tk.Listbox(dialog, width=80, height=12, font=('Courier', 9))
         listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         position_data = []
@@ -2383,6 +2455,56 @@ class FundingHunterGUI:
             listbox.insert(tk.END, text)
             position_data.append({"type": "single", "data": p})
         
+        # Add position open time frame
+        ttk.Separator(dialog, orient='horizontal').pack(fill='x', padx=10, pady=10)
+        
+        time_frame = ttk.LabelFrame(dialog, text="Position Open Time (for funding fee calculation)")
+        time_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Time selection options
+        time_option = tk.StringVar(value="lookback_24h")
+        
+        ttk.Radiobutton(time_frame, text="Opened within last 24 hours (default)", 
+                        variable=time_option, value="lookback_24h").pack(anchor='w', padx=10, pady=2)
+        ttk.Radiobutton(time_frame, text="Opened within last 48 hours", 
+                        variable=time_option, value="lookback_48h").pack(anchor='w', padx=10, pady=2)
+        ttk.Radiobutton(time_frame, text="Opened within last 7 days", 
+                        variable=time_option, value="lookback_7d").pack(anchor='w', padx=10, pady=2)
+        
+        # Custom datetime option
+        custom_frame = ttk.Frame(time_frame)
+        custom_frame.pack(anchor='w', padx=10, pady=2)
+        
+        ttk.Radiobutton(custom_frame, text="Custom date/time (UTC):", 
+                        variable=time_option, value="custom").pack(side='left')
+        
+        # Date entry (YYYY-MM-DD HH:MM format)
+        custom_datetime = tk.StringVar(value=(datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M"))
+        custom_entry = ttk.Entry(custom_frame, textvariable=custom_datetime, width=20)
+        custom_entry.pack(side='left', padx=5)
+        ttk.Label(custom_frame, text="(YYYY-MM-DD HH:MM)").pack(side='left')
+        
+        def get_open_time():
+            """Get the open time based on selection"""
+            option = time_option.get()
+            now = datetime.now(timezone.utc)
+            
+            if option == "lookback_24h":
+                return now - timedelta(hours=24)
+            elif option == "lookback_48h":
+                return now - timedelta(hours=48)
+            elif option == "lookback_7d":
+                return now - timedelta(days=7)
+            elif option == "custom":
+                try:
+                    dt_str = custom_datetime.get()
+                    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+                    return dt.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    messagebox.showerror("Error", "Invalid date format. Use YYYY-MM-DD HH:MM")
+                    return None
+            return now - timedelta(hours=24)  # Default fallback
+        
         def on_load():
             selection = listbox.curselection()
             if not selection:
@@ -2396,12 +2518,16 @@ class FundingHunterGUI:
                 messagebox.showwarning("Warning", "Please select a valid position, not a separator")
                 return
             
+            open_time = get_open_time()
+            if open_time is None:
+                return  # Error in date parsing
+            
             dialog.destroy()
             
             if selected["type"] == "hedged":
-                self._load_hedged_position(selected["data"])
+                self._load_hedged_position(selected["data"], open_time)
             else:
-                self._log(f"⚠️ Single position selected - cannot monitor as hedged pair")
+                self._log(f"Single position selected - cannot monitor as hedged pair")
                 self._log(f"   {selected['data']['exchange'].value}: {selected['data']['symbol']} {selected['data']['side'].value}")
         
         btn_frame = ttk.Frame(dialog)
@@ -2410,8 +2536,16 @@ class FundingHunterGUI:
         ttk.Button(btn_frame, text="Load & Monitor", command=on_load).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
     
-    def _load_hedged_position(self, hedged_pair):
-        """Load a hedged position and start monitoring"""
+    def _load_hedged_position(self, hedged_pair, open_time: Optional[datetime] = None):
+        """Load a hedged position and start monitoring
+        
+        Args:
+            hedged_pair: Dict containing pair info (long/short positions)
+            open_time: When the position was opened (for funding fee calculation).
+                       If None, defaults to 24 hours ago.
+        """
+        from datetime import timedelta
+        
         pair = hedged_pair["pair"]
         long_pos = hedged_pair["long"]
         short_pos = hedged_pair["short"]
@@ -2422,18 +2556,22 @@ class FundingHunterGUI:
         # Use average size (should be similar for hedged positions)
         size = (long_pos["size"] + short_pos["size"]) / 2
         
-        self._log(f"📥 Loading hedged position: {pair}")
+        # Use provided open_time or default to 24 hours ago
+        if open_time is None:
+            open_time = datetime.now(timezone.utc) - timedelta(hours=24)
+        
+        self._log(f"Loading hedged position: {pair}")
         self._log(f"   LONG: {long_ex.value} Size: {long_pos['size']}")
         self._log(f"   SHORT: {short_ex.value} Size: {short_pos['size']}")
+        self._log(f"   Open time (for funding): {open_time.strftime('%Y-%m-%d %H:%M')} UTC")
         
         # Setup position tracking
-        from datetime import datetime
         self.active_position = {
             "pair": pair,
             "long_exchange": long_ex,
             "short_exchange": short_ex,
             "size": size,
-            "open_time": datetime.now(timezone.utc),  # We don't know actual open time
+            "open_time": open_time,  # Use provided/calculated open time
             "total_funding_fees": 0.0,
             "last_funding_check": datetime.now(timezone.utc),
             "initial_long_rate": 0,
@@ -2446,7 +2584,7 @@ class FundingHunterGUI:
         self._update_position_display()
         
         # Update exchange selectors
-        exchange_name_map = {Exchange.OKX: "OKX", Exchange.BINANCE: "Binance", Exchange.BINGX: "BingX"}
+        exchange_name_map = {Exchange.OKX: "OKX", Exchange.BINANCE: "Binance", Exchange.BINGX: "BingX", Exchange.GATE: "Gate.io"}
         self.long_exchange.set(exchange_name_map.get(long_ex, ""))
         self.short_exchange.set(exchange_name_map.get(short_ex, ""))
         
@@ -2459,29 +2597,36 @@ class FundingHunterGUI:
 
     def _on_close_complete(self, future):
         """Handle close complete"""
+        # Save position info before clearing for PnL calculation
+        closed_position = self.active_position.copy() if self.active_position else None
+        
         def update_ui():
             self.waiting_for_close = False
-            self.close_btn.configure(text="🛑 Close Position", state=tk.NORMAL)
+            self.close_btn.configure(text="Close Position", state=tk.NORMAL)
             self.open_btn.configure(state=tk.NORMAL)
             
             try:
                 result = future.result()
                 
                 if result.get("cancelled"):
-                    self._log("🛑 Close process cancelled")
+                    self._log("Close process cancelled")
                     return
                 
                 if result["success"]:
-                    self._log("✅ Position closed!")
+                    self._log("Position closed successfully!")
                     self._stop_monitoring()
                     self.active_position = None
                     self._clear_position_display()
                     
+                    # Calculate and display final PnL
+                    if closed_position:
+                        self._calculate_and_show_final_pnl(closed_position)
+                    
                     # If auto trading is enabled, it will resume scanning
                     if getattr(self, 'auto_trading_active', False):
-                        self._log(f"🤖 Auto Trading: Resuming signal scanning...")
+                        self._log(f"Auto Trading: Resuming signal scanning...")
                 else:
-                    self._log(f"❌ Close failed: {result.get('error', 'Unknown error')}")
+                    self._log(f"Close failed: {result.get('error', 'Unknown error')}")
                     # If partially closed, we should keep the position active but maybe update size?
                     # For now just leave as is, user can check or retry
             except Exception as e:
@@ -2489,6 +2634,269 @@ class FundingHunterGUI:
         
         # Run on main thread
         self.root.after(0, update_ui)
+    
+    def _calculate_and_show_final_pnl(self, closed_position: Dict[str, Any]):
+        """Calculate and display final PnL after closing position (including trading fees)"""
+        
+        async def calculate_pnl():
+            pair = closed_position.get('pair', 'Unknown')
+            long_ex = closed_position.get('long_exchange')
+            short_ex = closed_position.get('short_exchange')
+            open_time = closed_position.get('open_time')
+            
+            if not open_time:
+                return None
+            
+            start_time = int(open_time.timestamp() * 1000)
+            # Add 60 seconds buffer after close to capture all closing trades
+            close_time = datetime.now(timezone.utc)
+            end_time = int((close_time.timestamp() + 60) * 1000)
+            
+            # Results
+            long_realized = 0.0
+            short_realized = 0.0
+            long_funding = 0.0
+            short_funding = 0.0
+            long_commission = 0.0
+            short_commission = 0.0
+            
+            # Helper to check if time is in range
+            def in_time_range(item_time: int) -> bool:
+                return start_time <= item_time <= end_time
+            
+            # Import clients
+            from exchanges.binance_client import BinanceClient
+            from exchanges.okx_client import OKXClient
+            from exchanges.bingx_client import BingXClient
+            
+            # Get PnL from LONG exchange
+            long_client = self.manager.clients.get(long_ex)
+            if long_client:
+                try:
+                    symbol = get_exchange_symbol(pair, long_ex)
+                    
+                    if isinstance(long_client, BinanceClient):
+                        binance_symbol = symbol.replace('/', '')
+                        # Get realized PnL
+                        realized = await long_client.get_income_history("REALIZED_PNL", limit=50, symbol=binance_symbol)
+                        for item in realized:
+                            if in_time_range(item.get('time', 0)):
+                                long_realized += float(item.get('income', 0))
+                        # Get funding fees
+                        funding = await long_client.get_income_history("FUNDING_FEE", limit=100, symbol=binance_symbol)
+                        for item in funding:
+                            if in_time_range(item.get('time', 0)):
+                                long_funding += float(item.get('income', 0))
+                        # Get trading commission (negative value = fee paid)
+                        commission = await long_client.get_income_history("COMMISSION", limit=50, symbol=binance_symbol)
+                        for item in commission:
+                            if in_time_range(item.get('time', 0)):
+                                long_commission += float(item.get('income', 0))
+                    
+                    elif isinstance(long_client, OKXClient):
+                        # Get realized PnL
+                        realized = await long_client.get_income_history(symbol, limit=50, income_type="REALIZED_PNL")
+                        for item in realized:
+                            if in_time_range(item.get('time', 0)):
+                                long_realized += float(item.get('income', 0))
+                        # Get funding fees
+                        funding = await long_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
+                        for item in funding:
+                            if in_time_range(item.get('time', 0)):
+                                long_funding += float(item.get('income', 0))
+                        # Get trading commission
+                        commission = await long_client.get_income_history(symbol, limit=50, income_type="COMMISSION")
+                        for item in commission:
+                            if in_time_range(item.get('time', 0)):
+                                long_commission += float(item.get('income', 0))
+                    
+                    elif isinstance(long_client, BingXClient):
+                        # Get realized PnL
+                        realized = await long_client.get_income_history(symbol, limit=50, income_type="REALIZED_PNL")
+                        for item in realized:
+                            if in_time_range(item.get('time', 0)):
+                                long_realized += float(item.get('income', 0))
+                        # Get funding fees
+                        funding = await long_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
+                        for item in funding:
+                            if in_time_range(item.get('time', 0)):
+                                long_funding += float(item.get('income', 0))
+                        # Get trading commission
+                        commission = await long_client.get_income_history(symbol, limit=50, income_type="COMMISSION")
+                        for item in commission:
+                            if in_time_range(item.get('time', 0)):
+                                long_commission += float(item.get('income', 0))
+                    
+                    elif isinstance(long_client, GateClient):
+                        # Get realized PnL
+                        realized = await long_client.get_income_history(symbol, limit=50, income_type="REALIZED_PNL")
+                        for item in realized:
+                            if in_time_range(item.get('time', 0)):
+                                long_realized += float(item.get('income', 0))
+                        # Get funding fees
+                        funding = await long_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
+                        for item in funding:
+                            if in_time_range(item.get('time', 0)):
+                                long_funding += float(item.get('income', 0))
+                        # Get trading commission
+                        commission = await long_client.get_income_history(symbol, limit=50, income_type="COMMISSION")
+                        for item in commission:
+                            if in_time_range(item.get('time', 0)):
+                                long_commission += float(item.get('income', 0))
+                                
+                except Exception as e:
+                    logger.error(f"Error getting PnL from {long_ex.value}: {e}")
+            
+            # Get PnL from SHORT exchange
+            short_client = self.manager.clients.get(short_ex)
+            if short_client:
+                try:
+                    symbol = get_exchange_symbol(pair, short_ex)
+                    
+                    if isinstance(short_client, BinanceClient):
+                        binance_symbol = symbol.replace('/', '')
+                        # Get realized PnL
+                        realized = await short_client.get_income_history("REALIZED_PNL", limit=50, symbol=binance_symbol)
+                        for item in realized:
+                            if in_time_range(item.get('time', 0)):
+                                short_realized += float(item.get('income', 0))
+                        # Get funding fees
+                        funding = await short_client.get_income_history("FUNDING_FEE", limit=100, symbol=binance_symbol)
+                        for item in funding:
+                            if in_time_range(item.get('time', 0)):
+                                short_funding += float(item.get('income', 0))
+                        # Get trading commission
+                        commission = await short_client.get_income_history("COMMISSION", limit=50, symbol=binance_symbol)
+                        for item in commission:
+                            if in_time_range(item.get('time', 0)):
+                                short_commission += float(item.get('income', 0))
+                    
+                    elif isinstance(short_client, OKXClient):
+                        # Get realized PnL
+                        realized = await short_client.get_income_history(symbol, limit=50, income_type="REALIZED_PNL")
+                        for item in realized:
+                            if in_time_range(item.get('time', 0)):
+                                short_realized += float(item.get('income', 0))
+                        # Get funding fees
+                        funding = await short_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
+                        for item in funding:
+                            if in_time_range(item.get('time', 0)):
+                                short_funding += float(item.get('income', 0))
+                        # Get trading commission
+                        commission = await short_client.get_income_history(symbol, limit=50, income_type="COMMISSION")
+                        for item in commission:
+                            if in_time_range(item.get('time', 0)):
+                                short_commission += float(item.get('income', 0))
+                    
+                    elif isinstance(short_client, BingXClient):
+                        # Get realized PnL
+                        realized = await short_client.get_income_history(symbol, limit=50, income_type="REALIZED_PNL")
+                        for item in realized:
+                            if in_time_range(item.get('time', 0)):
+                                short_realized += float(item.get('income', 0))
+                        # Get funding fees
+                        funding = await short_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
+                        for item in funding:
+                            if in_time_range(item.get('time', 0)):
+                                short_funding += float(item.get('income', 0))
+                        # Get trading commission
+                        commission = await short_client.get_income_history(symbol, limit=50, income_type="COMMISSION")
+                        for item in commission:
+                            if in_time_range(item.get('time', 0)):
+                                short_commission += float(item.get('income', 0))
+                    
+                    elif isinstance(short_client, GateClient):
+                        # Get realized PnL
+                        realized = await short_client.get_income_history(symbol, limit=50, income_type="REALIZED_PNL")
+                        for item in realized:
+                            if in_time_range(item.get('time', 0)):
+                                short_realized += float(item.get('income', 0))
+                        # Get funding fees
+                        funding = await short_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
+                        for item in funding:
+                            if in_time_range(item.get('time', 0)):
+                                short_funding += float(item.get('income', 0))
+                        # Get trading commission
+                        commission = await short_client.get_income_history(symbol, limit=50, income_type="COMMISSION")
+                        for item in commission:
+                            if in_time_range(item.get('time', 0)):
+                                short_commission += float(item.get('income', 0))
+                                
+                except Exception as e:
+                    logger.error(f"Error getting PnL from {short_ex.value}: {e}")
+            
+            total_realized_pnl = long_realized + short_realized
+            total_funding_fees = long_funding + short_funding
+            total_commission = long_commission + short_commission  # Usually negative
+            
+            return {
+                "pair": pair,
+                "long_exchange": long_ex,
+                "short_exchange": short_ex,
+                "long_realized_pnl": long_realized,
+                "short_realized_pnl": short_realized,
+                "long_funding": long_funding,
+                "short_funding": short_funding,
+                "long_commission": long_commission,
+                "short_commission": short_commission,
+                "total_realized_pnl": total_realized_pnl,
+                "total_funding_fees": total_funding_fees,
+                "total_commission": total_commission,
+                "total_pnl": total_realized_pnl + total_funding_fees + total_commission,
+                "open_time": open_time,
+                "close_time": close_time
+            }
+        
+        def on_pnl_calculated(future):
+            def show_result():
+                try:
+                    result = future.result(timeout=10)
+                    if result:
+                        self._log("=" * 60)
+                        self._log(f"FINAL PnL REPORT: {result['pair']}")
+                        self._log("=" * 60)
+                        self._log(f"Duration: {result['open_time'].strftime('%Y-%m-%d %H:%M')} -> {result['close_time'].strftime('%Y-%m-%d %H:%M')} UTC")
+                        self._log("")
+                        
+                        # LONG side
+                        long_subtotal = result['long_realized_pnl'] + result['long_funding'] + result['long_commission']
+                        self._log(f"LONG ({result['long_exchange'].value}):")
+                        self._log(f"   Realized PnL:   ${result['long_realized_pnl']:>12.6f}")
+                        self._log(f"   Funding Fees:   ${result['long_funding']:>12.6f}")
+                        self._log(f"   Trading Fees:   ${result['long_commission']:>12.6f}")
+                        self._log(f"   Subtotal:       ${long_subtotal:>12.6f}")
+                        self._log("")
+                        
+                        # SHORT side
+                        short_subtotal = result['short_realized_pnl'] + result['short_funding'] + result['short_commission']
+                        self._log(f"SHORT ({result['short_exchange'].value}):")
+                        self._log(f"   Realized PnL:   ${result['short_realized_pnl']:>12.6f}")
+                        self._log(f"   Funding Fees:   ${result['short_funding']:>12.6f}")
+                        self._log(f"   Trading Fees:   ${result['short_commission']:>12.6f}")
+                        self._log(f"   Subtotal:       ${short_subtotal:>12.6f}")
+                        self._log("")
+                        
+                        self._log("-" * 60)
+                        self._log(f"Total Realized PnL:  ${result['total_realized_pnl']:>12.6f}")
+                        self._log(f"Total Funding Fees:  ${result['total_funding_fees']:>12.6f}")
+                        self._log(f"Total Trading Fees:  ${result['total_commission']:>12.6f}")
+                        self._log("-" * 60)
+                        
+                        total = result['total_pnl']
+                        pnl_status = "PROFIT" if total >= 0 else "LOSS"
+                        self._log(f">>> NET PnL: ${total:.6f} ({pnl_status}) <<<")
+                        self._log("=" * 60)
+                    else:
+                        self._log("Could not calculate final PnL")
+                except Exception as e:
+                    self._log(f"Error calculating PnL: {e}")
+            
+            self.root.after(0, show_result)
+        
+        # Run async calculation
+        future = self._run_async(calculate_pnl())
+        if future:
+            future.add_done_callback(on_pnl_calculated)
     
     def _start_monitoring(self):
         """Start position monitoring"""
@@ -2806,13 +3214,16 @@ class FundingHunterGUI:
         total_funding = 0.0
         open_time = position.get('open_time')
         if not open_time:
+            logger.debug("No open_time in position, cannot calculate funding fees")
             return 0.0
         
         # Convert to timestamp in milliseconds
         start_time = int(open_time.timestamp() * 1000)
+        pair = position.get('pair', 'Unknown')
         
         # Get funding fees from long exchange
         long_client = self.manager.clients.get(position['long_exchange'])
+        long_funding = 0.0
         if long_client:
             try:
                 symbol = get_exchange_symbol(position['pair'], position['long_exchange'])
@@ -2821,34 +3232,49 @@ class FundingHunterGUI:
                 from exchanges.binance_client import BinanceClient
                 from exchanges.okx_client import OKXClient
                 from exchanges.bingx_client import BingXClient
+                from exchanges.gate_client import GateClient
                 
                 if isinstance(long_client, BinanceClient):
                     # Binance format: BTCUSDT
                     binance_symbol = symbol.replace('/', '')
                     income = await long_client.get_income_history("FUNDING_FEE", limit=100, symbol=binance_symbol)
                     for item in income:
-                        if item.get('time', 0) >= start_time:
-                            total_funding += float(item.get('income', 0))
+                        item_time = item.get('time', 0)
+                        if item_time >= start_time:
+                            long_funding += float(item.get('income', 0))
                 
                 elif isinstance(long_client, OKXClient):
                     # OKX format: BTC-USDT-SWAP
                     income = await long_client.get_income_history(symbol, limit=100)
                     for item in income:
-                        if item.get('time', 0) >= start_time:
-                            total_funding += float(item.get('income', 0))
+                        item_time = item.get('time', 0)
+                        if item_time >= start_time:
+                            long_funding += float(item.get('income', 0))
                 
                 elif isinstance(long_client, BingXClient):
                     # BingX format: BTC-USDT
                     income = await long_client.get_income_history(symbol, limit=100)
                     for item in income:
-                        if item.get('time', 0) >= start_time:
-                            total_funding += float(item.get('income', 0))
+                        item_time = item.get('time', 0)
+                        if item_time >= start_time:
+                            long_funding += float(item.get('income', 0))
+                
+                elif isinstance(long_client, GateClient):
+                    # Gate.io format: BTC_USDT
+                    income = await long_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
+                    for item in income:
+                        item_time = item.get('time', 0)
+                        if item_time >= start_time:
+                            long_funding += float(item.get('income', 0))
+                
+                logger.debug(f"LONG {position['long_exchange'].value} funding: ${long_funding:.6f}")
                             
             except Exception as e:
                 logger.debug(f"Error getting funding from {position['long_exchange'].value}: {e}")
         
         # Get funding fees from short exchange
         short_client = self.manager.clients.get(position['short_exchange'])
+        short_funding = 0.0
         if short_client:
             try:
                 symbol = get_exchange_symbol(position['pair'], position['short_exchange'])
@@ -2856,28 +3282,45 @@ class FundingHunterGUI:
                 from exchanges.binance_client import BinanceClient
                 from exchanges.okx_client import OKXClient
                 from exchanges.bingx_client import BingXClient
+                from exchanges.gate_client import GateClient
                 
                 if isinstance(short_client, BinanceClient):
                     binance_symbol = symbol.replace('/', '')
                     income = await short_client.get_income_history("FUNDING_FEE", limit=100, symbol=binance_symbol)
                     for item in income:
-                        if item.get('time', 0) >= start_time:
-                            total_funding += float(item.get('income', 0))
+                        item_time = item.get('time', 0)
+                        if item_time >= start_time:
+                            short_funding += float(item.get('income', 0))
                 
                 elif isinstance(short_client, OKXClient):
                     income = await short_client.get_income_history(symbol, limit=100)
                     for item in income:
-                        if item.get('time', 0) >= start_time:
-                            total_funding += float(item.get('income', 0))
+                        item_time = item.get('time', 0)
+                        if item_time >= start_time:
+                            short_funding += float(item.get('income', 0))
                 
                 elif isinstance(short_client, BingXClient):
                     income = await short_client.get_income_history(symbol, limit=100)
                     for item in income:
-                        if item.get('time', 0) >= start_time:
-                            total_funding += float(item.get('income', 0))
+                        item_time = item.get('time', 0)
+                        if item_time >= start_time:
+                            short_funding += float(item.get('income', 0))
+                
+                elif isinstance(short_client, GateClient):
+                    # Gate.io format: BTC_USDT
+                    income = await short_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
+                    for item in income:
+                        item_time = item.get('time', 0)
+                        if item_time >= start_time:
+                            short_funding += float(item.get('income', 0))
+                
+                logger.debug(f"SHORT {position['short_exchange'].value} funding: ${short_funding:.6f}")
                             
             except Exception as e:
                 logger.debug(f"Error getting funding from {position['short_exchange'].value}: {e}")
+        
+        total_funding = long_funding + short_funding
+        logger.debug(f"Total funding for {pair}: ${total_funding:.6f} (LONG: ${long_funding:.6f}, SHORT: ${short_funding:.6f})")
         
         return total_funding
     
@@ -2970,6 +3413,17 @@ class FundingHunterGUI:
                         except Exception as e:
                             logger.debug(f"BingX rate not available for {pair}: {e}")
                     
+                    # Get Gate.io rate
+                    gate_client = self.manager.clients.get(Exchange.GATE)
+                    if gate_client:
+                        try:
+                            from config.constants import get_exchange_symbol
+                            gate_symbol = get_exchange_symbol(pair, Exchange.GATE)
+                            gate_rate = await gate_client.get_funding_rate(gate_symbol)
+                            rates[Exchange.GATE] = gate_rate
+                        except Exception as e:
+                            logger.debug(f"Gate.io rate not available for {pair}: {e}")
+                    
                     all_rates[pair] = rates
                     
             except Exception as e:
@@ -3017,6 +3471,8 @@ class FundingHunterGUI:
                 rate_values[Exchange.BINANCE] = rates[Exchange.BINANCE].funding_rate
             if Exchange.BINGX in rates:
                 rate_values[Exchange.BINGX] = rates[Exchange.BINGX].funding_rate
+            if Exchange.GATE in rates:
+                rate_values[Exchange.GATE] = rates[Exchange.GATE].funding_rate
             
             # Calculate spread
             spread_value = 0.0
@@ -3033,10 +3489,12 @@ class FundingHunterGUI:
             okx_rate = rates.get(Exchange.OKX)
             binance_rate = rates.get(Exchange.BINANCE)
             bingx_rate = rates.get(Exchange.BINGX)
+            gate_rate = rates.get(Exchange.GATE)
             
             okx_val = f"{okx_rate.funding_rate * 100:.6f}%" if okx_rate else "-"
             binance_val = f"{binance_rate.funding_rate * 100:.6f}%" if binance_rate else "-"
             bingx_val = f"{bingx_rate.funding_rate * 100:.6f}%" if bingx_rate else "-"
+            gate_val = f"{gate_rate.funding_rate * 100:.6f}%" if gate_rate else "-"
             
             # Find best spread
             rate_values = {}
@@ -3046,6 +3504,8 @@ class FundingHunterGUI:
                 rate_values[Exchange.BINANCE] = binance_rate.funding_rate
             if bingx_rate:
                 rate_values[Exchange.BINGX] = bingx_rate.funding_rate
+            if gate_rate:
+                rate_values[Exchange.GATE] = gate_rate.funding_rate
             
             best_spread = "-"
             recommendation = "-"
@@ -3059,7 +3519,7 @@ class FundingHunterGUI:
                 recommendation = f"Long {lowest[0].value}, Short {highest[0].value}"
             
             self.funding_tree.insert("", tk.END, values=(
-                pair, okx_val, binance_val, bingx_val, best_spread, recommendation
+                pair, okx_val, binance_val, bingx_val, gate_val, best_spread, recommendation
             ))
         
         self._log(f"✅ Loaded {len(sorted_pairs)} pairs sorted by Best Spread (highest to lowest)")
@@ -3073,7 +3533,7 @@ class FundingHunterGUI:
         item = self.funding_tree.item(selected[0])
         values = item['values']
         pair = values[0]
-        recommendation = values[5]
+        recommendation = values[-1]  # Luôn lấy từ cuối - không cần sửa khi thêm sàn mới
         
         # Set the pair in dropdown
         self.pair_combo.set(pair)
@@ -3088,7 +3548,7 @@ class FundingHunterGUI:
                 short_ex = parts[1].replace("Short ", "").strip().lower()
                 
                 # Map to display names (case-insensitive)
-                name_map = {"okx": "OKX", "binance": "Binance", "bingx": "BingX"}
+                name_map = {"okx": "OKX", "binance": "Binance", "bingx": "BingX", "gate": "Gate.io"}
                 long_display = name_map.get(long_ex, long_ex.upper())
                 short_display = name_map.get(short_ex, short_ex.upper())
                 
@@ -3180,7 +3640,7 @@ class FundingHunterGUI:
             return
         
         # Map display names to Exchange enum
-        exchange_map = {"OKX": Exchange.OKX, "Binance": Exchange.BINANCE, "BingX": Exchange.BINGX}
+        exchange_map = {"OKX": Exchange.OKX, "Binance": Exchange.BINANCE, "BingX": Exchange.BINGX, "Gate.io": Exchange.GATE}
         long_ex = exchange_map.get(long_display)
         short_ex = exchange_map.get(short_display)
         
