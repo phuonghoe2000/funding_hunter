@@ -599,6 +599,148 @@ class MultiExchangeManager:
         
         return all_positions
     
+    async def analyze_spread(
+        self,
+        pair: str,
+        long_exchange: Exchange,
+        short_exchange: Exchange,
+        duration_seconds: float = 300.0,  # 5 phút
+        check_interval: float = 2.0,      # 2 giây
+        log_callback = None,
+        cancel_event: Optional[threading.Event] = None,
+        mode: str = "open"  # "open" hoặc "close"
+    ) -> Dict[str, Any]:
+        """
+        Analyze spread trong khoảng thời gian, trả về giá trị cao thứ 2.
+        
+        Args:
+            pair: Trading pair
+            long_exchange: Exchange có LONG position
+            short_exchange: Exchange có SHORT position
+            duration_seconds: Thời gian analyze (mặc định 5 phút)
+            check_interval: Khoảng cách giữa các lần check (mặc định 2 giây)
+            log_callback: Callback để log ra GUI
+            cancel_event: Event để cancel analyze
+            mode: "open" = tính spread mở (SHORT_BID - LONG_ASK), 
+                  "close" = tính spread đóng (LONG_BID - SHORT_ASK)
+        
+        Returns:
+            Dict với:
+                - success: bool
+                - second_best_spread: float (giá trị cao thứ 2)
+                - best_spread: float (giá trị cao nhất)
+                - spreads: List[float] (tất cả spreads thu thập được)
+                - samples: int (số lượng samples)
+                - error: str nếu có lỗi
+        """
+        def log_msg(msg: str):
+            logger.info(msg)
+            if log_callback:
+                log_callback(msg)
+        
+        def is_cancelled() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+        
+        result = {
+            "success": False,
+            "second_best_spread": None,
+            "best_spread": None,
+            "spreads": [],
+            "samples": 0,
+            "error": None
+        }
+        
+        if long_exchange not in self.clients or short_exchange not in self.clients:
+            result["error"] = "One or both exchanges not connected"
+            return result
+        
+        long_client = self.clients[long_exchange]
+        short_client = self.clients[short_exchange]
+        
+        long_symbol = get_exchange_symbol(pair, long_exchange)
+        short_symbol = get_exchange_symbol(pair, short_exchange)
+        
+        spreads = []
+        start_time = asyncio.get_event_loop().time()
+        sample_count = 0
+        expected_samples = int(duration_seconds / check_interval)
+        
+        log_msg(f"📊 Bắt đầu analyze spread {duration_seconds:.0f}s ({expected_samples} samples dự kiến)...")
+        
+        while True:
+            if is_cancelled():
+                log_msg("🛑 Analyze bị cancel")
+                result["error"] = "Cancelled"
+                return result
+            
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed >= duration_seconds:
+                break
+            
+            try:
+                # Fetch order books
+                long_book, short_book = await asyncio.wait_for(
+                    asyncio.gather(
+                        long_client.get_order_book(long_symbol, limit=10),
+                        short_client.get_order_book(short_symbol, limit=10)
+                    ),
+                    timeout=10.0
+                )
+                
+                if mode == "open":
+                    # Open: LONG (BUY) fills at ASK, SHORT (SELL) fills at BID
+                    # Spread = SHORT_BID - LONG_ASK
+                    if long_book.get("asks") and short_book.get("bids"):
+                        long_ask = long_book["asks"][0][0]
+                        short_bid = short_book["bids"][0][0]
+                        avg_price = (long_ask + short_bid) / 2
+                        spread_pct = ((short_bid - long_ask) / avg_price) * 100
+                        spreads.append(spread_pct)
+                        sample_count += 1
+                else:
+                    # Close: LONG (SELL) fills at BID, SHORT (BUY) fills at ASK
+                    # Spread = LONG_BID - SHORT_ASK
+                    if long_book.get("bids") and short_book.get("asks"):
+                        long_bid = long_book["bids"][0][0]
+                        short_ask = short_book["asks"][0][0]
+                        avg_price = (long_bid + short_ask) / 2
+                        spread_pct = ((long_bid - short_ask) / avg_price) * 100
+                        spreads.append(spread_pct)
+                        sample_count += 1
+                
+                # Log progress mỗi 30 giây
+                if sample_count % 15 == 0:  # 15 samples * 2s = 30s
+                    remaining = duration_seconds - elapsed
+                    log_msg(f"📊 Analyzing... {sample_count} samples | {remaining:.0f}s còn lại | Spread hiện tại: {spreads[-1]:.4f}%")
+                
+            except asyncio.TimeoutError:
+                logger.warning("Timeout fetching order book during analyze")
+            except Exception as e:
+                logger.error(f"Error during analyze: {e}")
+            
+            await asyncio.sleep(check_interval)
+        
+        if len(spreads) < 2:
+            result["error"] = f"Không đủ samples (chỉ có {len(spreads)})"
+            return result
+        
+        # Sort descending để lấy giá trị cao nhất
+        sorted_spreads = sorted(spreads, reverse=True)
+        best_spread = sorted_spreads[0]
+        second_best_spread = sorted_spreads[2]
+        
+        result["success"] = True
+        result["spreads"] = spreads
+        result["samples"] = len(spreads)
+        result["best_spread"] = best_spread
+        result["second_best_spread"] = second_best_spread
+        
+        log_msg(f"✅ Analyze hoàn thành: {len(spreads)} samples")
+        log_msg(f"   Best: {best_spread:.4f}% | Second best: {second_best_spread:.4f}%")
+        log_msg(f"   Min: {min(spreads):.4f}% | Max: {max(spreads):.4f}% | Avg: {sum(spreads)/len(spreads):.4f}%")
+        
+        return result
+    
     async def open_hedged_position_split(
         self,
         pair: str,
@@ -751,6 +893,9 @@ class MultiExchangeManager:
             # For many splits, only log every N splits to reduce GUI spam
             log_every = 1 if split_count <= 10 else (5 if split_count <= 50 else 10)
             
+            # Track current threshold (can be reduced if spread not met after 30 checks)
+            current_threshold = price_spread_min
+            
             # Open positions in splits
             for i in range(split_count):
                 split_num = i + 1
@@ -775,6 +920,7 @@ class MultiExchangeManager:
                     if should_log_this_split:
                         log_important(f"⏳ Split {split_num}/{split_count}: Checking spread...")
                     wait_start = asyncio.get_event_loop().time()
+                    check_count = 0  # Counter for threshold reduction
                     
                     while True:
                         # Check for cancellation while waiting for spread
@@ -788,10 +934,22 @@ class MultiExchangeManager:
                         
                         is_ok, spread_pct, long_price, short_price = await check_spread()
                         
+                        # Check against current threshold (not original)
+                        is_ok = spread_pct >= current_threshold
+                        
                         if is_ok:
                             # Only log spread OK for important splits
-                            log_msg(f"✅ Split {split_num}: Spread {spread_pct:.4f}% OK", force=should_log_this_split)
+                            log_msg(f"✅ Split {split_num}: Spread {spread_pct:.4f}% >= {current_threshold:.4f}% OK", force=should_log_this_split)
                             break
+                        
+                        check_count += 1
+                        
+                        # After 30 checks, reduce threshold by 0.01%
+                        if check_count >= 30:
+                            old_threshold = current_threshold
+                            current_threshold -= 0.01
+                            log_important(f"⚠️ Split {split_num}: 30 lần chưa đạt, giảm threshold: {old_threshold:.4f}% → {current_threshold:.4f}%")
+                            check_count = 0  # Reset counter
                         
                         # Check timeout
                         elapsed = asyncio.get_event_loop().time() - wait_start
@@ -804,7 +962,7 @@ class MultiExchangeManager:
                             return results
                         
                         # Don't log every spread check - too spammy
-                        log_msg(f"📊 Split {split_num}: Spread {spread_pct:.4f}% < {price_spread_min}%", force=False)
+                        log_msg(f"📊 Split {split_num}: Spread {spread_pct:.4f}% < {current_threshold:.4f}% (check {check_count}/30)", force=False)
                         await asyncio.sleep(spread_check_interval)
                 
                 # Only log opening message for important splits
@@ -943,6 +1101,10 @@ class FundingHunterGUI:
         self.price_spread_check_task = None
         self.price_spread_params = None  # Store params: pair, long_ex, short_ex, size, leverage
         self.split_cancel_event: Optional[threading.Event] = None  # For cancelling splits mid-execution (thread-safe)
+        
+        # Analyze spread state
+        self.analyzing_spread = False
+        self.analyze_cancel_event: Optional[threading.Event] = None
         
         # UI update tasks (to prevent spam and manage recurring updates)
         self._pair_info_update_task = None
@@ -1795,13 +1957,13 @@ class FundingHunterGUI:
         logger.info("🛑 Stopped all background tasks")
     
     def _open_position(self):
-        """Open hedged position - starts monitoring price spread and auto-opens when threshold met"""
+        """Open hedged position - analyze spread first, then wait for threshold"""
         if not self.connected:
             return
         
-        # If already waiting, this is a CANCEL action
-        if self.waiting_for_price_spread:
-            self._cancel_price_spread_wait()
+        # If already analyzing or waiting, this is a CANCEL action
+        if self.analyzing_spread or self.waiting_for_price_spread:
+            self._cancel_open_position()
             return
         
         pair = self.pair_combo.get()
@@ -1815,7 +1977,6 @@ class FundingHunterGUI:
         try:
             size = float(self.size_entry.get())
             leverage = int(self.leverage_var.get())
-            price_spread_min = float(self.price_spread_threshold.get())
             split_count = int(self.split_count_var.get())
             if split_count < 1:
                 split_count = 1
@@ -1823,7 +1984,7 @@ class FundingHunterGUI:
                 messagebox.showerror("Error", "Split count cannot exceed 1000")
                 return
         except ValueError:
-            messagebox.showerror("Error", "Invalid size, leverage, split count, or price spread threshold")
+            messagebox.showerror("Error", "Invalid size, leverage, or split count")
             return
         
         long_ex = self._get_exchange_enum(long_ex_name)
@@ -1832,7 +1993,7 @@ class FundingHunterGUI:
         # STOP ALL BACKGROUND TASKS before opening position
         self._stop_all_background_tasks()
         
-        # Store parameters for continuous checking
+        # Store parameters
         self.price_spread_params = {
             "pair": pair,
             "long_ex": long_ex,
@@ -1841,22 +2002,107 @@ class FundingHunterGUI:
             "short_ex_name": short_ex_name,
             "size": size,
             "leverage": leverage,
-            "price_spread_min": price_spread_min,
+            "price_spread_min": None,  # Will be set after analyze
             "split_count": split_count,
             "skip_leverage": self.skip_leverage_var.get()
         }
         
-        # Start waiting mode
-        self.waiting_for_price_spread = True
-        self.open_btn.configure(text="🛑 Cancel")
-        self._log(f"⏳ Waiting for price spread >= {price_spread_min}% on {pair}...")
-        self._log(f"   Checking every 2 seconds. Click 'Cancel' to stop.")
+        # Start analyze phase
+        self.analyzing_spread = True
+        self.analyze_cancel_event = threading.Event()
+        self.open_btn.configure(text="📊 Analyzing... (Cancel)")
+        self._log(f"📊 Bắt đầu analyze spread 5 phút cho {pair}...")
+        self._log(f"   LONG: {long_ex_name} | SHORT: {short_ex_name}")
         
-        # Subscribe to WS Market Data for this pair on both exchanges
+        # Subscribe to WS Market Data
         self._run_async(self.manager.subscribe_market_data(pair, long_ex, short_ex))
         
-        # Start price spread monitoring loop
-        self._check_price_spread_and_open()
+        # Start analyze
+        self._start_analyze_for_open()
+    
+    def _start_analyze_for_open(self):
+        """Run analyze spread and then start waiting for open"""
+        params = self.price_spread_params
+        if not params:
+            return
+        
+        def safe_log(msg):
+            self.root.after(0, lambda m=msg: self._log(m))
+        
+        async def do_analyze():
+            result = await self.manager.analyze_spread(
+                params["pair"],
+                params["long_ex"],
+                params["short_ex"],
+                duration_seconds=300.0,  # 5 phút
+                check_interval=2.0,      # 2 giây
+                log_callback=safe_log,
+                cancel_event=self.analyze_cancel_event,
+                mode="open"
+            )
+            return result
+        
+        future = self._run_async(do_analyze())
+        if future:
+            future.add_done_callback(lambda f: self._on_analyze_for_open_complete(f))
+    
+    def _on_analyze_for_open_complete(self, future):
+        """Handle analyze completion for open"""
+        def update_ui():
+            try:
+                result = future.result(timeout=1.0)
+                self.analyzing_spread = False
+                self.analyze_cancel_event = None
+                
+                if not result.get("success"):
+                    error = result.get("error", "Unknown error")
+                    self._log(f"❌ Analyze thất bại: {error}")
+                    self._reset_open_button()
+                    return
+                
+                # Get second best spread as threshold
+                second_best = result["second_best_spread"]
+                self.price_spread_params["price_spread_min"] = second_best
+                
+                # Update UI threshold display
+                self.price_spread_threshold.delete(0, tk.END)
+                self.price_spread_threshold.insert(0, f"{second_best:.4f}")
+                
+                self._log(f"✅ Analyze xong! Threshold = {second_best:.4f}% (giá trị cao thứ 2)")
+                self._log(f"⏳ Đang chờ spread >= {second_best:.4f}% để mở position...")
+                
+                # Update button to show waiting state
+                self.open_btn.configure(text="⏳ Waiting... (Cancel)")
+                
+                # Now start waiting for spread
+                self.waiting_for_price_spread = True
+                self._check_price_spread_and_open()
+                
+            except Exception as e:
+                self._log(f"❌ Lỗi analyze: {e}")
+                self._reset_open_button()
+        
+        self.root.after(0, update_ui)
+    
+    def _reset_open_button(self):
+        """Reset open button to default state"""
+        self.analyzing_spread = False
+        self.waiting_for_price_spread = False
+        self.analyze_cancel_event = None
+        self.price_spread_params = None
+        self.open_btn.configure(text="Open Position", state=tk.NORMAL)
+    
+    def _cancel_open_position(self):
+        """Cancel analyzing or waiting for price spread"""
+        # Cancel analyze if running
+        if self.analyze_cancel_event:
+            self.analyze_cancel_event.set()
+            self._log("🛑 Đang cancel analyze...")
+        
+        # Cancel waiting/splits
+        self._cancel_price_spread_wait()
+        
+        self._reset_open_button()
     
     def _cancel_price_spread_wait(self):
         """Cancel waiting for price spread and/or running splits"""
@@ -1932,20 +2178,32 @@ class FundingHunterGUI:
                 avg_price = (long_ask_price + short_bid_price) / 2
                 price_spread_pct = (price_diff / avg_price) * 100
                 
+                # Get current threshold (may have been reduced)
+                current_threshold = params.get("price_spread_min", 0)
+                check_count = params.get("spread_check_count", 0) + 1
+                params["spread_check_count"] = check_count
+                
                 # Show spread info with appropriate indicator
                 if price_spread_pct < 0:
-                    safe_log(f"📊 Real spread (OI): {price_spread_pct:.4f}% ⚠️ NEGATIVE (threshold: {params['price_spread_min']}%) | LONG ASK: ${long_ask_price:,.6f} | SHORT BID: ${short_bid_price:,.6f}")
+                    safe_log(f"📊 Real spread (OI): {price_spread_pct:.4f}% ⚠️ NEGATIVE (threshold: {current_threshold:.4f}%) (check {check_count % 30}/30) | LONG ASK: ${long_ask_price:,.6f} | SHORT BID: ${short_bid_price:,.6f}")
                 else:
-                    safe_log(f"📊 Real spread (OI): {price_spread_pct:.4f}% (threshold: {params['price_spread_min']}%) | LONG ASK: ${long_ask_price:,.6f} | SHORT BID: ${short_bid_price:,.6f}")
+                    safe_log(f"📊 Real spread (OI): {price_spread_pct:.4f}% (threshold: {current_threshold:.4f}%) (check {check_count % 30}/30) | LONG ASK: ${long_ask_price:,.6f} | SHORT BID: ${short_bid_price:,.6f}")
                 
                 # Check if spread meets minimum threshold
-                if price_spread_pct < params["price_spread_min"]:
+                if price_spread_pct < current_threshold:
+                    # After 30 checks, reduce threshold by 0.01%
+                    if check_count >= 30 and check_count % 30 == 0:
+                        old_threshold = current_threshold
+                        new_threshold = current_threshold - 0.01
+                        params["price_spread_min"] = new_threshold
+                        safe_log(f"⚠️ 30 lần chưa đạt, giảm threshold: {old_threshold:.4f}% → {new_threshold:.4f}%")
+                    
                     # Not ready yet, check again in 2 seconds
                     return {"success": False, "waiting": True}
                 
                 # Price spread is good, proceed to open position!
                 split_count = params.get("split_count", 1)
-                safe_log(f"✅ Price spread >= {params['price_spread_min']}%, and price position is good!")
+                safe_log(f"✅ Price spread {price_spread_pct:.4f}% >= {current_threshold:.4f}%, and price position is good!")
                 safe_log(f"🚀 Opening: {params['pair']} | Long {params['long_ex_name']} | Short {params['short_ex_name']} | Size: {params['size']} | Splits: {split_count}")
                 
                 # Create cancel event for this split session (use threading.Event for thread-safety)
@@ -2235,58 +2493,134 @@ class FundingHunterGUI:
         self.root.after(0, update_ui)
     
     def _close_position(self):
-        """Close position in splits with spread check"""
+        """Close position - analyze spread first, then close in splits"""
         if not self.active_position:
             messagebox.showinfo("Info", "No active position")
             return
         
-        # If already waiting, this is a CANCEL action
-        if getattr(self, 'waiting_for_close', False):
+        # If already analyzing or waiting, this is a CANCEL action
+        if getattr(self, 'analyzing_close', False) or getattr(self, 'waiting_for_close', False):
             self._cancel_close_process()
             return
 
         try:
             splits = int(self.split_count_var.get())
             if splits < 1: splits = 1
-            
-            # Use same threshold input as open position
-            price_spread_min = float(self.price_spread_threshold.get())
         except:
             splits = 1
-            price_spread_min = -100.0  # Default to ignore
         
-        confirm_msg = f"Close position in {splits} split(s)?\nSpread threshold: {price_spread_min}%\n(Check every 2s)"
+        confirm_msg = f"Close position in {splits} split(s)?\nWill analyze spread 5 minutes first."
         if not messagebox.askyesno("Confirm", confirm_msg):
             return
         
         pos = self.active_position
-        self._log(f"📤 Closing position for {pos['pair']} in {splits} split(s)...")
+        self._log(f"📤 Bắt đầu quá trình đóng position {pos['pair']}...")
         
         # STOP ALL BACKGROUND TASKS
         self._stop_all_background_tasks()
         
         # Update UI state
-        self.waiting_for_close = True
-        self.close_btn.configure(text="🛑 Cancel Close", state=tk.NORMAL)
-        self.open_btn.configure(state=tk.DISABLED) # Disable open while closing
+        self.analyzing_close = True
+        self.close_cancel_event = threading.Event()
+        self.close_btn.configure(text="📊 Analyzing... (Cancel)", state=tk.NORMAL)
+        self.open_btn.configure(state=tk.DISABLED)
         
-        # Create cancel event
+        # Store close params
+        self.close_params = {
+            "pair": pos["pair"],
+            "long_exchange": pos["long_exchange"],
+            "short_exchange": pos["short_exchange"],
+            "splits": splits,
+            "price_spread_min": None  # Will be set after analyze
+        }
+        
+        # Subscribe to WS Market Data
+        self._run_async(self.manager.subscribe_market_data(pos['pair'], pos['long_exchange'], pos['short_exchange']))
+        
+        self._log(f"📊 Bắt đầu analyze spread 5 phút cho CLOSE...")
+        
+        # Start analyze for close
+        self._start_analyze_for_close()
+    
+    def _start_analyze_for_close(self):
+        """Run analyze spread and then start closing"""
+        params = self.close_params
+        if not params:
+            return
+        
+        def safe_log(msg):
+            self.root.after(0, lambda m=msg: self._log(m))
+        
+        async def do_analyze():
+            result = await self.manager.analyze_spread(
+                params["pair"],
+                params["long_exchange"],
+                params["short_exchange"],
+                duration_seconds=300.0,  # 5 phút
+                check_interval=2.0,      # 2 giây
+                log_callback=safe_log,
+                cancel_event=self.close_cancel_event,
+                mode="close"  # Mode đóng: LONG_BID - SHORT_ASK
+            )
+            return result
+        
+        future = self._run_async(do_analyze())
+        if future:
+            future.add_done_callback(lambda f: self._on_analyze_for_close_complete(f))
+    
+    def _on_analyze_for_close_complete(self, future):
+        """Handle analyze completion for close"""
+        def update_ui():
+            try:
+                result = future.result(timeout=1.0)
+                self.analyzing_close = False
+                
+                if not result.get("success"):
+                    error = result.get("error", "Unknown error")
+                    self._log(f"❌ Analyze thất bại: {error}")
+                    self._reset_close_button()
+                    return
+                
+                # Get second best spread as threshold
+                second_best = result["second_best_spread"]
+                self.close_params["price_spread_min"] = second_best
+                
+                self._log(f"✅ Analyze xong! Threshold = {second_best:.4f}% (giá trị cao thứ 2)")
+                self._log(f"⏳ Đang chờ spread >= {second_best:.4f}% để đóng position...")
+                
+                # Update button to show waiting/closing state
+                self.close_btn.configure(text="⏳ Closing... (Cancel)")
+                
+                # Now start closing with splits
+                self.waiting_for_close = True
+                self._execute_close_with_splits()
+                
+            except Exception as e:
+                self._log(f"❌ Lỗi analyze: {e}")
+                self._reset_close_button()
+        
+        self.root.after(0, update_ui)
+    
+    def _execute_close_with_splits(self):
+        """Execute the actual close with splits after analyze"""
+        params = self.close_params
+        if not params:
+            return
+        
+        # Create cancel event for splits
         self.split_cancel_event = threading.Event()
         
         def progress_callback(split_num, total_splits, message):
             self.root.after(0, lambda: self._log(f"   {message}"))
         
-        # Subscribe to WS Market Data for this pair on both exchanges
-        self._run_async(self.manager.subscribe_market_data(pos['pair'], pos['long_exchange'], pos['short_exchange']))
-        
         async def async_close():
             return await self.manager.close_hedged_position_split(
-                pos['pair'], 
-                pos['long_exchange'], 
-                pos['short_exchange'],
-                splits=splits,
+                params['pair'], 
+                params['long_exchange'], 
+                params['short_exchange'],
+                splits=params['splits'],
                 interval_seconds=2.0,
-                price_spread_min=price_spread_min,
+                price_spread_min=params['price_spread_min'],
                 spread_check_interval=2.0,
                 progress_callback=progress_callback,
                 cancel_event=self.split_cancel_event
@@ -2295,15 +2629,29 @@ class FundingHunterGUI:
         future = self._run_async(async_close())
         if future:
             future.add_done_callback(self._on_close_complete)
+    
+    def _reset_close_button(self):
+        """Reset close button to default state"""
+        self.analyzing_close = False
+        self.waiting_for_close = False
+        self.close_cancel_event = None
+        self.close_params = None
+        self.close_btn.configure(text="🛑 Close Position", state=tk.NORMAL)
+        self.open_btn.configure(state=tk.NORMAL)
             
     def _cancel_close_process(self):
-        """Cancel the closing process"""
+        """Cancel the closing process (analyze or splits)"""
+        # Cancel analyze if running
+        if getattr(self, 'close_cancel_event', None):
+            self.close_cancel_event.set()
+            self._log("🛑 Đang cancel analyze/close...")
+        
+        # Cancel splits if running
         if self.split_cancel_event:
             self.split_cancel_event.set()
             self._log("🛑 Sending cancel signal to close process...")
         
-        self.waiting_for_close = False
-        self.close_btn.configure(text="🛑 Close Position", state=tk.NORMAL) # Will be effectively reset in _on_close_complete
+        self._reset_close_button()
 
     
     def _load_existing_positions(self):
@@ -3061,15 +3409,51 @@ class FundingHunterGUI:
                         should_close, reason = await self._check_funding_reversal(pos)
                         if should_close:
                             safe_log(f"🔄 Funding reversal detected: {reason}")
-                            safe_log(f"🔄 Auto-closing position...")
+                            safe_log(f"🔄 Bắt đầu analyze spread 5 phút trước khi auto-close...")
                             
-                            # Close position
+                            # Get split count from UI
                             try:
-                                close_result = await self.manager.close_hedged_position(
-                                    pos['pair'], pos['long_exchange'], pos['short_exchange']
+                                splits = int(self.split_count_var.get())
+                                if splits < 1: splits = 1
+                            except:
+                                splits = 1
+                            
+                            # Analyze spread first
+                            try:
+                                analyze_result = await self.manager.analyze_spread(
+                                    pos['pair'],
+                                    pos['long_exchange'],
+                                    pos['short_exchange'],
+                                    duration_seconds=300.0,  # 5 phút
+                                    check_interval=2.0,
+                                    log_callback=safe_log,
+                                    cancel_event=None,
+                                    mode="close"
                                 )
                                 
-                                if close_result["success"]:
+                                if not analyze_result.get("success"):
+                                    safe_log(f"❌ Analyze thất bại: {analyze_result.get('error')}")
+                                    # Still try to close with default threshold
+                                    price_spread_min = -100.0
+                                else:
+                                    price_spread_min = analyze_result["second_best_spread"]
+                                    safe_log(f"✅ Analyze xong! Threshold = {price_spread_min:.4f}%")
+                                
+                                # Close position with splits
+                                safe_log(f"🔄 Auto-closing position in {splits} split(s)...")
+                                close_result = await self.manager.close_hedged_position_split(
+                                    pos['pair'], 
+                                    pos['long_exchange'], 
+                                    pos['short_exchange'],
+                                    splits=splits,
+                                    interval_seconds=2.0,
+                                    price_spread_min=price_spread_min,
+                                    spread_check_interval=2.0,
+                                    progress_callback=lambda s, t, m: safe_log(f"   {m}"),
+                                    cancel_event=None
+                                )
+                                
+                                if close_result.get("success"):
                                     safe_log(f"✅ Position auto-closed due to: {reason}")
                                     self.root.after(0, lambda r=reason: messagebox.showinfo(
                                         "Auto-Close", 
@@ -3080,7 +3464,7 @@ class FundingHunterGUI:
                                     if self.auto_trading_active:
                                         safe_log(f"🤖 Auto Trading: Resuming signal scanning...")
                                 else:
-                                    safe_log(f"❌ Auto-close failed: {close_result['error']}")
+                                    safe_log(f"❌ Auto-close failed: {close_result.get('error')}")
                                     
                             except Exception as e:
                                 safe_log(f"❌ Auto-close error: {e}")
