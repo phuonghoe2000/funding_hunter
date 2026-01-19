@@ -1194,11 +1194,11 @@ class FundingHunterGUI:
         option_frame = ttk.Frame(frame)
         option_frame.pack(fill=tk.X, pady=5)
         
-        self.auto_close_var = tk.BooleanVar(value=True)
+        self.auto_close_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(option_frame, text="Auto-close other side on liquidation", 
                        variable=self.auto_close_var).pack(anchor=tk.W)
         
-        self.auto_close_reversal_var = tk.BooleanVar(value=True)
+        self.auto_close_reversal_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(option_frame, text="Auto-close on funding reversal", 
                        variable=self.auto_close_reversal_var).pack(anchor=tk.W, pady=2)
         
