@@ -173,31 +173,31 @@ class MultiExchangeManager:
             
             try:
                 long_order = await self._place_order_with_retry(
-                    long_client, long_symbol, Side.LONG, size, long_exchange, max_retries=1
+                    long_client, long_symbol, Side.LONG, size, long_exchange, max_retries=3
                 )
                 logger.info(f"✓ LONG order placed: {long_order.order_id}")
             except Exception as e:
-                # LONG failed - no cleanup needed, just fail
-                raise Exception(f"LONG order failed on {long_exchange.value} after retries: {e}")
+                # LONG failed after 3 retries - no cleanup needed, just fail
+                raise Exception(f"LONG order failed on {long_exchange.value} after 3 retries: {e}")
             
             # Step 3: Open SHORT position
             logger.info(f"  → Opening SHORT on {short_exchange.value}...")
             
             try:
                 short_order = await self._place_order_with_retry(
-                    short_client, short_symbol, Side.SHORT, size, short_exchange, max_retries=1
+                    short_client, short_symbol, Side.SHORT, size, short_exchange, max_retries=3
                 )
                 logger.info(f"✓ SHORT order placed: {short_order.order_id}")
             except Exception as e:
-                # SHORT failed but LONG succeeded - CRITICAL: Must rollback LONG!
-                logger.error(f"✗ SHORT order failed! Attempting to rollback LONG position...")
+                # SHORT failed after 3 retries but LONG succeeded - CRITICAL: Must rollback LONG!
+                logger.error(f"✗ SHORT order failed after 3 retries! Attempting to rollback LONG position...")
                 
                 rollback_success = await self._rollback_long_position(
                     long_client, long_symbol, long_order, long_exchange
                 )
                 
                 if rollback_success:
-                    raise Exception(f"SHORT order failed on {short_exchange.value}, LONG position rolled back successfully: {e}")
+                    raise Exception(f"SHORT order failed on {short_exchange.value} after 3 retries, LONG position rolled back successfully: {e}")
                 else:
                     raise Exception(f"CRITICAL: SHORT order failed AND rollback failed! You have an unhedged LONG position on {long_exchange.value}. Please close manually! Error: {e}")
             
@@ -469,29 +469,83 @@ class MultiExchangeManager:
                 if progress_callback:
                     progress_callback(split_num, splits, f"Closing split {split_num}/{splits}...")
                 
-                close_tasks = []
+                # Determine sizes to close for this split
+                long_size_to_close = 0
+                short_size_to_close = 0
                 
                 if is_last:
+                    # Last split: close all remaining
                     if long_pos:
                         try:
                             current_long = await long_client.get_position(long_symbol)
                             if current_long and current_long.size > 0:
-                                close_tasks.append(long_client.close_position(long_symbol))
+                                long_size_to_close = current_long.size
                         except: pass
                     if short_pos:
                         try:
                             current_short = await short_client.get_position(short_symbol)
                             if current_short and current_short.size > 0:
-                                close_tasks.append(short_client.close_position(short_symbol))
+                                short_size_to_close = current_short.size
                         except: pass
                 else:
-                    if long_per_split > 0:
-                        close_tasks.append(long_client.close_position_partial(long_symbol, long_per_split))
-                    if short_per_split > 0:
-                        close_tasks.append(short_client.close_position_partial(short_symbol, short_per_split))
+                    long_size_to_close = long_per_split
+                    short_size_to_close = short_per_split
                 
-                if close_tasks:
-                    await asyncio.gather(*close_tasks)
+                # Close LONG first with retries
+                long_closed = False
+                if long_size_to_close > 0:
+                    for attempt in range(3):
+                        try:
+                            if is_last:
+                                await long_client.close_position(long_symbol)
+                            else:
+                                await long_client.close_position_partial(long_symbol, long_size_to_close)
+                            long_closed = True
+                            log_msg(f"✓ LONG closed (split {split_num})")
+                            break
+                        except Exception as e:
+                            log_msg(f"⚠️ LONG close attempt {attempt+1}/3 failed: {e}")
+                            if attempt < 2:
+                                await asyncio.sleep(0.5 * (2 ** attempt))
+                    
+                    if not long_closed:
+                        log_msg(f"❌ LONG close failed after 3 retries. Stopping to prevent volume mismatch.")
+                        results["error"] = "LONG close failed after 3 retries"
+                        return results
+                
+                # Close SHORT with retries
+                short_closed = False
+                if short_size_to_close > 0:
+                    for attempt in range(3):
+                        try:
+                            if is_last:
+                                await short_client.close_position(short_symbol)
+                            else:
+                                await short_client.close_position_partial(short_symbol, short_size_to_close)
+                            short_closed = True
+                            log_msg(f"✓ SHORT closed (split {split_num})")
+                            break
+                        except Exception as e:
+                            log_msg(f"⚠️ SHORT close attempt {attempt+1}/3 failed: {e}")
+                            if attempt < 2:
+                                await asyncio.sleep(0.5 * (2 ** attempt))
+                    
+                    if not short_closed:
+                        # SHORT failed but LONG succeeded - try to reopen LONG to maintain hedge
+                        log_msg(f"❌ SHORT close failed after 3 retries. Attempting to reopen LONG to maintain hedge...")
+                        
+                        try:
+                            # Reopen LONG position with same size
+                            await self._place_order_with_retry(
+                                long_client, long_symbol, Side.LONG, long_size_to_close, long_exchange, max_retries=3
+                            )
+                            log_msg(f"✓ LONG reopened to maintain hedge. Please retry closing later.")
+                            results["error"] = "SHORT close failed, LONG reopened to maintain hedge"
+                        except Exception as reopen_error:
+                            log_msg(f"❌ CRITICAL: SHORT close failed AND LONG reopen failed! Volume mismatch exists. Error: {reopen_error}")
+                            results["error"] = f"CRITICAL: Volume mismatch! SHORT close failed, LONG reopen failed: {reopen_error}"
+                        
+                        return results
                 
                 results["closed_splits"] = split_num
                 
