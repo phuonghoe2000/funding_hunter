@@ -6,13 +6,73 @@ import asyncio
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 import logging
 import json
 import os
+import time
+import subprocess
+import aiohttp
 
 from config.settings import settings
+
+
+def sync_windows_time() -> tuple[bool, str]:
+    """
+    Sync Windows system clock with internet time server.
+    Requires admin privileges to actually update the clock.
+    Returns (success, message).
+    """
+    if os.name != 'nt':
+        return False, "⚠️ Không phải Windows, bỏ qua sync time"
+    
+    try:
+        # Step 1: Start Windows Time service if not running
+        start_result = subprocess.run(
+            ["net", "start", "w32time"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        
+        # Step 2: Configure time server (use pool.ntp.org)
+        subprocess.run(
+            ["w32tm", "/config", "/manualpeerlist:pool.ntp.org", "/syncfromflags:manual", "/update"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        
+        # Step 3: Force resync
+        result = subprocess.run(
+            ["w32tm", "/resync", "/force"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        
+        if result.returncode == 0:
+            return True, "✅ Đã sync time Windows thành công"
+        else:
+            error_msg = result.stderr.strip() or result.stdout.strip()
+            if "0x80070426" in error_msg:
+                return False, "❌ Windows Time service chưa start - cần quyền Admin"
+            elif "access" in error_msg.lower() or "denied" in error_msg.lower():
+                return False, "❌ Cần chạy app với quyền Admin để sync time"
+            else:
+                return False, f"⚠️ Sync time: {error_msg[:50]}"
+                
+    except subprocess.TimeoutExpired:
+        return False, "❌ Timeout khi sync time"
+    except FileNotFoundError:
+        return False, "❌ Không tìm thấy w32tm"
+    except Exception as e:
+        return False, f"❌ Lỗi sync time: {e}"
+
 from config.constants import POPULAR_PAIRS, Side, Exchange, get_exchange_symbol
 from exchanges.okx_client import OKXClient
 from exchanges.binance_client import BinanceClient
@@ -1835,6 +1895,10 @@ class FundingHunterGUI:
     async def _async_connect(self):
         """Async connection"""
         connected = []
+        
+        # Sync Windows time trước khi connect
+        success, msg = sync_windows_time()
+        self._log(msg)
         
         # OKX
         if self.okx_enabled.get():
