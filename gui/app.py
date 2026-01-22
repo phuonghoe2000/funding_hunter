@@ -469,6 +469,23 @@ class MultiExchangeManager:
                 if progress_callback:
                     progress_callback(split_num, splits, f"Closing split {split_num}/{splits}...")
                 
+                # Wait if we're in the restricted time window (minute 59-01)
+                # Some exchanges don't allow orders during funding settlement
+                while True:
+                    now = datetime.now(timezone.utc)
+                    minute = now.minute
+                    if minute >= 59 or minute <= 1:
+                        if is_cancelled():
+                            log_msg(f"🛑 Cancelled while waiting for safe time")
+                            results["cancelled"] = True
+                            if results["closed_splits"] > 0:
+                                results["success"] = True
+                            return results
+                        log_msg(f"⏳ Split {split_num}: Chờ qua phút {minute} (funding settlement)...")
+                        await asyncio.sleep(5)
+                    else:
+                        break
+                
                 # Determine sizes to close for this split
                 long_size_to_close = 0
                 short_size_to_close = 0
@@ -1022,6 +1039,24 @@ class MultiExchangeManager:
                 # Only log opening message for important splits
                 log_msg(f"🔄 Opening split {split_num}/{split_count} (size: {size_per_split})...", force=should_log_this_split)
                 
+                # Wait if we're in the restricted time window (minute 59-01)
+                # Some exchanges don't allow orders during funding settlement
+                while True:
+                    now = datetime.now(timezone.utc)
+                    minute = now.minute
+                    if minute >= 59 or minute <= 1:
+                        if is_cancelled():
+                            log_important(f"🛑 Cancelled while waiting for safe time")
+                            results["cancelled"] = True
+                            results["error"] = "Cancelled by user"
+                            if results["splits_completed"] > 0:
+                                results["success"] = True
+                            return results
+                        log_msg(f"⏳ Split {split_num}: Chờ qua phút {minute} (funding settlement)...", force=should_log_this_split)
+                        await asyncio.sleep(5)  # Check every 5 seconds
+                    else:
+                        break
+                
                 try:
                     # Open both sides simultaneously for this split with timeout
                     long_order, short_order = await asyncio.wait_for(
@@ -1058,6 +1093,17 @@ class MultiExchangeManager:
                 
                 except asyncio.TimeoutError:
                     log_important(f"⚠️ Split {split_num} timeout - retrying once...")
+                    
+                    # Wait if we're in the restricted time window before retry
+                    while True:
+                        now = datetime.now(timezone.utc)
+                        minute = now.minute
+                        if minute >= 59 or minute <= 1:
+                            log_msg(f"⏳ Split {split_num}: Chờ qua phút {minute} (funding settlement)...", force=True)
+                            await asyncio.sleep(5)
+                        else:
+                            break
+                    
                     # Retry once on timeout
                     try:
                         long_order, short_order = await asyncio.wait_for(
