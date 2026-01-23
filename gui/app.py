@@ -1,6 +1,6 @@
 """
 Main GUI Application for Funding Hunter - Multi Exchange Support
-Supports OKX, Binance, and BingX
+Supports OKX, Binance, BingX, and Bybit
 """
 import asyncio
 import threading
@@ -77,6 +77,7 @@ from config.constants import POPULAR_PAIRS, Side, Exchange, get_exchange_symbol
 from exchanges.okx_client import OKXClient
 from exchanges.binance_client import BinanceClient
 from exchanges.bingx_client import BingXClient
+from exchanges.bybit_client import BybitClient
 from exchanges.base import BaseExchangeClient, FundingRate
 
 logger = logging.getLogger(__name__)
@@ -932,6 +933,12 @@ class FundingHunterGUI:
                     "secret": self.bingx_secret.get(),
                     "enabled": self.bingx_enabled.get()
                 },
+                "bybit": {
+                    "api_key": self.bybit_api_key.get(),
+                    "secret": self.bybit_secret.get(),
+                    "testnet": self.bybit_testnet.get(),
+                    "enabled": self.bybit_enabled.get()
+                },
                 "trading": {
                     "leverage": self.leverage_var.get(),
                     "size": self.size_entry.get(),
@@ -985,6 +992,15 @@ class FundingHunterGUI:
                 self.bingx_secret.delete(0, tk.END)
                 self.bingx_secret.insert(0, config["bingx"].get("secret", ""))
                 self.bingx_enabled.set(config["bingx"].get("enabled", False))
+            
+            # Bybit
+            if "bybit" in config:
+                self.bybit_api_key.delete(0, tk.END)
+                self.bybit_api_key.insert(0, config["bybit"].get("api_key", ""))
+                self.bybit_secret.delete(0, tk.END)
+                self.bybit_secret.insert(0, config["bybit"].get("secret", ""))
+                self.bybit_testnet.set(config["bybit"].get("testnet", False))
+                self.bybit_enabled.set(config["bybit"].get("enabled", False))
             
             # Trading settings
             if "trading" in config:
@@ -1085,6 +1101,24 @@ class FundingHunterGUI:
         self.bingx_enabled = tk.BooleanVar(value=False)
         ttk.Checkbutton(bingx_frame, text="Enable", variable=self.bingx_enabled).grid(row=0, column=5, padx=5)
         
+        # Bybit Tab
+        bybit_frame = ttk.Frame(notebook, padding="10")
+        notebook.add(bybit_frame, text="Bybit")
+        
+        ttk.Label(bybit_frame, text="API Key:").grid(row=0, column=0, padx=5, pady=2, sticky='e')
+        self.bybit_api_key = ttk.Entry(bybit_frame, width=40, show="*")
+        self.bybit_api_key.grid(row=0, column=1, padx=5, pady=2)
+        
+        ttk.Label(bybit_frame, text="Secret:").grid(row=0, column=2, padx=5, pady=2, sticky='e')
+        self.bybit_secret = ttk.Entry(bybit_frame, width=40, show="*")
+        self.bybit_secret.grid(row=0, column=3, padx=5, pady=2)
+        
+        self.bybit_testnet = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bybit_frame, text="Testnet", variable=self.bybit_testnet).grid(row=0, column=4, padx=10)
+        
+        self.bybit_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bybit_frame, text="Enable", variable=self.bybit_enabled).grid(row=0, column=5, padx=5)
+        
         # Connection buttons
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=tk.X, pady=10)
@@ -1119,6 +1153,10 @@ class FundingHunterGUI:
         ttk.Label(self.balance_frame, text="BingX:").pack(side=tk.LEFT, padx=2)
         self.bingx_balance_label = ttk.Label(self.balance_frame, text="$0.00")
         self.bingx_balance_label.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(self.balance_frame, text="Bybit:").pack(side=tk.LEFT, padx=2)
+        self.bybit_balance_label = ttk.Label(self.balance_frame, text="$0.00")
+        self.bybit_balance_label.pack(side=tk.LEFT, padx=5)
     
     def _create_trading_frame(self, parent):
         """Create trading panel with scrollbar"""
@@ -1208,7 +1246,7 @@ class FundingHunterGUI:
         ex_frame = ttk.LabelFrame(frame, text="Select Exchanges for Arbitrage", padding="10")
         ex_frame.pack(fill=tk.X, pady=10)
         
-        exchanges = ["OKX", "Binance", "BingX"]
+        exchanges = ["OKX", "Binance", "BingX", "Bybit"]
         
         ttk.Label(ex_frame, text="LONG Exchange:", style='Header.TLabel').grid(row=0, column=0, padx=5, pady=5, sticky='e')
         self.long_exchange = ttk.Combobox(ex_frame, values=exchanges, width=12, state='readonly')
@@ -1265,6 +1303,24 @@ class FundingHunterGUI:
         self.skip_leverage_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(option_frame, text="Skip leverage set (faster entry)", 
                        variable=self.skip_leverage_var).pack(anchor=tk.W)
+        
+        # Scheduled open option
+        schedule_frame = ttk.Frame(option_frame)
+        schedule_frame.pack(fill=tk.X, pady=3)
+        
+        self.scheduled_open_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(schedule_frame, text="Schedule Open at:", 
+                       variable=self.scheduled_open_var).pack(side=tk.LEFT)
+        
+        self.scheduled_time_entry = ttk.Entry(schedule_frame, width=6)
+        self.scheduled_time_entry.insert(0, "15:59")  # Default: 15:59 UTC
+        self.scheduled_time_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Label(schedule_frame, text="(UTC)").pack(side=tk.LEFT)
+        
+        # Check price spread option
+        self.check_price_spread_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(schedule_frame, text="Check Price Spread", 
+                       variable=self.check_price_spread_var).pack(side=tk.LEFT, padx=(15, 0))
         
         # Threshold settings
         threshold_frame = ttk.Frame(option_frame)
@@ -1455,7 +1511,8 @@ class FundingHunterGUI:
         mapping = {
             "OKX": Exchange.OKX,
             "Binance": Exchange.BINANCE,
-            "BingX": Exchange.BINGX
+            "BingX": Exchange.BINGX,
+            "Bybit": Exchange.BYBIT
         }
         return mapping.get(name, Exchange.OKX)
     
@@ -1519,6 +1576,20 @@ class FundingHunterGUI:
                 if await self.manager.connect_exchange(Exchange.BINGX, client):
                     connected.append("BingX")
         
+        # Bybit
+        if self.bybit_enabled.get():
+            bybit_key = self.bybit_api_key.get().strip()
+            bybit_secret = self.bybit_secret.get().strip()
+            
+            if bybit_key and bybit_secret:
+                settings.bybit.api_key = bybit_key
+                settings.bybit.secret_key = bybit_secret
+                settings.bybit.testnet = self.bybit_testnet.get()
+                
+                client = BybitClient(settings.bybit, debug=self.debug_mode.get())
+                if await self.manager.connect_exchange(Exchange.BYBIT, client):
+                    connected.append("Bybit")
+        
         # Get balances
         balances = await self.manager.get_all_balances()
         
@@ -1563,6 +1634,8 @@ class FundingHunterGUI:
             self.binance_balance_label.config(text=f"${balances[Exchange.BINANCE].available:.6f}")
         if Exchange.BINGX in balances:
             self.bingx_balance_label.config(text=f"${balances[Exchange.BINGX].available:.6f}")
+        if Exchange.BYBIT in balances:
+            self.bybit_balance_label.config(text=f"${balances[Exchange.BYBIT].available:.6f}")
         
         # Update exchange dropdowns
         available = connected  # Use exchange names directly from connected list
@@ -1686,8 +1759,8 @@ class FundingHunterGUI:
         if not self.connected:
             return
         
-        # If already waiting, this is a CANCEL action
-        if self.waiting_for_price_spread:
+        # If already waiting (scheduled or price spread), this is a CANCEL action
+        if self.waiting_for_price_spread or getattr(self, 'waiting_for_schedule', False):
             self._cancel_price_spread_wait()
             return
         
@@ -1713,6 +1786,19 @@ class FundingHunterGUI:
             messagebox.showerror("Error", "Invalid size, leverage, split count, or price spread threshold")
             return
         
+        # Parse scheduled time if enabled
+        scheduled_time = None
+        if self.scheduled_open_var.get():
+            try:
+                time_str = self.scheduled_time_entry.get().strip()
+                hour, minute = map(int, time_str.split(":"))
+                if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+                    raise ValueError("Invalid time range")
+                scheduled_time = (hour, minute)
+            except:
+                messagebox.showerror("Error", "Invalid scheduled time format. Use HH:MM (e.g., 15:59)")
+                return
+        
         long_ex = self._get_exchange_enum(long_ex_name)
         short_ex = self._get_exchange_enum(short_ex_name)
         
@@ -1730,21 +1816,103 @@ class FundingHunterGUI:
             "leverage": leverage,
             "price_spread_min": price_spread_min,
             "split_count": split_count,
-            "skip_leverage": self.skip_leverage_var.get()
+            "skip_leverage": self.skip_leverage_var.get(),
+            "scheduled_time": scheduled_time,
+            "check_price_spread": self.check_price_spread_var.get()
         }
         
-        # Start waiting mode
-        self.waiting_for_price_spread = True
-        self.open_btn.configure(text="🛑 Cancel")
-        self._log(f"⏳ Waiting for price spread >= {price_spread_min}% on {pair}...")
-        self._log(f"   Checking every 2 seconds. Click 'Cancel' to stop.")
+        # If scheduled, wait for time first
+        if scheduled_time:
+            self.waiting_for_schedule = True
+            self.open_btn.configure(text="🛑 Cancel")
+            check_spread_msg = " (with price spread check)" if self.check_price_spread_var.get() else " (instant entry)"
+            self._log(f"📅 Scheduled open at {scheduled_time[0]:02d}:{scheduled_time[1]:02d} UTC{check_spread_msg}")
+            self._log(f"   Waiting for scheduled time... Click 'Cancel' to stop.")
+            self._check_scheduled_time()
+        else:
+            # Check if we should check price spread or open immediately
+            if self.check_price_spread_var.get():
+                # Start waiting mode for price spread
+                self.waiting_for_price_spread = True
+                self.open_btn.configure(text="🛑 Cancel")
+                self._log(f"⏳ Waiting for price spread >= {price_spread_min}% on {pair}...")
+                self._log(f"   Checking every 2 seconds. Click 'Cancel' to stop.")
+                self._check_price_spread_and_open()
+            else:
+                # Open immediately without price spread check
+                self._log(f"🚀 Opening position immediately (no price spread check)...")
+                self._execute_open_position()
+    
+    def _check_scheduled_time(self):
+        """Check if scheduled time has been reached"""
+        if not getattr(self, 'waiting_for_schedule', False) or not self.price_spread_params:
+            return
         
-        # Start price spread monitoring loop
-        self._check_price_spread_and_open()
+        scheduled_time = self.price_spread_params.get("scheduled_time")
+        if not scheduled_time:
+            return
+        
+        now = datetime.now(timezone.utc)
+        target_hour, target_minute = scheduled_time
+        
+        # Calculate seconds until target time
+        target_today = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+        
+        # If target time already passed today, schedule for tomorrow
+        if now >= target_today:
+            # Check if we're within 2 seconds of target (time to start!)
+            diff = (now - target_today).total_seconds()
+            if diff <= 2:
+                # Time reached!
+                self.waiting_for_schedule = False
+                
+                # Check if we should check price spread or open immediately
+                if self.price_spread_params.get("check_price_spread", True):
+                    # Start price spread monitoring
+                    self.waiting_for_price_spread = True
+                    price_spread_min = self.price_spread_params["price_spread_min"]
+                    pair = self.price_spread_params["pair"]
+                    self._log(f"⏰ Scheduled time reached! Starting price spread check...")
+                    self._log(f"⏳ Waiting for price spread >= {price_spread_min}% on {pair}...")
+                    self._check_price_spread_and_open()
+                else:
+                    # Open immediately without price spread check
+                    self._log(f"⏰ Scheduled time reached! Opening position immediately...")
+                    self._execute_open_position()
+                return
+            else:
+                # Passed by more than 2 seconds, schedule for tomorrow
+                target_today = target_today + timedelta(days=1)
+        
+        seconds_until = (target_today - now).total_seconds()
+        
+        # Log countdown every 30 seconds, or every second if < 60s
+        if seconds_until <= 60:
+            self._log(f"⏰ {int(seconds_until)}s until {target_hour:02d}:{target_minute:02d} UTC...")
+            check_interval = 1000  # 1 second
+        elif seconds_until <= 300:  # 5 minutes
+            mins = int(seconds_until // 60)
+            secs = int(seconds_until % 60)
+            self._log(f"⏰ {mins}m {secs}s until {target_hour:02d}:{target_minute:02d} UTC...")
+            check_interval = 10000  # 10 seconds
+        else:
+            mins = int(seconds_until // 60)
+            self._log(f"⏰ ~{mins} minutes until {target_hour:02d}:{target_minute:02d} UTC...")
+            check_interval = 30000  # 30 seconds
+        
+        # Schedule next check
+        self.schedule_check_task = self.root.after(check_interval, self._check_scheduled_time)
     
     def _cancel_price_spread_wait(self):
-        """Cancel waiting for price spread and/or running splits"""
+        """Cancel waiting for price spread, scheduled time, and/or running splits"""
         self.waiting_for_price_spread = False
+        self.waiting_for_schedule = False
+        
+        # Cancel scheduled time check task
+        if hasattr(self, 'schedule_check_task') and self.schedule_check_task:
+            self.root.after_cancel(self.schedule_check_task)
+            self.schedule_check_task = None
+        
         if self.price_spread_check_task:
             self.root.after_cancel(self.price_spread_check_task)
             self.price_spread_check_task = None
@@ -1756,7 +1924,90 @@ class FundingHunterGUI:
         
         self.price_spread_params = None
         self.open_btn.configure(text="Open Position", state=tk.NORMAL)
-        self._log("🛑 Cancelled waiting for price spread")
+        self._log("🛑 Cancelled waiting")
+    
+    def _execute_open_position(self):
+        """Execute open position immediately without price spread check"""
+        if not self.price_spread_params:
+            return
+        
+        params = self.price_spread_params
+        
+        # Thread-safe log callback
+        def safe_log(msg):
+            self.root.after(0, lambda m=msg: self._log(m))
+        
+        async def do_open():
+            try:
+                split_count = params.get("split_count", 1)
+                safe_log(f"🚀 Opening: {params['pair']} | Long {params['long_ex_name']} | Short {params['short_ex_name']} | Size: {params['size']} | Splits: {split_count}")
+                
+                # Create cancel event for this split session
+                self.split_cancel_event = threading.Event()
+                
+                # Callback to start monitoring after first split
+                def on_first_split(size_opened):
+                    self.root.after(0, lambda: self._on_first_split_complete(params, size_opened))
+                
+                result = await self.manager.open_hedged_position_split(
+                    params["pair"], 
+                    params["long_ex"], 
+                    params["short_ex"], 
+                    params["size"], 
+                    params["leverage"],
+                    split_count=split_count,
+                    delay_between_splits=2.0,
+                    price_spread_min=params["price_spread_min"],
+                    spread_check_interval=2.0,
+                    max_wait_per_split=3600.0,
+                    log_callback=safe_log,
+                    on_first_split_complete=on_first_split,
+                    skip_leverage_set=params.get("skip_leverage", False),
+                    cancel_event=self.split_cancel_event
+                )
+                
+                # Clear cancel event after done
+                self.split_cancel_event = None
+                
+                return result
+                
+            except Exception as e:
+                safe_log(f"❌ Error: {e}")
+                return {"success": False, "error": str(e)}
+        
+        future = self._run_async(do_open())
+        if future:
+            future.add_done_callback(lambda f: self._on_execute_open_complete(f))
+    
+    def _on_execute_open_complete(self, future):
+        """Handle execute open position result"""
+        def update_ui():
+            try:
+                result = future.result(timeout=0.1)
+                
+                self.open_btn.configure(text="Open Position", state=tk.NORMAL)
+                
+                if result.get("success"):
+                    params = self.price_spread_params
+                    if not params:
+                        return
+                    
+                    splits_completed = result.get("splits_completed", 1)
+                    splits_total = result.get("splits_total", 1)
+                    self._log(f"✅ Position opened successfully! ({splits_completed}/{splits_total} splits completed)")
+                    
+                    # Start monitoring after all splits are done
+                    total_size = result.get("total_long_size", params["size"])
+                    self._on_all_splits_complete(params, total_size)
+                else:
+                    error_msg = result.get("error", "Unknown error")
+                    self._log(f"❌ Failed to open position: {error_msg}")
+                    
+            except Exception as e:
+                self._log(f"❌ Error in callback: {e}")
+                self.open_btn.configure(text="Open Position", state=tk.NORMAL)
+        
+        self.root.after(0, update_ui)
     
     def _check_price_spread_and_open(self):
         """Check price spread and open position if threshold met"""
@@ -2371,7 +2622,7 @@ class FundingHunterGUI:
         self._update_position_display()
         
         # Update exchange selectors
-        exchange_name_map = {Exchange.OKX: "OKX", Exchange.BINANCE: "Binance", Exchange.BINGX: "BingX"}
+        exchange_name_map = {Exchange.OKX: "OKX", Exchange.BINANCE: "Binance", Exchange.BINGX: "BingX", Exchange.BYBIT: "Bybit"}
         self.long_exchange.set(exchange_name_map.get(long_ex, ""))
         self.short_exchange.set(exchange_name_map.get(short_ex, ""))
         
@@ -3002,7 +3253,7 @@ class FundingHunterGUI:
                 short_ex = parts[1].replace("Short ", "").strip().lower()
                 
                 # Map to display names (case-insensitive)
-                name_map = {"okx": "OKX", "binance": "Binance", "bingx": "BingX"}
+                name_map = {"okx": "OKX", "binance": "Binance", "bingx": "BingX", "bybit": "Bybit"}
                 long_display = name_map.get(long_ex, long_ex.upper())
                 short_display = name_map.get(short_ex, short_ex.upper())
                 
@@ -3094,7 +3345,7 @@ class FundingHunterGUI:
             return
         
         # Map display names to Exchange enum
-        exchange_map = {"OKX": Exchange.OKX, "Binance": Exchange.BINANCE, "BingX": Exchange.BINGX}
+        exchange_map = {"OKX": Exchange.OKX, "Binance": Exchange.BINANCE, "BingX": Exchange.BINGX, "Bybit": Exchange.BYBIT}
         long_ex = exchange_map.get(long_display)
         short_ex = exchange_map.get(short_display)
         

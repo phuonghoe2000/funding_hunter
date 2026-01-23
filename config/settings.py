@@ -67,6 +67,27 @@ class BingXConfig:
 
 
 @dataclass
+class BybitConfig:
+    """Bybit API Configuration"""
+    api_key: str = ""
+    secret_key: str = ""
+    # True for testnet, False for mainnet
+    testnet: bool = False
+    
+    @property
+    def base_url(self) -> str:
+        if self.testnet:
+            return "https://api-testnet.bybit.com"
+        return "https://api.bybit.com"
+    
+    @property
+    def ws_url(self) -> str:
+        if self.testnet:
+            return "wss://stream-testnet.bybit.com/v5/private"
+        return "wss://stream.bybit.com/v5/private"
+
+
+@dataclass
 class TradingConfig:
     """Trading parameters"""
     # Default leverage
@@ -98,6 +119,7 @@ class Settings:
         self.okx = OKXConfig()
         self.binance = BinanceConfig()
         self.bingx = BingXConfig()
+        self.bybit = BybitConfig()
         self.trading = TradingConfig()
     
     def load_from_env(self):
@@ -116,6 +138,11 @@ class Settings:
         # BingX
         self.bingx.api_key = os.getenv("BINGX_API_KEY", "")
         self.bingx.secret_key = os.getenv("BINGX_SECRET_KEY", "")
+        
+        # Bybit
+        self.bybit.api_key = os.getenv("BYBIT_API_KEY", "")
+        self.bybit.secret_key = os.getenv("BYBIT_SECRET_KEY", "")
+        self.bybit.testnet = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
         
         # Trading
         self.trading.default_leverage = int(os.getenv("DEFAULT_LEVERAGE", "10"))
