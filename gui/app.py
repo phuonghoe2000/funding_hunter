@@ -1266,6 +1266,7 @@ class FundingHunterGUI:
         self.connected = False
         self.monitoring = False
         self.active_position = None  # Store active position info
+        self.balance_before_open = {}  # Balance of 2 exchanges before opening position
         self._monitor_task = None
         self.cached_funding_rates = {}  # Cache funding rates for quick access
         
@@ -2390,6 +2391,20 @@ class FundingHunterGUI:
                 safe_log(f"✅ Price spread {price_spread_pct:.4f}% >= {current_threshold:.4f}%, and price position is good!")
                 safe_log(f"🚀 Opening: {params['pair']} | Long {params['long_ex_name']} | Short {params['short_ex_name']} | Size: {params['size']} | Splits: {split_count}")
                 
+                # Save balance BEFORE opening for PnL calculation later
+                balance_before = {}
+                for ex in [params["long_ex"], params["short_ex"]]:
+                    client = self.manager.clients.get(ex)
+                    if client:
+                        try:
+                            bal = await client.get_balance()
+                            if bal:
+                                balance_before[ex] = bal.available
+                        except:
+                            pass
+                self.balance_before_open = balance_before
+                safe_log(f"💰 Balance before: Long({params['long_ex'].value}): ${balance_before.get(params['long_ex'], 0):.2f} | Short({params['short_ex'].value}): ${balance_before.get(params['short_ex'], 0):.2f}")
+                
                 # Create cancel event for this split session (use threading.Event for thread-safety)
                 self.split_cancel_event = threading.Event()
                 
@@ -3168,215 +3183,51 @@ class FundingHunterGUI:
         self.root.after(0, update_ui)
     
     def _calculate_and_show_final_pnl(self, closed_position: Dict[str, Any]):
-        """Calculate and display final PnL after closing position (including trading fees)"""
+        """Calculate and display final PnL after closing position
+        
+        Simple logic: PnL = Balance After - Balance Before
+        """
+        long_ex = closed_position.get('long_exchange')
+        short_ex = closed_position.get('short_exchange')
+        pair = closed_position.get('pair', 'Unknown')
         
         async def calculate_pnl():
-            pair = closed_position.get('pair', 'Unknown')
-            long_ex = closed_position.get('long_exchange')
-            short_ex = closed_position.get('short_exchange')
-            open_time = closed_position.get('open_time')
+            # Get current balance (after close)
+            balance_after = {}
+            for ex in [long_ex, short_ex]:
+                client = self.manager.clients.get(ex)
+                if client:
+                    try:
+                        bal = await client.get_balance()
+                        if bal:
+                            balance_after[ex] = bal.available
+                    except:
+                        pass
             
-            if not open_time:
-                return None
+            # Calculate PnL
+            balance_before = getattr(self, 'balance_before_open', {})
             
-            start_time = int(open_time.timestamp() * 1000)
-            # Add 60 seconds buffer after close to capture all closing trades
-            close_time = datetime.now(timezone.utc)
-            end_time = int((close_time.timestamp() + 60) * 1000)
+            long_before = balance_before.get(long_ex, 0)
+            long_after = balance_after.get(long_ex, 0)
+            long_pnl = long_after - long_before
             
-            # Results
-            long_realized = 0.0
-            short_realized = 0.0
-            long_funding = 0.0
-            short_funding = 0.0
-            long_commission = 0.0
-            short_commission = 0.0
+            short_before = balance_before.get(short_ex, 0)
+            short_after = balance_after.get(short_ex, 0)
+            short_pnl = short_after - short_before
             
-            # Helper to check if time is in range
-            def in_time_range(item_time: int) -> bool:
-                return start_time <= item_time <= end_time
-            
-            # Import clients
-            from exchanges.binance_client import BinanceClient
-            from exchanges.okx_client import OKXClient
-            from exchanges.bingx_client import BingXClient
-            
-            # Get PnL from LONG exchange
-            long_client = self.manager.clients.get(long_ex)
-            if long_client:
-                try:
-                    symbol = get_exchange_symbol(pair, long_ex)
-                    
-                    if isinstance(long_client, BinanceClient):
-                        binance_symbol = symbol.replace('/', '')
-                        # Get realized PnL
-                        realized = await long_client.get_income_history("REALIZED_PNL", limit=50, symbol=binance_symbol)
-                        for item in realized:
-                            if in_time_range(item.get('time', 0)):
-                                long_realized += float(item.get('income', 0))
-                        # Get funding fees
-                        funding = await long_client.get_income_history("FUNDING_FEE", limit=100, symbol=binance_symbol)
-                        for item in funding:
-                            if in_time_range(item.get('time', 0)):
-                                long_funding += float(item.get('income', 0))
-                        # Get trading commission (negative value = fee paid)
-                        commission = await long_client.get_income_history("COMMISSION", limit=50, symbol=binance_symbol)
-                        for item in commission:
-                            if in_time_range(item.get('time', 0)):
-                                long_commission += float(item.get('income', 0))
-                    
-                    elif isinstance(long_client, OKXClient):
-                        # Get realized PnL
-                        realized = await long_client.get_income_history(symbol, limit=50, income_type="REALIZED_PNL")
-                        for item in realized:
-                            if in_time_range(item.get('time', 0)):
-                                long_realized += float(item.get('income', 0))
-                        # Get funding fees
-                        funding = await long_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
-                        for item in funding:
-                            if in_time_range(item.get('time', 0)):
-                                long_funding += float(item.get('income', 0))
-                        # Get trading commission
-                        commission = await long_client.get_income_history(symbol, limit=50, income_type="COMMISSION")
-                        for item in commission:
-                            if in_time_range(item.get('time', 0)):
-                                long_commission += float(item.get('income', 0))
-                    
-                    elif isinstance(long_client, BingXClient):
-                        # Get realized PnL
-                        realized = await long_client.get_income_history(symbol, limit=50, income_type="REALIZED_PNL")
-                        for item in realized:
-                            if in_time_range(item.get('time', 0)):
-                                long_realized += float(item.get('income', 0))
-                        # Get funding fees
-                        funding = await long_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
-                        for item in funding:
-                            if in_time_range(item.get('time', 0)):
-                                long_funding += float(item.get('income', 0))
-                        # Get trading commission
-                        commission = await long_client.get_income_history(symbol, limit=50, income_type="COMMISSION")
-                        for item in commission:
-                            if in_time_range(item.get('time', 0)):
-                                long_commission += float(item.get('income', 0))
-                    
-                    elif isinstance(long_client, GateClient):
-                        # Get realized PnL
-                        realized = await long_client.get_income_history(symbol, limit=50, income_type="REALIZED_PNL")
-                        for item in realized:
-                            if in_time_range(item.get('time', 0)):
-                                long_realized += float(item.get('income', 0))
-                        # Get funding fees
-                        funding = await long_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
-                        for item in funding:
-                            if in_time_range(item.get('time', 0)):
-                                long_funding += float(item.get('income', 0))
-                        # Get trading commission
-                        commission = await long_client.get_income_history(symbol, limit=50, income_type="COMMISSION")
-                        for item in commission:
-                            if in_time_range(item.get('time', 0)):
-                                long_commission += float(item.get('income', 0))
-                                
-                except Exception as e:
-                    logger.error(f"Error getting PnL from {long_ex.value}: {e}")
-            
-            # Get PnL from SHORT exchange
-            short_client = self.manager.clients.get(short_ex)
-            if short_client:
-                try:
-                    symbol = get_exchange_symbol(pair, short_ex)
-                    
-                    if isinstance(short_client, BinanceClient):
-                        binance_symbol = symbol.replace('/', '')
-                        # Get realized PnL
-                        realized = await short_client.get_income_history("REALIZED_PNL", limit=50, symbol=binance_symbol)
-                        for item in realized:
-                            if in_time_range(item.get('time', 0)):
-                                short_realized += float(item.get('income', 0))
-                        # Get funding fees
-                        funding = await short_client.get_income_history("FUNDING_FEE", limit=100, symbol=binance_symbol)
-                        for item in funding:
-                            if in_time_range(item.get('time', 0)):
-                                short_funding += float(item.get('income', 0))
-                        # Get trading commission
-                        commission = await short_client.get_income_history("COMMISSION", limit=50, symbol=binance_symbol)
-                        for item in commission:
-                            if in_time_range(item.get('time', 0)):
-                                short_commission += float(item.get('income', 0))
-                    
-                    elif isinstance(short_client, OKXClient):
-                        # Get realized PnL
-                        realized = await short_client.get_income_history(symbol, limit=50, income_type="REALIZED_PNL")
-                        for item in realized:
-                            if in_time_range(item.get('time', 0)):
-                                short_realized += float(item.get('income', 0))
-                        # Get funding fees
-                        funding = await short_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
-                        for item in funding:
-                            if in_time_range(item.get('time', 0)):
-                                short_funding += float(item.get('income', 0))
-                        # Get trading commission
-                        commission = await short_client.get_income_history(symbol, limit=50, income_type="COMMISSION")
-                        for item in commission:
-                            if in_time_range(item.get('time', 0)):
-                                short_commission += float(item.get('income', 0))
-                    
-                    elif isinstance(short_client, BingXClient):
-                        # Get realized PnL
-                        realized = await short_client.get_income_history(symbol, limit=50, income_type="REALIZED_PNL")
-                        for item in realized:
-                            if in_time_range(item.get('time', 0)):
-                                short_realized += float(item.get('income', 0))
-                        # Get funding fees
-                        funding = await short_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
-                        for item in funding:
-                            if in_time_range(item.get('time', 0)):
-                                short_funding += float(item.get('income', 0))
-                        # Get trading commission
-                        commission = await short_client.get_income_history(symbol, limit=50, income_type="COMMISSION")
-                        for item in commission:
-                            if in_time_range(item.get('time', 0)):
-                                short_commission += float(item.get('income', 0))
-                    
-                    elif isinstance(short_client, GateClient):
-                        # Get realized PnL
-                        realized = await short_client.get_income_history(symbol, limit=50, income_type="REALIZED_PNL")
-                        for item in realized:
-                            if in_time_range(item.get('time', 0)):
-                                short_realized += float(item.get('income', 0))
-                        # Get funding fees
-                        funding = await short_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
-                        for item in funding:
-                            if in_time_range(item.get('time', 0)):
-                                short_funding += float(item.get('income', 0))
-                        # Get trading commission
-                        commission = await short_client.get_income_history(symbol, limit=50, income_type="COMMISSION")
-                        for item in commission:
-                            if in_time_range(item.get('time', 0)):
-                                short_commission += float(item.get('income', 0))
-                                
-                except Exception as e:
-                    logger.error(f"Error getting PnL from {short_ex.value}: {e}")
-            
-            total_realized_pnl = long_realized + short_realized
-            total_funding_fees = long_funding + short_funding
-            total_commission = long_commission + short_commission  # Usually negative
+            total_pnl = long_pnl + short_pnl
             
             return {
                 "pair": pair,
-                "long_exchange": long_ex,
-                "short_exchange": short_ex,
-                "long_realized_pnl": long_realized,
-                "short_realized_pnl": short_realized,
-                "long_funding": long_funding,
-                "short_funding": short_funding,
-                "long_commission": long_commission,
-                "short_commission": short_commission,
-                "total_realized_pnl": total_realized_pnl,
-                "total_funding_fees": total_funding_fees,
-                "total_commission": total_commission,
-                "total_pnl": total_realized_pnl + total_funding_fees + total_commission,
-                "open_time": open_time,
-                "close_time": close_time
+                "long_ex": long_ex,
+                "short_ex": short_ex,
+                "long_before": long_before,
+                "long_after": long_after,
+                "long_pnl": long_pnl,
+                "short_before": short_before,
+                "short_after": short_after,
+                "short_pnl": short_pnl,
+                "total_pnl": total_pnl
             }
         
         def on_pnl_calculated(future):
@@ -3384,40 +3235,32 @@ class FundingHunterGUI:
                 try:
                     result = future.result(timeout=10)
                     if result:
-                        self._log("=" * 60)
+                        self._log("=" * 50)
                         self._log(f"FINAL PnL REPORT: {result['pair']}")
-                        self._log("=" * 60)
-                        self._log(f"Duration: {result['open_time'].strftime('%Y-%m-%d %H:%M')} -> {result['close_time'].strftime('%Y-%m-%d %H:%M')} UTC")
-                        self._log("")
+                        self._log("=" * 50)
                         
                         # LONG side
-                        long_subtotal = result['long_realized_pnl'] + result['long_funding'] + result['long_commission']
-                        self._log(f"LONG ({result['long_exchange'].value}):")
-                        self._log(f"   Realized PnL:   ${result['long_realized_pnl']:>12.6f}")
-                        self._log(f"   Funding Fees:   ${result['long_funding']:>12.6f}")
-                        self._log(f"   Trading Fees:   ${result['long_commission']:>12.6f}")
-                        self._log(f"   Subtotal:       ${long_subtotal:>12.6f}")
+                        self._log(f"LONG ({result['long_ex'].value}):")
+                        self._log(f"   Before: ${result['long_before']:.2f}")
+                        self._log(f"   After:  ${result['long_after']:.2f}")
+                        self._log(f"   PnL:    ${result['long_pnl']:+.2f}")
                         self._log("")
                         
                         # SHORT side
-                        short_subtotal = result['short_realized_pnl'] + result['short_funding'] + result['short_commission']
-                        self._log(f"SHORT ({result['short_exchange'].value}):")
-                        self._log(f"   Realized PnL:   ${result['short_realized_pnl']:>12.6f}")
-                        self._log(f"   Funding Fees:   ${result['short_funding']:>12.6f}")
-                        self._log(f"   Trading Fees:   ${result['short_commission']:>12.6f}")
-                        self._log(f"   Subtotal:       ${short_subtotal:>12.6f}")
+                        self._log(f"SHORT ({result['short_ex'].value}):")
+                        self._log(f"   Before: ${result['short_before']:.2f}")
+                        self._log(f"   After:  ${result['short_after']:.2f}")
+                        self._log(f"   PnL:    ${result['short_pnl']:+.2f}")
                         self._log("")
-                        
-                        self._log("-" * 60)
-                        self._log(f"Total Realized PnL:  ${result['total_realized_pnl']:>12.6f}")
-                        self._log(f"Total Funding Fees:  ${result['total_funding_fees']:>12.6f}")
-                        self._log(f"Total Trading Fees:  ${result['total_commission']:>12.6f}")
-                        self._log("-" * 60)
                         
                         total = result['total_pnl']
                         pnl_status = "PROFIT" if total >= 0 else "LOSS"
-                        self._log(f">>> NET PnL: ${total:.6f} ({pnl_status}) <<<")
-                        self._log("=" * 60)
+                        self._log("-" * 50)
+                        self._log(f">>> TOTAL PnL: ${total:+.2f} ({pnl_status}) <<<")
+                        self._log("=" * 50)
+                        
+                        # Clear balance_before for next trade
+                        self.balance_before_open = {}
                     else:
                         self._log("Could not calculate final PnL")
                 except Exception as e:
