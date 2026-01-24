@@ -503,6 +503,8 @@ class MultiExchangeManager:
                 if price_spread_min > -99.0:
                     log_msg(f"⏳ Split {split_num}: Waiting for spread >= {price_spread_min}%...")
                     wait_start = asyncio.get_event_loop().time()
+                    check_count = 0
+                    current_threshold = price_spread_min
                     
                     while True:
                         if is_cancelled():
@@ -513,17 +515,28 @@ class MultiExchangeManager:
                             return results
                             
                         is_ok, spread_pct, long_bid, short_ask = await check_spread_for_close()
+                        # Check against current (possibly reduced) threshold
+                        is_ok = spread_pct >= current_threshold
                         
                         if is_ok:
-                            log_msg(f"✅ Split {split_num}: Spread {spread_pct:.4f}% >= {price_spread_min}% - Closing...")
+                            log_msg(f"✅ Split {split_num}: Spread {spread_pct:.4f}% >= {current_threshold:.4f}% - Closing...")
                             break
+                        
+                        check_count += 1
+                        
+                        # After 30 checks, reduce threshold by 0.01%
+                        if check_count >= 30:
+                            old_threshold = current_threshold
+                            current_threshold -= 0.01
+                            log_msg(f"⚠️ Split {split_num}: 30 lần chưa đạt, giảm threshold: {old_threshold:.4f}% → {current_threshold:.4f}%")
+                            check_count = 0
                         
                         elapsed = asyncio.get_event_loop().time() - wait_start
                         if max_wait_per_split > 0 and elapsed >= max_wait_per_split:
                             log_msg(f"⚠️ Timeout waiting for spread. Proceeding to close.")
                             break
                         
-                        log_msg(f"📊 Close Spread: {spread_pct:.4f}% < {price_spread_min}% | L_BID: ${long_bid:,.4f} | S_ASK: ${short_ask:,.4f}")
+                        log_msg(f"📊 Close Spread: {spread_pct:.4f}% < {current_threshold:.4f}% (check {check_count}/30)")
                         await asyncio.sleep(spread_check_interval)
                 
                 if progress_callback:
@@ -1675,9 +1688,16 @@ class FundingHunterGUI:
         option_frame = ttk.Frame(frame)
         option_frame.pack(fill=tk.X, pady=5)
         
-        self.auto_close_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(option_frame, text="Auto-close other side on liquidation", 
-                       variable=self.auto_close_var).pack(anchor=tk.W)
+        # Auto close on risk threshold
+        risk_frame = ttk.Frame(option_frame)
+        risk_frame.pack(anchor=tk.W)
+        
+        self.auto_close_risk_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(risk_frame, text="Auto-close when Risk >=", 
+                       variable=self.auto_close_risk_var).pack(side=tk.LEFT)
+        self.risk_threshold_var = tk.StringVar(value="10")
+        ttk.Entry(risk_frame, textvariable=self.risk_threshold_var, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(risk_frame, text="%").pack(side=tk.LEFT)
         
         self.auto_close_reversal_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(option_frame, text="Auto-close on funding reversal", 
@@ -1760,7 +1780,7 @@ class FundingHunterGUI:
         self.pos_size_label = ttk.Label(self.position_info, text="Size: -")
         self.pos_size_label.pack(side=tk.LEFT, padx=10)
         
-        self.pos_pnl_label = ttk.Label(self.position_info, text="PnL: $0.00 | Funding: $0.00 | Total: $0.00")
+        self.pos_pnl_label = ttk.Label(self.position_info, text="Risk: 0% | Long: $0 | Short: $0")
         self.pos_pnl_label.pack(side=tk.LEFT, padx=10)
         
         self.pos_status_label = ttk.Label(self.position_info, text="Status: No Position")
@@ -2198,7 +2218,7 @@ class FundingHunterGUI:
                 params["pair"],
                 params["long_ex"],
                 params["short_ex"],
-                duration_seconds=300.0,  # 5 phút
+                duration_seconds=120.0,  # 2 phút
                 check_interval=2.0,      # 2 giây
                 log_callback=safe_log,
                 cancel_event=self.analyze_cancel_event,
@@ -2720,7 +2740,7 @@ class FundingHunterGUI:
                 params["pair"],
                 params["long_exchange"],
                 params["short_exchange"],
-                duration_seconds=300.0,  # 5 phút
+                duration_seconds=120.0,  # 2 phút
                 check_interval=2.0,      # 2 giây
                 log_callback=safe_log,
                 cancel_event=self.close_cancel_event,
@@ -3423,150 +3443,152 @@ class FundingHunterGUI:
             self.root.after(0, lambda: self._log(msg))
         
         async def monitor_loop():
-            last_pnl_update = None  # None = update immediately on first run
-            liquidation_check_count = 0  # Counter for liquidation confirmation
-            liquidation_suspect_exchange = None  # Which exchange is suspected
             safe_log("📊 Monitor loop started...")
+            
+            # Get account balance for risk calculation
+            total_balance = 0.0
+            for ex, client in self.manager.clients.items():
+                try:
+                    balance = await client.get_balance()
+                    if balance:
+                        total_balance += balance.available
+                except:
+                    pass
+            if total_balance <= 0:
+                total_balance = 1000.0  # Fallback to avoid division by zero
+            safe_log(f"📊 Total balance for risk calc: ${total_balance:.2f}")
             
             while self.monitoring and self.active_position:
                 try:
                     pos = self.active_position
-                    # Don't log every check - too spammy
                     result = await self.manager.check_positions(
                         pos['pair'], pos['long_exchange'], pos['short_exchange']
                     )
                     
-                    # Get unrealized PnL from positions
+                    # Get unrealized PnL from each side
                     long_pnl = result['long'].unrealized_pnl if result['long'] else 0
                     short_pnl = result['short'].unrealized_pnl if result['short'] else 0
-                    unrealized_pnl = long_pnl + short_pnl
                     
                     # Update active_position with latest data
-                    pos['unrealized_pnl'] = unrealized_pnl
                     pos['long_pnl'] = long_pnl
                     pos['short_pnl'] = short_pnl
                     
-                    # Get funding fees (every 30 seconds to avoid rate limit)
-                    from datetime import timedelta
-                    now = datetime.now(timezone.utc)
-                    time_since_check = (now - pos.get('last_funding_check', now)).total_seconds()
+                    # Calculate % Risk = |negative PnL| / Balance * 100
+                    # Only count the losing side for risk
+                    losing_pnl = 0.0
+                    if long_pnl < 0:
+                        losing_pnl += abs(long_pnl)
+                    if short_pnl < 0:
+                        losing_pnl += abs(short_pnl)
+                    risk_percent = (losing_pnl / total_balance) * 100
                     
-                    if time_since_check >= 30:  # Check funding fees every 30 seconds
-                        funding_fees = await self._get_funding_fees(pos)
-                        pos['total_funding_fees'] = funding_fees
-                        pos['last_funding_check'] = now
-                    else:
-                        funding_fees = pos.get('total_funding_fees', 0.0)
+                    # Get exchange names
+                    long_ex_name = pos['long_exchange'].value.capitalize()
+                    short_ex_name = pos['short_exchange'].value.capitalize()
                     
-                    # Total PnL = Unrealized PnL + Funding Fees
-                    total_pnl = unrealized_pnl + funding_fees
+                    # Update display: Risk% | Long(Exchange): $X | Short(Exchange): $X
+                    def update_label(risk=risk_percent, lp=long_pnl, sp=short_pnl, le=long_ex_name, se=short_ex_name):
+                        # Color based on which side is losing more
+                        color = 'red' if risk > 5 else ('orange' if risk > 2 else 'green')
+                        self.pos_pnl_label.config(
+                            text=f"Risk: {risk:.2f}% | Long({le}): ${lp:+.2f} | Short({se}): ${sp:+.2f}",
+                            foreground=color
+                        )
+                    self.root.after(0, update_label)
                     
-                    # Update PnL display (first time immediately, then every 10 seconds)
-                    should_update_pnl = (last_pnl_update is None) or ((now - last_pnl_update).total_seconds() >= 10)
-                    if should_update_pnl:
-                        # Only log to console, don't spam GUI log
-                        logger.debug(f"PnL: ${unrealized_pnl:.4f} | Funding: ${funding_fees:.4f} | Total: ${total_pnl:.4f}")
-                        self.root.after(0, lambda u=unrealized_pnl, f=funding_fees, t=total_pnl: 
-                            self.pos_pnl_label.config(
-                                text=f"PnL: ${u:.6f} | Funding: ${f:.6f} | Total: ${t:.6f}",
-                                foreground='green' if t >= 0 else 'red'
-                            ))
-                        last_pnl_update = now
-                    
-                    # Check liquidation with retry logic (3 consecutive checks)
-                    missing_ex = result.get('one_side_missing')
-                    
-                    if missing_ex:
-                        # One side is missing - potential liquidation
-                        if liquidation_suspect_exchange == missing_ex:
-                            # Same exchange missing again
-                            liquidation_check_count += 1
-                            safe_log(f"⚠️ Position missing on {missing_ex.value} (check {liquidation_check_count}/3)...")
-                        else:
-                            # Different exchange or first time
-                            liquidation_suspect_exchange = missing_ex
-                            liquidation_check_count = 1
-                            safe_log(f"⚠️ Position missing on {missing_ex.value} (check 1/3)...")
+                    # Check auto-close on risk threshold
+                    if self.auto_close_risk_var.get():
+                        try:
+                            risk_threshold = float(self.risk_threshold_var.get())
+                        except:
+                            risk_threshold = 10.0
                         
-                        # Wait 2 seconds before next check
-                        await asyncio.sleep(2)
-                        
-                        # After 3 consecutive checks, check order history to determine cause
-                        if liquidation_check_count >= 3:
-                            # Check if user manually closed position
-                            client = self.manager.clients.get(missing_ex)
-                            symbol = get_exchange_symbol(pos['pair'], missing_ex)
-                            was_manual_close = False
+                        if risk_percent >= risk_threshold:
+                            safe_log(f"🚨 Risk {risk_percent:.2f}% >= threshold {risk_threshold}%!")
+                            safe_log(f"🔄 Bắt đầu analyze spread 5 phút trước khi close...")
                             
-                            if client:
-                                try:
-                                    # Get recent orders to check if position was manually closed
-                                    recent_orders = await client.get_recent_orders(symbol, limit=5)
-                                    
-                                    # Check for recent close order (within last 30 seconds)
-                                    import time
-                                    now_ms = int(time.time() * 1000)
-                                    thirty_sec_ago = now_ms - 30000
-                                    
-                                    for order in recent_orders:
-                                        # Get order time (different field names per exchange)
-                                        order_time = int(order.get('time') or order.get('updateTime') or order.get('cTime') or order.get('ts') or 0)
+                            # Analyze spread first
+                            try:
+                                analyze_result = await self.manager.analyze_spread(
+                                    pos['pair'],
+                                    pos['long_exchange'],
+                                    pos['short_exchange'],
+                                    duration_seconds=120.0,  # 2 phút
+                                    check_interval=2.0,
+                                    log_callback=safe_log,
+                                    cancel_event=None,
+                                    mode="close"
+                                )
+                                
+                                if not analyze_result.get("success"):
+                                    safe_log(f"❌ Analyze thất bại: {analyze_result.get('error')}")
+                                    price_spread_threshold = -100.0  # Fallback
+                                else:
+                                    price_spread_threshold = analyze_result["second_best_spread"]
+                                    safe_log(f"✅ Analyze xong! Threshold = {price_spread_threshold:.4f}%")
+                                
+                                # Close with spread check + reduce threshold after 30 failed checks
+                                safe_log(f"🔄 Đang chờ spread >= {price_spread_threshold:.4f}% để close...")
+                                
+                                check_count = 0
+                                current_threshold = price_spread_threshold
+                                
+                                while True:
+                                    # Get current spread for close (LONG_BID - SHORT_ASK)
+                                    try:
+                                        long_client = self.manager.clients.get(pos['long_exchange'])
+                                        short_client = self.manager.clients.get(pos['short_exchange'])
+                                        long_symbol = get_exchange_symbol(pos['pair'], pos['long_exchange'])
+                                        short_symbol = get_exchange_symbol(pos['pair'], pos['short_exchange'])
                                         
-                                        if order_time > thirty_sec_ago:
-                                            # Recent order found - check if it was a close order
-                                            order_status = str(order.get('status') or order.get('state') or '').upper()
-                                            if order_status in ['FILLED', 'filled', 'live']:
-                                                was_manual_close = True
-                                                safe_log(f"📋 Found recent order - position was manually closed")
-                                                break
-                                except Exception as e:
-                                    logger.debug(f"Could not check order history: {e}")
+                                        long_book = await long_client.get_order_book(long_symbol)
+                                        short_book = await short_client.get_order_book(short_symbol)
+                                        
+                                        long_bid = float(long_book['bids'][0][0])
+                                        short_ask = float(short_book['asks'][0][0])
+                                        mid_price = (long_bid + short_ask) / 2
+                                        spread_pct = ((long_bid - short_ask) / mid_price) * 100
+                                        
+                                        if spread_pct >= current_threshold:
+                                            safe_log(f"✅ Spread {spread_pct:.4f}% >= {current_threshold:.4f}% OK! Closing...")
+                                            break
+                                        
+                                        check_count += 1
+                                        
+                                        # After 30 checks, reduce threshold by 0.01%
+                                        if check_count >= 30:
+                                            old_threshold = current_threshold
+                                            current_threshold -= 0.01
+                                            safe_log(f"⚠️ 30 lần chưa đạt, giảm threshold: {old_threshold:.4f}% → {current_threshold:.4f}%")
+                                            check_count = 0
+                                        
+                                        await asyncio.sleep(2)
+                                        
+                                    except Exception as e:
+                                        safe_log(f"⚠️ Spread check error: {e}, retrying...")
+                                        await asyncio.sleep(2)
+                                
+                                # Now close position
+                                close_result = await self.manager.close_hedged_position(
+                                    pos['pair'], pos['long_exchange'], pos['short_exchange']
+                                )
+                                
+                                if close_result.get("success"):
+                                    safe_log(f"✅ Position closed do risk >= {risk_threshold}%")
+                                    self.root.after(0, lambda r=risk_percent: messagebox.showwarning(
+                                        "Risk Auto-Close", 
+                                        f"Position closed!\nRisk was {r:.2f}%"
+                                    ))
+                                else:
+                                    safe_log(f"❌ Auto-close failed: {close_result.get('error')}")
+                                    
+                            except Exception as e:
+                                safe_log(f"❌ Auto-close error: {e}")
                             
-                            if was_manual_close:
-                                # User manually closed - just update state, don't show liquidation warning
-                                safe_log(f"✅ Position on {missing_ex.value} was closed manually")
-                                self.monitoring = False
-                                self.active_position = None
-                                self.root.after(0, self._clear_position_display)
-                                break
-                            else:
-                                # No recent close order - likely liquidation
-                                safe_log(f"🚨 LIQUIDATION CONFIRMED on {missing_ex.value}!")
-                                
-                                if self.auto_close_var.get():
-                                    # Close other side
-                                    other_ex = pos['short_exchange'] if missing_ex == pos['long_exchange'] else pos['long_exchange']
-                                    other_client = self.manager.clients.get(other_ex)
-                                    if other_client:
-                                        other_symbol = get_exchange_symbol(pos['pair'], other_ex)
-                                        try:
-                                            await other_client.close_position(other_symbol)
-                                            safe_log(f"Auto-closed position on {other_ex.value}")
-                                        except:
-                                            pass
-                                
-                                self.root.after(0, lambda ex=missing_ex: messagebox.showwarning(
-                                    "Liquidation", 
-                                    f"Position liquidated on {ex.value}!"
-                                ))
-                                self.monitoring = False
-                                self.active_position = None
-                                self.root.after(0, self._clear_position_display)
-                                
-                                # If auto trading is enabled, it will resume scanning
-                                if self.auto_trading_active:
-                                    safe_log(f"🤖 Auto Trading: Resuming signal scanning after liquidation...")
-                                
-                                break
-                        
-                        # Continue to next iteration (don't sleep again, already waited 2s)
-                        continue
-                    else:
-                        # Both positions exist - reset liquidation counter
-                        if liquidation_check_count > 0:
-                            safe_log(f"✅ Position recovered on {liquidation_suspect_exchange.value}")
-                        liquidation_check_count = 0
-                        liquidation_suspect_exchange = None
+                            self.monitoring = False
+                            self.active_position = None
+                            self.root.after(0, self._clear_position_display)
+                            break
                     
                     # Check funding reversal (if enabled)
                     if self.auto_close_reversal_var.get() and 'initial_net_funding' in pos:
@@ -3588,7 +3610,7 @@ class FundingHunterGUI:
                                     pos['pair'],
                                     pos['long_exchange'],
                                     pos['short_exchange'],
-                                    duration_seconds=300.0,  # 5 phút
+                                    duration_seconds=120.0,  # 2 phút
                                     check_interval=2.0,
                                     log_callback=safe_log,
                                     cancel_event=None,
@@ -3890,7 +3912,7 @@ class FundingHunterGUI:
         self.pos_long_label.config(text="Long: -")
         self.pos_short_label.config(text="Short: -")
         self.pos_size_label.config(text="Size: -")
-        self.pos_pnl_label.config(text="PnL: $0.00 | Funding: $0.00 | Total: $0.00", foreground='black')
+        self.pos_pnl_label.config(text="Risk: 0% | Long: $0 | Short: $0", foreground='black')
         self.pos_status_label.config(text="Status: No Position", foreground='black')
         # Disable monitor button and reset text
         self.monitor_btn.config(text="👁 Start Monitor", state=tk.DISABLED)
