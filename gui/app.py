@@ -712,7 +712,9 @@ class MultiExchangeManager:
                 # Check spread before each split (except first one which was already checked)
                 # Always check spread regardless of threshold being positive or negative
                 if i > 0:
-                    log_msg(f"⏳ Split {split_num}/{split_count}: Waiting for spread threshold ({price_spread_min}%)...")
+                    current_threshold = price_spread_min
+                    spread_check_count = 0
+                    log_msg(f"⏳ Split {split_num}/{split_count}: Waiting for spread threshold ({current_threshold}%)...")
                     wait_start = asyncio.get_event_loop().time()
                     
                     while True:
@@ -726,10 +728,18 @@ class MultiExchangeManager:
                             return results
                         
                         is_ok, spread_pct, long_price, short_price = await check_spread()
+                        spread_check_count += 1
                         
-                        if is_ok:
-                            log_msg(f"✅ Split {split_num}: Spread {spread_pct:.4f}% >= {price_spread_min}% - Opening...")
+                        # Check against current threshold (may have been reduced)
+                        if spread_pct >= current_threshold:
+                            log_msg(f"✅ Split {split_num}: Spread {spread_pct:.4f}% >= {current_threshold}% - Opening...")
                             break
+                        
+                        # Every 30 failed checks, reduce threshold by 0.01%
+                        if spread_check_count % 30 == 0 and spread_check_count > 0:
+                            old_threshold = current_threshold
+                            current_threshold -= 0.01
+                            log_msg(f"📉 Split {split_num}: {spread_check_count} checks failed, reducing threshold: {old_threshold:.4f}% → {current_threshold:.4f}%")
                         
                         # Check timeout
                         elapsed = asyncio.get_event_loop().time() - wait_start
@@ -741,7 +751,7 @@ class MultiExchangeManager:
                                 results["success"] = True
                             return results
                         
-                        log_msg(f"📊 Split {split_num}: Spread {spread_pct:.4f}% < {price_spread_min}% | LONG: ${long_price:,.4f} | SHORT: ${short_price:,.4f} | Waiting...")
+                        log_msg(f"📊 Split {split_num}: Spread {spread_pct:.4f}% < {current_threshold}% | LONG: ${long_price:,.4f} | SHORT: ${short_price:,.4f} | Waiting... ({spread_check_count})")
                         await asyncio.sleep(spread_check_interval)
                 
                 log_msg(f"🔄 Opening split {split_num}/{split_count} (size: {size_per_split})...")
@@ -1748,6 +1758,16 @@ class FundingHunterGUI:
             self.root.after_cancel(self._usdt_update_pending)
             self._usdt_update_pending = None
         
+        # Stop schedule check task
+        if hasattr(self, 'schedule_check_task') and self.schedule_check_task:
+            self.root.after_cancel(self.schedule_check_task)
+            self.schedule_check_task = None
+        
+        # Stop price spread check task
+        if hasattr(self, 'price_spread_check_task') and self.price_spread_check_task:
+            self.root.after_cancel(self.price_spread_check_task)
+            self.price_spread_check_task = None
+        
         # Stop monitoring temporarily
         if self.monitoring:
             self._stop_monitoring()
@@ -1959,7 +1979,7 @@ class FundingHunterGUI:
                     delay_between_splits=2.0,
                     price_spread_min=params["price_spread_min"],
                     spread_check_interval=2.0,
-                    max_wait_per_split=3600.0,
+                    max_wait_per_split=300.0,
                     log_callback=safe_log,
                     on_first_split_complete=on_first_split,
                     skip_leverage_set=params.get("skip_leverage", False),
@@ -2100,7 +2120,7 @@ class FundingHunterGUI:
                     delay_between_splits=2.0,  # Reduced from 13s to 2s for faster execution
                     price_spread_min=params["price_spread_min"],
                     spread_check_interval=2.0,
-                    max_wait_per_split=3600.0,
+                    max_wait_per_split=300.0,
                     log_callback=safe_log,
                     on_first_split_complete=on_first_split,
                     skip_leverage_set=params.get("skip_leverage", False),
