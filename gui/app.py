@@ -414,9 +414,12 @@ class MultiExchangeManager:
             cancel_event: Optional threading.Event to signal cancellation
         """
         def log_msg(msg: str):
-            logger.info(msg)
+            # Only use callback, don't call logger.info directly
+            # because progress_callback -> _log -> logger.info (avoid duplicate)
             if progress_callback:
                 progress_callback(0, 0, msg)
+            else:
+                logger.info(msg)
         
         def is_cancelled() -> bool:
             return cancel_event is not None and cancel_event.is_set()
@@ -778,9 +781,11 @@ class MultiExchangeManager:
                 - error: str nếu có lỗi
         """
         def log_msg(msg: str):
-            logger.info(msg)
+            # Only use callback to avoid duplicate logs
             if log_callback:
                 log_callback(msg)
+            else:
+                logger.info(msg)
         
         def is_cancelled() -> bool:
             return cancel_event is not None and cancel_event.is_set()
@@ -927,15 +932,18 @@ class MultiExchangeManager:
         """
         def log_msg(msg: str, force: bool = False):
             """Log message - use force=True for important messages"""
-            logger.info(msg)
+            # Only use callback to avoid duplicate logs
             if log_callback and force:
                 log_callback(msg)
+            elif not log_callback:
+                logger.info(msg)
         
         def log_important(msg: str):
-            """Always log to both logger and GUI"""
-            logger.info(msg)
+            """Always log to GUI (or logger if no callback)"""
             if log_callback:
                 log_callback(msg)
+            else:
+                logger.info(msg)
         
         def is_cancelled() -> bool:
             """Check if cancellation was requested"""
