@@ -3405,26 +3405,11 @@ class FundingHunterGUI:
                         else:
                             funding_interval_text = f"Every {interval_hours} hours"
                     
-                    # Build display text with order book info
+                    # Build display text - simple, no order book
                     info_text = f"═══ {pair} ═══\n\n"
-                    info_text += f"LONG  ({long_display}):  ${long_price:,.6f} [{long_price_type}]\n"
-                    
-                    # Show top 3 ASKs for LONG if available
-                    if long_order_book and long_order_book.get('asks'):
-                        asks = long_order_book['asks'][:3]
-                        for i, (price, qty) in enumerate(asks):
-                            info_text += f"  ASK{i+1}: ${price:,.6f} x {qty:.4f}\n"
-                    
-                    info_text += f"\nSHORT ({short_display}): ${short_price:,.6f} [{short_price_type}]\n"
-                    
-                    # Show top 3 BIDs for SHORT if available
-                    if short_order_book and short_order_book.get('bids'):
-                        bids = short_order_book['bids'][:3]
-                        for i, (price, qty) in enumerate(bids):
-                            info_text += f"  BID{i+1}: ${price:,.6f} x {qty:.4f}\n"
-                    
-                    info_text += "\n"
-                    
+                    info_text += f"LONG  ({long_display}):  ${long_price:,.6f}\n"
+                    info_text += f"SHORT ({short_display}): ${short_price:,.6f}\n"
+                    info_text += f"\n"
                     info_text += f"─────────────────────────\n"
                     info_text += f"Funding Rate ({long_display}):  {long_rate_str}\n"
                     info_text += f"Funding Rate ({short_display}): {short_rate_str}\n"
