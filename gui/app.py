@@ -560,10 +560,7 @@ class MultiExchangeManager:
         total_size: float,
         leverage: int,
         split_count: int = 1,
-        delay_between_splits: float = 0.5,
-        price_spread_min: float = 0.0,
-        spread_check_interval: float = 2.0,
-        max_wait_per_split: float = 300.0,
+        delay_between_splits: float = 2.0,
         log_callback = None,
         on_first_split_complete = None,
         skip_leverage_set: bool = False,
@@ -571,7 +568,7 @@ class MultiExchangeManager:
     ) -> Dict[str, Any]:
         """
         Open hedged position in multiple splits (DCA style)
-        Checks price spread threshold before each split.
+        Simply opens splits with 2s delay, no spread checking.
         
         Args:
             pair: Trading pair
@@ -580,25 +577,22 @@ class MultiExchangeManager:
             total_size: Total position size
             leverage: Leverage to use
             split_count: Number of splits (1, 3, 5, 10)
-            delay_between_splits: Delay in seconds between each split
-            price_spread_min: Minimum price spread % required before opening each split
-            spread_check_interval: Seconds between spread checks when waiting
-            max_wait_per_split: Maximum seconds to wait for spread per split (0 = unlimited)
+            delay_between_splits: Delay in seconds between each split (default 2s)
             log_callback: Optional callback function for logging to GUI
-            on_first_split_complete: Optional callback called after first split completes (to start monitoring)
+            on_first_split_complete: Optional callback called after first split completes
             skip_leverage_set: Skip setting leverage (use if leverage already set)
-            cancel_event: Optional threading.Event to signal cancellation (thread-safe)
+            cancel_event: Optional threading.Event to signal cancellation
         
         Returns:
             Dict with success status and details
         """
         def log_msg(msg: str):
-            logger.info(msg)
             if log_callback:
                 log_callback(msg)
+            else:
+                logger.info(msg)
         
         def is_cancelled() -> bool:
-            """Check if cancellation was requested"""
             return cancel_event is not None and cancel_event.is_set()
         
         results = {
@@ -625,61 +619,8 @@ class MultiExchangeManager:
         # Calculate size per split
         size_per_split = total_size / split_count
         
-        async def check_spread() -> tuple[bool, float, float, float]:
-            """Check if current spread meets threshold using order book (bid/ask prices).
-            
-            Returns (is_ok, spread_pct, long_ask_price, short_bid_price)
-            
-            Logic: 
-            - LONG (BUY market) will fill at ASK price (sellers)
-            - SHORT (SELL market) will fill at BID price (buyers)
-            - Spread = (SHORT_BID - LONG_ASK) / avg_price * 100
-            - For funding arbitrage, negative spread is OK since we profit from funding fees
-            """
-            try:
-                # Get order books with timeout
-                long_book, short_book = await asyncio.wait_for(
-                    asyncio.gather(
-                        long_client.get_order_book(long_symbol, limit=10),
-                        short_client.get_order_book(short_symbol, limit=10)
-                    ),
-                    timeout=10.0
-                )
-                
-                # Get best ask (lowest sell price) from LONG exchange
-                # This is the price we'll pay when buying (opening LONG)
-                if not long_book.get("asks") or len(long_book["asks"]) == 0:
-                    logger.warning(f"No asks in order book for {long_symbol}")
-                    return (False, 0.0, 0.0, 0.0)
-                long_ask_price = long_book["asks"][0][0]  # Best ask [price, qty]
-                
-                # Get best bid (highest buy price) from SHORT exchange
-                # This is the price we'll receive when selling (opening SHORT)
-                if not short_book.get("bids") or len(short_book["bids"]) == 0:
-                    logger.warning(f"No bids in order book for {short_symbol}")
-                    return (False, 0.0, 0.0, 0.0)
-                short_bid_price = short_book["bids"][0][0]  # Best bid [price, qty]
-                
-                # Calculate spread percentage
-                # Positive = profitable on entry, Negative = loss on entry (but OK for funding arb)
-                price_diff = short_bid_price - long_ask_price
-                avg_price = (long_ask_price + short_bid_price) / 2
-                spread_pct = (price_diff / avg_price) * 100
-                
-                # For funding arbitrage, we allow negative spread
-                # User sets price_spread_min to control minimum acceptable spread
-                # If price_spread_min = -0.1, allows up to -0.1% spread
-                return (spread_pct >= price_spread_min, spread_pct, long_ask_price, short_bid_price)
-                
-            except asyncio.TimeoutError:
-                logger.warning("Timeout checking spread")
-                return (False, 0.0, 0.0, 0.0)
-            except Exception as e:
-                logger.error(f"Error checking spread: {e}")
-                return (False, 0.0, 0.0, 0.0)
-        
         try:
-            # Set leverage first (skip if already set to save time)
+            # Set leverage first (skip if already set)
             if not skip_leverage_set:
                 log_msg(f"Setting leverage to {leverage}x on both exchanges...")
                 try:
@@ -693,11 +634,11 @@ class MultiExchangeManager:
                 except asyncio.TimeoutError:
                     log_msg("⚠️ Timeout setting leverage, continuing anyway...")
             
-            # Open positions in splits
+            # Open positions in splits - simple loop with 2s delay
             for i in range(split_count):
                 split_num = i + 1
                 
-                # Check for cancellation before each split
+                # Check for cancellation
                 if is_cancelled():
                     log_msg(f"🛑 Cancelled before split {split_num}/{split_count}")
                     results["cancelled"] = True
@@ -706,58 +647,10 @@ class MultiExchangeManager:
                         results["success"] = True
                     return results
                 
-                # Yield to event loop briefly to keep GUI responsive
-                await asyncio.sleep(0.01)
-                
-                # Check spread before each split (except first one which was already checked)
-                # Always check spread regardless of threshold being positive or negative
-                if i > 0:
-                    current_threshold = price_spread_min
-                    spread_check_count = 0
-                    log_msg(f"⏳ Split {split_num}/{split_count}: Waiting for spread threshold ({current_threshold}%)...")
-                    wait_start = asyncio.get_event_loop().time()
-                    
-                    while True:
-                        # Check for cancellation while waiting for spread
-                        if is_cancelled():
-                            log_msg(f"🛑 Cancelled while waiting for spread (split {split_num}/{split_count})")
-                            results["cancelled"] = True
-                            results["error"] = "Cancelled by user"
-                            if results["splits_completed"] > 0:
-                                results["success"] = True
-                            return results
-                        
-                        is_ok, spread_pct, long_price, short_price = await check_spread()
-                        spread_check_count += 1
-                        
-                        # Check against current threshold (may have been reduced)
-                        if spread_pct >= current_threshold:
-                            log_msg(f"✅ Split {split_num}: Spread {spread_pct:.4f}% >= {current_threshold}% - Opening...")
-                            break
-                        
-                        # Every 30 failed checks, reduce threshold by 0.01%
-                        if spread_check_count % 30 == 0 and spread_check_count > 0:
-                            old_threshold = current_threshold
-                            current_threshold -= 0.01
-                            log_msg(f"📉 Split {split_num}: {spread_check_count} checks failed, reducing threshold: {old_threshold:.4f}% → {current_threshold:.4f}%")
-                        
-                        # Check timeout
-                        elapsed = asyncio.get_event_loop().time() - wait_start
-                        if max_wait_per_split > 0 and elapsed >= max_wait_per_split:
-                            log_msg(f"⚠️ Split {split_num}: Timeout waiting for spread ({elapsed:.0f}s). Skipping remaining splits.")
-                            results["error"] = f"Timeout waiting for spread at split {split_num}"
-                            # Return with whatever splits we completed
-                            if results["splits_completed"] > 0:
-                                results["success"] = True
-                            return results
-                        
-                        log_msg(f"📊 Split {split_num}: Spread {spread_pct:.4f}% < {current_threshold}% | LONG: ${long_price:,.4f} | SHORT: ${short_price:,.4f} | Waiting... ({spread_check_count})")
-                        await asyncio.sleep(spread_check_interval)
-                
                 log_msg(f"🔄 Opening split {split_num}/{split_count} (size: {size_per_split})...")
                 
                 try:
-                    # Open both sides simultaneously for this split with timeout
+                    # Open both sides simultaneously
                     long_order, short_order = await asyncio.wait_for(
                         asyncio.gather(
                             long_client.place_market_order(long_symbol, Side.LONG, size_per_split),
@@ -778,7 +671,7 @@ class MultiExchangeManager:
                     
                     log_msg(f"✓ Split {split_num}/{split_count} completed")
                     
-                    # Call callback after first split to start monitoring
+                    # Callback after first split
                     if split_num == 1 and on_first_split_complete:
                         try:
                             on_first_split_complete(size_per_split)
@@ -792,7 +685,6 @@ class MultiExchangeManager:
                 
                 except asyncio.TimeoutError:
                     log_msg(f"⚠️ Split {split_num} timeout - retrying once...")
-                    # Retry once on timeout
                     try:
                         long_order, short_order = await asyncio.wait_for(
                             asyncio.gather(
@@ -836,9 +728,8 @@ class MultiExchangeManager:
                         "success": False,
                         "error": str(e)
                     })
-                    # Continue with remaining splits even if one fails
             
-            # Consider success if at least one split completed
+            # Success if at least one split completed
             if results["splits_completed"] > 0:
                 results["success"] = True
                 log_msg(f"✅ Completed {results['splits_completed']}/{split_count} splits")
@@ -849,7 +740,6 @@ class MultiExchangeManager:
             results["error"] = str(e)
             logger.error(f"❌ Failed to open hedged position: {e}")
         
-        logger.debug(f"open_hedged_position_split: EXIT with success={results.get('success')}")
         return results
 
 
@@ -1977,9 +1867,6 @@ class FundingHunterGUI:
                     params["leverage"],
                     split_count=split_count,
                     delay_between_splits=2.0,
-                    price_spread_min=params["price_spread_min"],
-                    spread_check_interval=2.0,
-                    max_wait_per_split=300.0,
                     log_callback=safe_log,
                     on_first_split_complete=on_first_split,
                     skip_leverage_set=params.get("skip_leverage", False),
@@ -2117,10 +2004,7 @@ class FundingHunterGUI:
                     params["size"], 
                     params["leverage"],
                     split_count=split_count,
-                    delay_between_splits=2.0,  # Reduced from 13s to 2s for faster execution
-                    price_spread_min=params["price_spread_min"],
-                    spread_check_interval=2.0,
-                    max_wait_per_split=300.0,
+                    delay_between_splits=2.0,
                     log_callback=safe_log,
                     on_first_split_complete=on_first_split,
                     skip_leverage_set=params.get("skip_leverage", False),
@@ -3437,15 +3321,6 @@ class FundingHunterGUI:
                         short_price = short_data.get('price', 0)
                         short_price_type = "Mark"
                     
-                    # Calculate price spread (BID - ASK)
-                    # Positive = profitable (sell high at BID, buy low at ASK)
-                    # Negative = losing (buy high, sell low)
-                    price_diff = short_price - long_price
-                    price_spread_pct = (price_diff / long_price * 100) if long_price > 0 else 0
-                    
-                    # Determine if spread is good for entry
-                    is_good_entry = price_diff > 0
-                    
                     # Get funding rates to determine next funding time from API
                     from datetime import datetime, timezone, timedelta
                     now = datetime.now(timezone.utc)
@@ -3550,15 +3425,6 @@ class FundingHunterGUI:
                             info_text += f"  BID{i+1}: ${price:,.6f} x {qty:.4f}\n"
                     
                     info_text += "\n"
-                    
-                    # Display spread with sign (positive = good, negative = bad)
-                    spread_sign = "+" if price_diff >= 0 else ""
-                    info_text += f"Real Spread (OI): {spread_sign}${price_diff:,.6f} ({spread_sign}{price_spread_pct:.3f}%)\n"
-                    
-                    if is_good_entry:
-                        info_text += f"Entry Signal: ✅ BID > ASK (Profitable!)\n"
-                    else:
-                        info_text += f"Entry Signal: ❌ BID < ASK (Would Lose!)\n"
                     
                     info_text += f"─────────────────────────\n"
                     info_text += f"Funding Rate ({long_display}):  {long_rate_str}\n"
