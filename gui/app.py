@@ -417,9 +417,6 @@ class MultiExchangeManager:
                 split_num = i + 1
                 is_last = (split_num == splits)
                 
-                if progress_callback:
-                    progress_callback(split_num, splits, f"Closing split {split_num}/{splits}...")
-                
                 close_tasks = []
                 
                 # For last split, close remaining position entirely
@@ -449,11 +446,17 @@ class MultiExchangeManager:
                 
                 results["closed_splits"] = split_num
                 
+                # Log progress
+                if progress_callback:
+                    progress_callback(split_num, splits, f"✓ Split {split_num}/{splits} done")
+                
                 # Wait before next split (except for last one)
                 if not is_last:
                     await asyncio.sleep(interval_seconds)
             
             results["success"] = True
+            if progress_callback:
+                progress_callback(splits, splits, f"✅ Close done: {splits}/{splits} splits")
             
         except Exception as e:
             results["error"] = str(e)
@@ -622,7 +625,7 @@ class MultiExchangeManager:
         try:
             # Set leverage first (skip if already set)
             if not skip_leverage_set:
-                log_msg(f"Setting leverage to {leverage}x on both exchanges...")
+                log_msg(f"Setting leverage {leverage}x...")
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(
@@ -632,7 +635,7 @@ class MultiExchangeManager:
                         timeout=15.0
                     )
                 except asyncio.TimeoutError:
-                    log_msg("⚠️ Timeout setting leverage, continuing anyway...")
+                    pass  # Continue anyway
             
             # Open positions in splits - simple loop with 2s delay
             for i in range(split_count):
@@ -640,14 +643,12 @@ class MultiExchangeManager:
                 
                 # Check for cancellation
                 if is_cancelled():
-                    log_msg(f"🛑 Cancelled before split {split_num}/{split_count}")
+                    log_msg(f"🛑 Cancelled at split {split_num}/{split_count}")
                     results["cancelled"] = True
                     results["error"] = "Cancelled by user"
                     if results["splits_completed"] > 0:
                         results["success"] = True
                     return results
-                
-                log_msg(f"🔄 Opening split {split_num}/{split_count} (size: {size_per_split})...")
                 
                 try:
                     # Open both sides simultaneously
@@ -669,7 +670,7 @@ class MultiExchangeManager:
                         "short_order": short_order.order_id if short_order else None
                     })
                     
-                    log_msg(f"✓ Split {split_num}/{split_count} completed")
+                    log_msg(f"✓ Split {split_num}/{split_count} done")
                     
                     # Callback after first split
                     if split_num == 1 and on_first_split_complete:
@@ -680,11 +681,10 @@ class MultiExchangeManager:
                     
                     # Delay between splits (except for last one)
                     if i < split_count - 1:
-                        log_msg(f"⏳ Waiting {delay_between_splits}s before next split...")
                         await asyncio.sleep(delay_between_splits)
                 
                 except asyncio.TimeoutError:
-                    log_msg(f"⚠️ Split {split_num} timeout - retrying once...")
+                    # Retry once on timeout
                     try:
                         long_order, short_order = await asyncio.wait_for(
                             asyncio.gather(
@@ -702,7 +702,7 @@ class MultiExchangeManager:
                             "long_order": long_order.order_id if long_order else None,
                             "short_order": short_order.order_id if short_order else None
                         })
-                        log_msg(f"✓ Split {split_num}/{split_count} completed (retry)")
+                        log_msg(f"✓ Split {split_num}/{split_count} done (retry)")
                         
                         if split_num == 1 and on_first_split_complete:
                             try:
@@ -713,7 +713,7 @@ class MultiExchangeManager:
                         if i < split_count - 1:
                             await asyncio.sleep(delay_between_splits)
                     except Exception as retry_e:
-                        logger.error(f"✗ Split {split_num} failed on retry: {retry_e}")
+                        log_msg(f"❌ Split {split_num} failed: {retry_e}")
                         results["split_results"].append({
                             "split": split_num,
                             "success": False,
@@ -721,7 +721,6 @@ class MultiExchangeManager:
                         })
                         
                 except Exception as e:
-                    logger.error(f"✗ Split {split_num} failed: {e}")
                     log_msg(f"❌ Split {split_num} failed: {e}")
                     results["split_results"].append({
                         "split": split_num,
@@ -732,7 +731,7 @@ class MultiExchangeManager:
             # Success if at least one split completed
             if results["splits_completed"] > 0:
                 results["success"] = True
-                log_msg(f"✅ Completed {results['splits_completed']}/{split_count} splits")
+                log_msg(f"✅ Open done: {results['splits_completed']}/{split_count} splits")
             else:
                 results["error"] = "All splits failed"
                 
