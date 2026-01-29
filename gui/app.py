@@ -491,6 +491,9 @@ class MultiExchangeManager:
             long_per_split = long_total / splits if long_total > 0 else 0
             short_per_split = short_total / splits if short_total > 0 else 0
             
+            # Track current threshold outside loop so it persists across splits
+            current_threshold = price_spread_min
+            
             for i in range(splits):
                 split_num = i + 1
                 is_last = (split_num == splits)
@@ -504,10 +507,9 @@ class MultiExchangeManager:
                 
                 # Check spread if threshold set
                 if price_spread_min > -99.0:
-                    log_msg(f"⏳ Split {split_num}: Waiting for spread >= {price_spread_min}%...")
+                    log_msg(f"⏳ Split {split_num}: Waiting for spread >= {current_threshold:.4f}%...")
                     wait_start = asyncio.get_event_loop().time()
                     check_count = 0
-                    current_threshold = price_spread_min
                     
                     while True:
                         if is_cancelled():
