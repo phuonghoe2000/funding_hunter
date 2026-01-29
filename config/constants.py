@@ -137,6 +137,123 @@ def get_exchange_symbol(pair: str, exchange: Exchange) -> str:
         return f"{base}{quote}"
 
 
+# Trading fees for each exchange (in percentage)
+# Taker fee is used for market orders (which we use)
+# These are default fees - VIP levels may have lower fees
+EXCHANGE_FEES = {
+    Exchange.OKX: {
+        "maker": 0.02,      # 0.02%
+        "taker": 0.05,      # 0.05%
+    },
+    Exchange.BINANCE: {
+        "maker": 0.02,      # 0.02%
+        "taker": 0.04,      # 0.04% (with BNB discount)
+    },
+    Exchange.BINGX: {
+        "maker": 0.02,      # 0.02%
+        "taker": 0.05,      # 0.05%
+    },
+    Exchange.GATE: {
+        "maker": 0.015,     # 0.015%
+        "taker": 0.05,      # 0.05%
+    },
+}
+
+
+def get_exchange_fee(exchange: Exchange, order_type: str = "taker") -> float:
+    """Get trading fee for an exchange
+    
+    Args:
+        exchange: The exchange
+        order_type: "maker" or "taker" (default "taker" for market orders)
+    
+    Returns:
+        Fee as percentage (e.g., 0.05 for 0.05%)
+    """
+    if exchange in EXCHANGE_FEES:
+        return EXCHANGE_FEES[exchange].get(order_type, 0.05)
+    return 0.05  # Default to 0.05% if unknown
+
+
+def calculate_break_even(
+    long_exchange: Exchange,
+    short_exchange: Exchange,
+    position_size_usd: float,
+    funding_rate_pct: float,
+    leverage: int = 10,
+    slippage_pct: float = 0.02
+) -> dict:
+    """Calculate break-even and expected profit for a funding arbitrage trade
+    
+    Args:
+        long_exchange: Exchange for LONG position
+        short_exchange: Exchange for SHORT position
+        position_size_usd: Position size in USD (notional value)
+        funding_rate_pct: Net funding rate in % (positive = we receive)
+        leverage: Leverage used
+        slippage_pct: Estimated slippage per side (default 0.02%)
+    
+    Returns:
+        Dict with:
+        - total_fees_pct: Total fees as % of position
+        - total_fees_usd: Total fees in USD
+        - funding_income_usd: Expected funding income per 8h
+        - net_profit_usd: Net profit after fees (per 8h)
+        - break_even_rate: Minimum funding rate needed to break even
+        - is_profitable: True if trade is profitable
+        - hours_to_break_even: Hours needed to recover fees
+    """
+    # Get fees for each exchange (taker for market orders)
+    long_fee = get_exchange_fee(long_exchange, "taker")
+    short_fee = get_exchange_fee(short_exchange, "taker")
+    
+    # Total fees = (open + close) * 2 sides
+    # Open: 1 long + 1 short
+    # Close: 1 long + 1 short
+    total_fee_pct = (long_fee + short_fee) * 2  # Open and close
+    
+    # Add slippage estimate (both sides, open and close)
+    total_slippage_pct = slippage_pct * 4  # 4 trades total
+    
+    # Total cost
+    total_cost_pct = total_fee_pct + total_slippage_pct
+    total_cost_usd = position_size_usd * (total_cost_pct / 100)
+    
+    # Funding income per 8h period
+    funding_income_usd = position_size_usd * (abs(funding_rate_pct) / 100)
+    
+    # Net profit per 8h
+    # Note: We subtract fees from the first funding period
+    net_profit_per_8h = funding_income_usd
+    net_profit_first_period = funding_income_usd - total_cost_usd
+    
+    # Break-even funding rate (to cover fees in 1 period)
+    break_even_rate = total_cost_pct
+    
+    # Hours to break even
+    if funding_income_usd > 0:
+        periods_to_break_even = total_cost_usd / funding_income_usd
+        hours_to_break_even = periods_to_break_even * 8
+    else:
+        hours_to_break_even = float('inf')
+    
+    return {
+        "long_fee_pct": long_fee,
+        "short_fee_pct": short_fee,
+        "total_fees_pct": total_fee_pct,
+        "total_slippage_pct": total_slippage_pct,
+        "total_cost_pct": total_cost_pct,
+        "total_cost_usd": total_cost_usd,
+        "funding_rate_pct": funding_rate_pct,
+        "funding_income_usd": funding_income_usd,
+        "net_profit_first_period": net_profit_first_period,
+        "net_profit_per_8h": net_profit_per_8h,
+        "break_even_rate": break_even_rate,
+        "is_profitable": net_profit_first_period > 0,
+        "hours_to_break_even": hours_to_break_even,
+    }
+
+
 def get_unified_pair(symbol: str, exchange: Exchange) -> str:
     """Get unified pair from exchange-specific symbol"""
     for pair, symbols in SYMBOL_MAP.items():

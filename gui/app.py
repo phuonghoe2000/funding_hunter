@@ -73,7 +73,7 @@ def sync_windows_time() -> tuple[bool, str]:
     except Exception as e:
         return False, f"❌ Lỗi sync time: {e}"
 
-from config.constants import POPULAR_PAIRS, Side, Exchange, get_exchange_symbol
+from config.constants import POPULAR_PAIRS, Side, Exchange, get_exchange_symbol, calculate_break_even
 from exchanges.okx_client import OKXClient
 from exchanges.binance_client import BinanceClient
 from exchanges.bingx_client import BingXClient
@@ -2185,6 +2185,39 @@ class FundingHunterGUI:
         long_ex = self._get_exchange_enum(long_ex_name)
         short_ex = self._get_exchange_enum(short_ex_name)
         
+        # Quick profitability check using current funding rates (if available in cache)
+        # This is a non-blocking check to warn user before starting analyze
+        try:
+            be_result = calculate_break_even(
+                long_exchange=long_ex,
+                short_exchange=short_ex,
+                position_size_usd=size,
+                funding_rate_pct=0.01,  # Assume minimum 0.01% for warning
+                leverage=leverage,
+                slippage_pct=0.02
+            )
+            min_funding_needed = be_result['break_even_rate']
+            
+            # Show warning with fee info
+            confirm_msg = (
+                f"Open {pair}?\n\n"
+                f"Size: ${size} | Leverage: {leverage}x | Splits: {split_count}\n"
+                f"LONG: {long_ex_name} | SHORT: {short_ex_name}\n\n"
+                f"--- FEE ESTIMATE ---\n"
+                f"Total fees + slippage: ~{be_result['total_cost_pct']:.3f}%\n"
+                f"Est. cost: ~${be_result['total_cost_usd']:.2f}\n"
+                f"Min funding needed: {min_funding_needed:.3f}%\n\n"
+                f"Proceed with 2-min spread analysis?"
+            )
+            
+            if not messagebox.askyesno("Confirm Open Position", confirm_msg):
+                return
+        except Exception as e:
+            logger.warning(f"Could not calculate break-even: {e}")
+            # Fallback to simple confirm
+            if not messagebox.askyesno("Confirm", f"Open {pair}?\nSize: ${size}, Leverage: {leverage}x, Splits: {split_count}"):
+                return
+        
         # STOP ALL BACKGROUND TASKS before opening position
         self._stop_all_background_tasks()
         
@@ -4262,6 +4295,47 @@ class FundingHunterGUI:
                     info_text += f"Funding Rate ({long_display}):  {long_rate_str}\n"
                     info_text += f"Funding Rate ({short_display}): {short_rate_str}\n"
                     info_text += f"Net Funding (SHORT-LONG): {net_funding_str}\n"
+                    
+                    # Break-even calculation
+                    info_text += f"─────────────────────────\n"
+                    info_text += f"BREAK-EVEN ANALYSIS:\n"
+                    
+                    # Get position size from UI (or use default)
+                    try:
+                        position_size = float(self.size_var.get())
+                    except:
+                        position_size = 100.0  # Default
+                    
+                    # Calculate break-even if we have funding rates
+                    if long_funding and short_funding:
+                        net_funding_rate = (short_funding.funding_rate - long_funding.funding_rate) * 100
+                        
+                        be_result = calculate_break_even(
+                            long_exchange=long_ex,
+                            short_exchange=short_ex,
+                            position_size_usd=position_size,
+                            funding_rate_pct=net_funding_rate,
+                            leverage=10,
+                            slippage_pct=0.02
+                        )
+                        
+                        # Display fees
+                        info_text += f"  Fees: {be_result['total_fees_pct']:.3f}% (${be_result['total_cost_usd']:.2f})\n"
+                        info_text += f"  Slippage est: {be_result['total_slippage_pct']:.3f}%\n"
+                        info_text += f"  Total cost: {be_result['total_cost_pct']:.3f}%\n"
+                        info_text += f"  Funding/8h: ${be_result['funding_income_usd']:.2f}\n"
+                        
+                        # Profit/Loss indicator
+                        if be_result['is_profitable']:
+                            profit_str = f"  Net 1st period: +${be_result['net_profit_first_period']:.2f} PROFIT\n"
+                            info_text += profit_str
+                        else:
+                            loss = abs(be_result['net_profit_first_period'])
+                            info_text += f"  Net 1st period: -${loss:.2f} LOSS\n"
+                            info_text += f"  Break-even: {be_result['hours_to_break_even']:.1f}h\n"
+                    else:
+                        info_text += f"  (Need funding rates to calculate)\n"
+                    
                     info_text += f"─────────────────────────\n"
                     info_text += f"Next Funding: {time_str}\n"
                     info_text += f"Entry Timing: {entry_status}\n"
