@@ -720,6 +720,48 @@ class MultiExchangeManager:
                             "error": str(retry_e)
                         })
                         
+                        # === REROLL ON FAILURE THEN STOP ===
+                        long_pos = await long_client.get_position(long_symbol)
+                        short_pos = await short_client.get_position(short_symbol)
+                        
+                        long_actual = long_pos.size if long_pos else 0
+                        short_actual = short_pos.size if short_pos else 0
+                        size_diff = abs(long_actual - short_actual)
+                        
+                        if size_diff > 0.0001:
+                            for reroll_attempt in range(1, 4):
+                                diff = long_actual - short_actual
+                                log_msg(f"⚠️ Mismatch: Long={long_actual:.6f}, Short={short_actual:.6f}. Reroll #{reroll_attempt}")
+                                
+                                try:
+                                    if diff > 0:
+                                        await short_client.place_market_order(short_symbol, Side.SHORT, abs(diff))
+                                    else:
+                                        await long_client.place_market_order(long_symbol, Side.LONG, abs(diff))
+                                    
+                                    await asyncio.sleep(1)
+                                    
+                                    long_pos = await long_client.get_position(long_symbol)
+                                    short_pos = await short_client.get_position(short_symbol)
+                                    long_actual = long_pos.size if long_pos else 0
+                                    short_actual = short_pos.size if short_pos else 0
+                                    size_diff = abs(long_actual - short_actual)
+                                    
+                                    if size_diff <= 0.0001:
+                                        log_msg(f"✓ Reroll thành công sau {reroll_attempt} lần")
+                                        break
+                                except Exception as reroll_e:
+                                    log_msg(f"❌ Reroll #{reroll_attempt} failed: {reroll_e}")
+                            
+                            if size_diff > 0.0001:
+                                log_msg(f"❌ Reroll failed. Long={long_actual:.6f}, Short={short_actual:.6f}")
+                        
+                        # STOP sau khi reroll (dù thành công hay thất bại)
+                        results["error"] = "Split failed - stopped after reroll"
+                        results["success"] = results["splits_completed"] > 0
+                        break
+                        # === END REROLL ===
+                        
                 except Exception as e:
                     log_msg(f"❌ Split {split_num} failed: {e}")
                     results["split_results"].append({
@@ -727,6 +769,48 @@ class MultiExchangeManager:
                         "success": False,
                         "error": str(e)
                     })
+                    
+                    # === REROLL ON FAILURE THEN STOP ===
+                    long_pos = await long_client.get_position(long_symbol)
+                    short_pos = await short_client.get_position(short_symbol)
+                    
+                    long_actual = long_pos.size if long_pos else 0
+                    short_actual = short_pos.size if short_pos else 0
+                    size_diff = abs(long_actual - short_actual)
+                    
+                    if size_diff > 0.0001:
+                        for reroll_attempt in range(1, 4):
+                            diff = long_actual - short_actual
+                            log_msg(f"⚠️ Mismatch: Long={long_actual:.6f}, Short={short_actual:.6f}. Reroll #{reroll_attempt}")
+                            
+                            try:
+                                if diff > 0:
+                                    await short_client.place_market_order(short_symbol, Side.SHORT, abs(diff))
+                                else:
+                                    await long_client.place_market_order(long_symbol, Side.LONG, abs(diff))
+                                
+                                await asyncio.sleep(1)
+                                
+                                long_pos = await long_client.get_position(long_symbol)
+                                short_pos = await short_client.get_position(short_symbol)
+                                long_actual = long_pos.size if long_pos else 0
+                                short_actual = short_pos.size if short_pos else 0
+                                size_diff = abs(long_actual - short_actual)
+                                
+                                if size_diff <= 0.0001:
+                                    log_msg(f"✓ Reroll thành công sau {reroll_attempt} lần")
+                                    break
+                            except Exception as reroll_e:
+                                log_msg(f"❌ Reroll #{reroll_attempt} failed: {reroll_e}")
+                        
+                        if size_diff > 0.0001:
+                            log_msg(f"❌ Reroll failed. Long={long_actual:.6f}, Short={short_actual:.6f}")
+                    
+                    # STOP sau khi reroll (dù thành công hay thất bại)
+                    results["error"] = "Split failed - stopped after reroll"
+                    results["success"] = results["splits_completed"] > 0
+                    break
+                    # === END REROLL ===
             
             # Success if at least one split completed
             if results["splits_completed"] > 0:
@@ -1216,8 +1300,8 @@ class FundingHunterGUI:
         self.scheduled_time_entry.pack(side=tk.LEFT, padx=5)
         ttk.Label(schedule_frame, text="(UTC)").pack(side=tk.LEFT)
         
-        # Check price spread option
-        self.check_price_spread_var = tk.BooleanVar(value=True)
+        # Check price spread option (disabled by default)
+        self.check_price_spread_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(schedule_frame, text="Check Price Spread", 
                        variable=self.check_price_spread_var).pack(side=tk.LEFT, padx=(15, 0))
         
