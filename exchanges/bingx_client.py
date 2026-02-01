@@ -347,12 +347,12 @@ class BingXClient(BaseExchangeClient):
         
         return Balance(currency=currency, total=0, available=0, frozen=0)
     
-    async def get_position(self, symbol: str) -> Optional[Position]:
+    async def get_position(self, symbol: str, force_rest: bool = False) -> Optional[Position]:
         """Get position for symbol (Check CACHE then REST)"""
         bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
         
-        # 1. Check Cache
-        if self.ws_manager.connected and bingx_symbol in self._position_cache:
+        # 1. Check Cache (skip if force_rest=True)
+        if not force_rest and self.ws_manager.connected and bingx_symbol in self._position_cache:
             return self._position_cache[bingx_symbol]
 
         # 2. Fallback to REST

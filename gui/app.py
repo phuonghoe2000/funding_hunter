@@ -73,7 +73,7 @@ def sync_windows_time() -> tuple[bool, str]:
     except Exception as e:
         return False, f"❌ Lỗi sync time: {e}"
 
-from config.constants import POPULAR_PAIRS, Side, Exchange, get_exchange_symbol, calculate_break_even
+from config.constants import POPULAR_PAIRS, Side, Exchange, get_exchange_symbol, calculate_break_even, calculate_trade_quality, assess_price_divergence
 from exchanges.okx_client import OKXClient
 from exchanges.binance_client import BinanceClient
 from exchanges.bingx_client import BingXClient
@@ -687,7 +687,7 @@ class MultiExchangeManager:
                 symbol = get_exchange_symbol(pair, long_ex)
                 try:
                     result["long"] = await asyncio.wait_for(
-                        long_client.get_position(symbol),
+                        long_client.get_position(symbol, force_rest=True),
                         timeout=10.0
                     )
                 except asyncio.TimeoutError:
@@ -698,7 +698,7 @@ class MultiExchangeManager:
                 symbol = get_exchange_symbol(pair, short_ex)
                 try:
                     result["short"] = await asyncio.wait_for(
-                        short_client.get_position(symbol),
+                        short_client.get_position(symbol, force_rest=True),
                         timeout=10.0
                     )
                 except asyncio.TimeoutError:
@@ -1223,6 +1223,48 @@ class MultiExchangeManager:
                             "error": str(retry_e)
                         })
                         
+                        # === REROLL ON FAILURE ===
+                        long_pos = await long_client.get_position(long_symbol, force_rest=True)
+                        short_pos = await short_client.get_position(short_symbol, force_rest=True)
+                        
+                        long_actual = long_pos.size if long_pos else 0
+                        short_actual = short_pos.size if short_pos else 0
+                        size_diff = abs(long_actual - short_actual)
+                        
+                        if size_diff > 0.0001:
+                            reroll_success = False
+                            for reroll_attempt in range(1, 4):
+                                diff = long_actual - short_actual
+                                log_important(f"⚠️ Mismatch: Long={long_actual:.6f}, Short={short_actual:.6f}. Reroll #{reroll_attempt}")
+                                
+                                try:
+                                    if diff > 0:
+                                        await short_client.place_market_order(short_symbol, Side.SHORT, abs(diff))
+                                    else:
+                                        await long_client.place_market_order(long_symbol, Side.LONG, abs(diff))
+                                    
+                                    await asyncio.sleep(1)
+                                    
+                                    long_pos = await long_client.get_position(long_symbol, force_rest=True)
+                                    short_pos = await short_client.get_position(short_symbol, force_rest=True)
+                                    long_actual = long_pos.size if long_pos else 0
+                                    short_actual = short_pos.size if short_pos else 0
+                                    size_diff = abs(long_actual - short_actual)
+                                    
+                                    if size_diff <= 0.0001:
+                                        log_msg(f"✓ Reroll thành công sau {reroll_attempt} lần", force=True)
+                                        reroll_success = True
+                                        break
+                                except Exception as reroll_e:
+                                    logger.error(f"Reroll #{reroll_attempt} failed: {reroll_e}")
+                            
+                            if not reroll_success:
+                                log_important(f"❌ Reroll failed 3 lần. STOP. Long={long_actual:.6f}, Short={short_actual:.6f}")
+                                results["error"] = "Reroll failed after 3 attempts"
+                                results["success"] = results["splits_completed"] > 0
+                                break
+                        # === END REROLL ===
+                        
                 except Exception as e:
                     logger.error(f"✗ Split {split_num} failed: {e}")
                     log_important(f"❌ Split {split_num} failed: {e}")
@@ -1231,7 +1273,48 @@ class MultiExchangeManager:
                         "success": False,
                         "error": str(e)
                     })
-                    # Continue with remaining splits even if one fails
+                    
+                    # === REROLL ON FAILURE ===
+                    long_pos = await long_client.get_position(long_symbol, force_rest=True)
+                    short_pos = await short_client.get_position(short_symbol, force_rest=True)
+                    
+                    long_actual = long_pos.size if long_pos else 0
+                    short_actual = short_pos.size if short_pos else 0
+                    size_diff = abs(long_actual - short_actual)
+                    
+                    if size_diff > 0.0001:
+                        reroll_success = False
+                        for reroll_attempt in range(1, 4):
+                            diff = long_actual - short_actual
+                            log_important(f"⚠️ Mismatch: Long={long_actual:.6f}, Short={short_actual:.6f}. Reroll #{reroll_attempt}")
+                            
+                            try:
+                                if diff > 0:
+                                    await short_client.place_market_order(short_symbol, Side.SHORT, abs(diff))
+                                else:
+                                    await long_client.place_market_order(long_symbol, Side.LONG, abs(diff))
+                                
+                                await asyncio.sleep(1)
+                                
+                                long_pos = await long_client.get_position(long_symbol, force_rest=True)
+                                short_pos = await short_client.get_position(short_symbol, force_rest=True)
+                                long_actual = long_pos.size if long_pos else 0
+                                short_actual = short_pos.size if short_pos else 0
+                                size_diff = abs(long_actual - short_actual)
+                                
+                                if size_diff <= 0.0001:
+                                    log_msg(f"✓ Reroll thành công sau {reroll_attempt} lần", force=True)
+                                    reroll_success = True
+                                    break
+                            except Exception as reroll_e:
+                                logger.error(f"Reroll #{reroll_attempt} failed: {reroll_e}")
+                        
+                        if not reroll_success:
+                            log_important(f"❌ Reroll failed 3 lần. STOP. Long={long_actual:.6f}, Short={short_actual:.6f}")
+                            results["error"] = "Reroll failed after 3 attempts"
+                            results["success"] = results["splits_completed"] > 0
+                            break
+                    # === END REROLL ===
             
             # Consider success if at least one split completed
             if results["splits_completed"] > 0:
@@ -2575,14 +2658,15 @@ class FundingHunterGUI:
             if self.active_position:
                 self.active_position["size"] = total_size
             
-            # Monitoring disabled by default - user can manually start if needed
-            # def start_monitor():
-            #     if not self.monitoring:
-            #         logger.debug("_on_all_splits_complete: Starting monitoring")
-            #         self._start_monitoring()
-            #     else:
-            #         logger.debug("_on_all_splits_complete: Monitoring already active")
-            # self.root.after(500, start_monitor)
+            # Auto-start monitoring after position opens
+            def start_monitor():
+                if not self.monitoring:
+                    logger.debug("_on_all_splits_complete: Starting monitoring")
+                    self._start_monitoring()
+                    self.monitor_btn.config(text="⏹ Stop Monitor")
+                else:
+                    logger.debug("_on_all_splits_complete: Monitoring already active")
+            self.root.after(500, start_monitor)
             
             logger.debug("_on_all_splits_complete: EXIT")
         except Exception as e:
@@ -4298,7 +4382,7 @@ class FundingHunterGUI:
                     
                     # Break-even calculation
                     info_text += f"─────────────────────────\n"
-                    info_text += f"BREAK-EVEN ANALYSIS:\n"
+                    info_text += f"TRADE ANALYSIS:\n"
                     
                     # Get position size from UI (or use default)
                     try:
@@ -4309,6 +4393,7 @@ class FundingHunterGUI:
                     # Calculate break-even if we have funding rates
                     if long_funding and short_funding:
                         net_funding_rate = (short_funding.funding_rate - long_funding.funding_rate) * 100
+                        interval_hours = long_funding.funding_interval_hours or 8
                         
                         be_result = calculate_break_even(
                             long_exchange=long_ex,
@@ -4316,23 +4401,47 @@ class FundingHunterGUI:
                             position_size_usd=position_size,
                             funding_rate_pct=net_funding_rate,
                             leverage=10,
-                            slippage_pct=0.02
+                            slippage_pct=0.02,
+                            funding_interval_hours=interval_hours
                         )
+                        
+                        # Price divergence check
+                        div_result = assess_price_divergence(long_price, short_price)
+                        
+                        # Display APR prominently
+                        apr = be_result['apr_pct']
+                        net_apr = be_result['net_apr_pct']
+                        if apr >= 50:
+                            apr_indicator = "EXCELLENT"
+                        elif apr >= 20:
+                            apr_indicator = "GOOD"
+                        elif apr >= 10:
+                            apr_indicator = "FAIR"
+                        else:
+                            apr_indicator = "LOW"
+                        
+                        info_text += f"  APR: {apr:.1f}% ({apr_indicator})\n"
+                        info_text += f"  Net APR: {net_apr:.1f}% (after fees)\n"
+                        info_text += f"  Daily: {be_result['daily_return_pct']:.3f}%\n"
+                        info_text += f"─────────────────────────\n"
                         
                         # Display fees
                         info_text += f"  Fees: {be_result['total_fees_pct']:.3f}% (${be_result['total_cost_usd']:.2f})\n"
-                        info_text += f"  Slippage est: {be_result['total_slippage_pct']:.3f}%\n"
-                        info_text += f"  Total cost: {be_result['total_cost_pct']:.3f}%\n"
-                        info_text += f"  Funding/8h: ${be_result['funding_income_usd']:.2f}\n"
+                        info_text += f"  Funding/{interval_hours}h: ${be_result['funding_income_usd']:.2f}\n"
                         
                         # Profit/Loss indicator
                         if be_result['is_profitable']:
-                            profit_str = f"  Net 1st period: +${be_result['net_profit_first_period']:.2f} PROFIT\n"
+                            profit_str = f"  1st period: +${be_result['net_profit_first_period']:.2f} PROFIT\n"
                             info_text += profit_str
                         else:
                             loss = abs(be_result['net_profit_first_period'])
-                            info_text += f"  Net 1st period: -${loss:.2f} LOSS\n"
+                            info_text += f"  1st period: -${loss:.2f} LOSS\n"
                             info_text += f"  Break-even: {be_result['hours_to_break_even']:.1f}h\n"
+                        
+                        # Price divergence warning
+                        if div_result['divergence_pct'] >= 0.1:
+                            info_text += f"─────────────────────────\n"
+                            info_text += f"  Price Div: {div_result['divergence_pct']:.3f}% ({div_result['risk_level']})\n"
                     else:
                         info_text += f"  (Need funding rates to calculate)\n"
                     
