@@ -11,6 +11,7 @@ from typing import Optional, Dict, Any, List
 import logging
 import json
 import os
+import sys
 import time
 import subprocess
 import aiohttp
@@ -82,8 +83,18 @@ from exchanges.base import BaseExchangeClient, FundingRate
 
 logger = logging.getLogger(__name__)
 
-# Config file path
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "user_config.json")
+# Config file path - always use the directory where the exe/script is running
+def _get_config_path():
+    """Get config path that works for both source and exe"""
+    if getattr(sys, 'frozen', False):
+        # Running as exe (PyInstaller)
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        # Running from source
+        base_dir = os.path.dirname(os.path.dirname(__file__))
+    return os.path.join(base_dir, "user_config.json")
+
+CONFIG_FILE = _get_config_path()
 
 
 class MultiExchangeManager:
