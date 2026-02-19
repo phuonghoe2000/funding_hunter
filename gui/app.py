@@ -1400,6 +1400,11 @@ class FundingHunterGUI:
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_closing)
         
+        # Tools menu
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+        tools_menu.add_command(label="🎯 Scalping Mode (BingX)", command=self._open_scalping_gui)
+        
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
         help_menu.add_command(label="About", command=self._show_about)
@@ -4570,6 +4575,41 @@ class FundingHunterGUI:
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete(1.0, tk.END)
         self.log_text.configure(state=tk.DISABLED)
+    
+    def _open_scalping_gui(self):
+        """Open Scalping Mode GUI"""
+        if not self.connected:
+            messagebox.showerror("Error", "Please connect to exchanges first!")
+            return
+        
+        # Check if BingX and Binance are connected
+        bingx_client = self.manager.clients.get(Exchange.BINGX)
+        binance_client = self.manager.clients.get(Exchange.BINANCE)
+        
+        if not bingx_client:
+            messagebox.showerror("Error", "BingX must be connected for Scalping Mode!")
+            return
+        
+        if not binance_client:
+            messagebox.showerror("Error", "Binance must be connected for Scalping Mode!")
+            return
+        
+        # Import and launch scalping GUI
+        try:
+            from gui.scalping_gui import launch_scalping_gui
+            
+            scalping_window = launch_scalping_gui(
+                parent=self.root,
+                bingx_client=bingx_client,
+                binance_client=binance_client,
+                loop=self.loop
+            )
+            
+            self._log("🎯 Scalping Mode window opened")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open Scalping Mode: {e}")
+            self._log(f"❌ Error opening Scalping Mode: {e}")
     
     def _show_about(self):
         """Show about"""
