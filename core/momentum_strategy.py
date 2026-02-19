@@ -49,6 +49,11 @@ class MomentumConfig:
     take_profit_pct: float = 0.5  # 0.5% take profit
     stop_loss_pct: float = 0.3  # 0.3% stop loss
     
+    # Trailing TP settings
+    use_trailing_tp: bool = True  # Enable trailing take profit
+    tp_extension_pct: float = 0.3  # Extend TP by this % when hit
+    max_tp_extensions: int = 10  # Max number of TP extensions (0 = unlimited)
+    
     # Risk management
     max_positions: int = 1  # Max concurrent positions
     cooldown_seconds: int = 60  # Wait time after closing position
@@ -106,6 +111,11 @@ class ActiveTrade:
     close_price: Optional[float] = None
     close_time: Optional[datetime] = None
     close_reason: Optional[str] = None
+    # Trailing TP tracking
+    tp_hit_count: int = 0  # Number of times TP has been extended
+    original_tp_price: float = 0.0  # Original TP price for reference
+    highest_price: float = 0.0  # Highest price seen (for LONG)
+    lowest_price: float = 0.0  # Lowest price seen (for SHORT)
 
 
 class PriceTracker:
@@ -387,17 +397,22 @@ class MomentumStrategy:
             )
             
             if order:
+                entry = order.avg_price if order.avg_price else price
+                
                 # Create active trade record
                 trade = ActiveTrade(
                     symbol=symbol,
                     direction=direction,
-                    entry_price=order.avg_price if order.avg_price else price,
+                    entry_price=entry,
                     size=size,
                     leverage=self.config.leverage,
                     take_profit_price=tp_price,
                     stop_loss_price=sl_price,
                     entry_time=datetime.now(timezone.utc),
-                    order_id=order.order_id
+                    order_id=order.order_id,
+                    original_tp_price=tp_price,
+                    highest_price=entry,
+                    lowest_price=entry
                 )
                 
                 self.active_trades[symbol] = trade
@@ -413,7 +428,7 @@ class MomentumStrategy:
             self.log(f"Failed to execute trade: {e}")
     
     async def _monitor_trades(self):
-        """Monitor active trades for TP/SL"""
+        """Monitor active trades for TP/SL with trailing TP support"""
         for symbol, trade in list(self.active_trades.items()):
             if trade.is_closed:
                 continue
@@ -426,6 +441,14 @@ class MomentumStrategy:
                 
                 trade.current_price = current_price
                 
+                # Update highest/lowest price tracking
+                if trade.direction == TradeDirection.LONG:
+                    if current_price > trade.highest_price:
+                        trade.highest_price = current_price
+                else:
+                    if current_price < trade.lowest_price or trade.lowest_price == 0:
+                        trade.lowest_price = current_price
+                
                 # Calculate PnL
                 if trade.direction == TradeDirection.LONG:
                     pnl_pct = ((current_price - trade.entry_price) / trade.entry_price) * 100
@@ -434,20 +457,96 @@ class MomentumStrategy:
                 
                 trade.unrealized_pnl = pnl_pct
                 
-                # Check TP
+                # Check TP/SL with trailing logic
                 if trade.direction == TradeDirection.LONG:
-                    if current_price >= trade.take_profit_price:
-                        await self._close_trade(trade, "TAKE_PROFIT")
-                    elif current_price <= trade.stop_loss_price:
-                        await self._close_trade(trade, "STOP_LOSS")
+                    await self._check_tp_sl_long(trade, current_price)
                 else:
-                    if current_price <= trade.take_profit_price:
-                        await self._close_trade(trade, "TAKE_PROFIT")
-                    elif current_price >= trade.stop_loss_price:
-                        await self._close_trade(trade, "STOP_LOSS")
+                    await self._check_tp_sl_short(trade, current_price)
                         
             except Exception as e:
                 logger.error(f"Error monitoring trade {symbol}: {e}")
+    
+    async def _check_tp_sl_long(self, trade: ActiveTrade, current_price: float):
+        """Check TP/SL for LONG position with trailing TP"""
+        # Check Stop Loss first
+        if current_price <= trade.stop_loss_price:
+            reason = "STOP_LOSS" if trade.tp_hit_count == 0 else f"TRAILING_SL (TP hit {trade.tp_hit_count}x)"
+            await self._close_trade(trade, reason)
+            return
+        
+        # Check Take Profit
+        if current_price >= trade.take_profit_price:
+            if self.config.use_trailing_tp:
+                # Check if we can extend TP
+                can_extend = (self.config.max_tp_extensions == 0 or 
+                             trade.tp_hit_count < self.config.max_tp_extensions)
+                
+                if can_extend:
+                    # Move SL to current TP (lock profit)
+                    old_tp = trade.take_profit_price
+                    old_sl = trade.stop_loss_price
+                    
+                    trade.stop_loss_price = trade.take_profit_price
+                    
+                    # Extend TP by tp_extension_pct
+                    trade.take_profit_price = current_price * (1 + self.config.tp_extension_pct / 100)
+                    trade.tp_hit_count += 1
+                    
+                    self.log(
+                        f"🎯 TP #{trade.tp_hit_count} hit! Trailing... "
+                        f"New SL: {trade.stop_loss_price:.2f} (was {old_sl:.2f}) | "
+                        f"New TP: {trade.take_profit_price:.2f} (was {old_tp:.2f})"
+                    )
+                    
+                    # Notify UI of TP extension
+                    self.on_trade(trade, f"TP_EXTENDED_{trade.tp_hit_count}")
+                else:
+                    # Max extensions reached, close at profit
+                    await self._close_trade(trade, f"MAX_TP (hit {trade.tp_hit_count}x)")
+            else:
+                # No trailing, just close
+                await self._close_trade(trade, "TAKE_PROFIT")
+    
+    async def _check_tp_sl_short(self, trade: ActiveTrade, current_price: float):
+        """Check TP/SL for SHORT position with trailing TP"""
+        # Check Stop Loss first
+        if current_price >= trade.stop_loss_price:
+            reason = "STOP_LOSS" if trade.tp_hit_count == 0 else f"TRAILING_SL (TP hit {trade.tp_hit_count}x)"
+            await self._close_trade(trade, reason)
+            return
+        
+        # Check Take Profit
+        if current_price <= trade.take_profit_price:
+            if self.config.use_trailing_tp:
+                # Check if we can extend TP
+                can_extend = (self.config.max_tp_extensions == 0 or 
+                             trade.tp_hit_count < self.config.max_tp_extensions)
+                
+                if can_extend:
+                    # Move SL to current TP (lock profit)
+                    old_tp = trade.take_profit_price
+                    old_sl = trade.stop_loss_price
+                    
+                    trade.stop_loss_price = trade.take_profit_price
+                    
+                    # Extend TP by tp_extension_pct (lower for short)
+                    trade.take_profit_price = current_price * (1 - self.config.tp_extension_pct / 100)
+                    trade.tp_hit_count += 1
+                    
+                    self.log(
+                        f"🎯 TP #{trade.tp_hit_count} hit! Trailing... "
+                        f"New SL: {trade.stop_loss_price:.2f} (was {old_sl:.2f}) | "
+                        f"New TP: {trade.take_profit_price:.2f} (was {old_tp:.2f})"
+                    )
+                    
+                    # Notify UI of TP extension
+                    self.on_trade(trade, f"TP_EXTENDED_{trade.tp_hit_count}")
+                else:
+                    # Max extensions reached, close at profit
+                    await self._close_trade(trade, f"MAX_TP (hit {trade.tp_hit_count}x)")
+            else:
+                # No trailing, just close
+                await self._close_trade(trade, "TAKE_PROFIT")
     
     async def _close_trade(self, trade: ActiveTrade, reason: str):
         """Close an active trade"""

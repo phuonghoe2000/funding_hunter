@@ -204,6 +204,24 @@ class AutoTradeGUI:
         self.sl_var = tk.StringVar(value="0.3")
         ttk.Entry(tpsl_row, textvariable=self.sl_var, width=6).pack(side=tk.LEFT, padx=5)
         ttk.Label(tpsl_row, text="%").pack(side=tk.LEFT)
+        
+        # Trailing TP settings
+        trailing_row = ttk.Frame(frame)
+        trailing_row.pack(fill=tk.X, pady=5)
+        
+        self.trailing_tp_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(trailing_row, text="Trailing TP", 
+                       variable=self.trailing_tp_var).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(trailing_row, text="Extend:").pack(side=tk.LEFT, padx=(10, 5))
+        self.tp_extend_var = tk.StringVar(value="0.3")
+        ttk.Entry(trailing_row, textvariable=self.tp_extend_var, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(trailing_row, text="%").pack(side=tk.LEFT)
+        
+        ttk.Label(trailing_row, text="Max:").pack(side=tk.LEFT, padx=(10, 5))
+        self.max_tp_var = tk.StringVar(value="10")
+        ttk.Spinbox(trailing_row, from_=0, to=50, width=4, textvariable=self.max_tp_var).pack(side=tk.LEFT, padx=2)
+        ttk.Label(trailing_row, text="(0=unlimited)").pack(side=tk.LEFT, padx=2)
     
     def _create_trading_frame(self, parent):
         """Create trading control frame"""
@@ -441,6 +459,8 @@ class AutoTradeGUI:
             leverage = int(self.leverage_var.get())
             tp = float(self.tp_var.get())
             sl = float(self.sl_var.get())
+            tp_extend = float(self.tp_extend_var.get())
+            max_tp = int(self.max_tp_var.get())
         except ValueError:
             messagebox.showerror("Error", "Invalid numeric values")
             return
@@ -452,7 +472,10 @@ class AutoTradeGUI:
             position_size_usdt=size,
             leverage=leverage,
             take_profit_pct=tp,
-            stop_loss_pct=sl
+            stop_loss_pct=sl,
+            use_trailing_tp=self.trailing_tp_var.get(),
+            tp_extension_pct=tp_extend,
+            max_tp_extensions=max_tp
         )
         
         # Create strategy
@@ -477,7 +500,13 @@ class AutoTradeGUI:
         
         self.is_trading = True
         self._update_trading_ui(True)
-        self._log(f"▶️ Started trading {pair} | Threshold: {threshold}% | TF: {timeframe_str}")
+        
+        trailing_info = ""
+        if self.trailing_tp_var.get():
+            max_ext = f"max {max_tp}" if max_tp > 0 else "unlimited"
+            trailing_info = f" | Trailing TP: +{tp_extend}% ({max_ext})"
+        
+        self._log(f"▶️ Started trading {pair} | Threshold: {threshold}% | TF: {timeframe_str} | TP: {tp}% | SL: {sl}%{trailing_info}")
         
         # Start price update loop
         self._start_price_updates()
@@ -536,6 +565,13 @@ class AutoTradeGUI:
                 text=f"{trade.direction.value.upper()} @ {trade.entry_price:.2f} | TP: {trade.take_profit_price:.2f} | SL: {trade.stop_loss_price:.2f}",
                 foreground="blue"
             ))
+        elif "TP_EXTENDED" in event:
+            # Update position display with new TP/SL and extension count
+            tp_count = trade.tp_hit_count
+            self.root.after(0, lambda: self.position_label.config(
+                text=f"{trade.direction.value.upper()} @ {trade.entry_price:.2f} | TP: {trade.take_profit_price:.2f} | SL: {trade.stop_loss_price:.2f} | 🎯x{tp_count}",
+                foreground="green"
+            ))
         elif "CLOSED" in event:
             self.root.after(0, lambda: self.position_label.config(
                 text="No position",
@@ -580,7 +616,10 @@ class AutoTradeGUI:
             "size": self.size_var.get(),
             "leverage": self.leverage_var.get(),
             "tp": self.tp_var.get(),
-            "sl": self.sl_var.get()
+            "sl": self.sl_var.get(),
+            "trailing_tp": self.trailing_tp_var.get(),
+            "tp_extend": self.tp_extend_var.get(),
+            "max_tp": self.max_tp_var.get()
         }
         
         try:
@@ -609,6 +648,9 @@ class AutoTradeGUI:
             self.leverage_var.set(config.get("leverage", "10"))
             self.tp_var.set(config.get("tp", "0.5"))
             self.sl_var.set(config.get("sl", "0.3"))
+            self.trailing_tp_var.set(config.get("trailing_tp", True))
+            self.tp_extend_var.set(config.get("tp_extend", "0.3"))
+            self.max_tp_var.set(config.get("max_tp", "10"))
             
             self._log("Config loaded")
         except Exception as e:
