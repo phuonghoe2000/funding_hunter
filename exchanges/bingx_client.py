@@ -734,6 +734,31 @@ class BingXClient(BaseExchangeClient):
         
         raise Exception(f"No ticker data for {bingx_symbol}")
     
+    async def get_all_symbols(self) -> List[str]:
+        """Get all available USDT perpetual futures symbols"""
+        try:
+            result = await self._request("GET", "/openApi/swap/v2/quote/contracts", signed=False)
+            symbols = []
+            
+            if result.get("code") == 0 and result.get("data"):
+                for contract in result["data"]:
+                    # Only active USDT contracts
+                    if contract.get("status") == 1:  # 1 = active
+                        symbol = contract.get("symbol", "")  # Format: BTC-USDT
+                        if symbol and symbol.endswith("-USDT"):
+                            # Convert BTC-USDT to BTC/USDT format
+                            base = symbol.replace("-USDT", "")
+                            symbols.append(f"{base}/USDT")
+            
+            # Sort alphabetically
+            symbols.sort()
+            logger.info(f"Loaded {len(symbols)} symbols from BingX")
+            return symbols
+            
+        except Exception as e:
+            logger.error(f"Failed to get symbols from BingX: {e}")
+            return []
+    
     async def set_position_mode(self, hedge_mode: bool = True) -> bool:
         """Set position mode (hedge or one-way)"""
         try:

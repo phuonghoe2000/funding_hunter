@@ -201,6 +201,30 @@ class BinanceClient(BaseExchangeClient):
         
         return float(result.get("markPrice", 0))
     
+    async def get_all_symbols(self) -> List[str]:
+        """Get all available USDT perpetual futures symbols"""
+        try:
+            result = await self._request("GET", "/fapi/v1/exchangeInfo", signed=False)
+            symbols = []
+            
+            for s in result.get("symbols", []):
+                # Only USDT perpetual contracts that are trading
+                if (s.get("quoteAsset") == "USDT" and 
+                    s.get("contractType") == "PERPETUAL" and
+                    s.get("status") == "TRADING"):
+                    # Convert BTCUSDT to BTC/USDT format
+                    base = s.get("baseAsset", "")
+                    symbols.append(f"{base}/USDT")
+            
+            # Sort alphabetically
+            symbols.sort()
+            logger.info(f"Loaded {len(symbols)} symbols from Binance")
+            return symbols
+            
+        except Exception as e:
+            logger.error(f"Failed to get symbols from Binance: {e}")
+            return []
+    
     async def get_order_book(self, symbol: str, limit: int = 20) -> Dict[str, Any]:
         """Get order book (depth)"""
         binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)

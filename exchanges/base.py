@@ -140,3 +140,8 @@ class BaseExchangeClient(ABC):
     def get_exchange_name(self) -> str:
         """Get exchange name"""
         pass
+    
+    @abstractmethod
+    async def get_all_symbols(self) -> List[str]:
+        """Get all available trading symbols (USDT perpetual futures)"""
+        pass

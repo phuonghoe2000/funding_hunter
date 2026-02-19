@@ -35,7 +35,8 @@ logger = logging.getLogger(__name__)
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "autotrade_config.json")
 
-TRADING_PAIRS = [
+# Default pairs (used when not connected to exchange)
+DEFAULT_TRADING_PAIRS = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
     "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT", "DOT/USDT"
 ]
@@ -148,6 +149,10 @@ class AutoTradeGUI:
         
         self.connection_status = ttk.Label(btn_row, text="⚪ Disconnected", foreground="gray")
         self.connection_status.pack(side=tk.LEFT, padx=10)
+        
+        # Save/Load config buttons
+        ttk.Button(btn_row, text="💾 Save", command=self._save_config_manual).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(btn_row, text="📂 Load", command=self._load_config_manual).pack(side=tk.RIGHT, padx=2)
     
     def _create_strategy_frame(self, parent):
         """Create strategy configuration frame"""
@@ -159,9 +164,13 @@ class AutoTradeGUI:
         pair_row.pack(fill=tk.X, pady=5)
         
         ttk.Label(pair_row, text="Pair:").pack(side=tk.LEFT, padx=5)
-        self.pair_combo = ttk.Combobox(pair_row, values=TRADING_PAIRS, width=12)
+        self.pair_combo = ttk.Combobox(pair_row, values=DEFAULT_TRADING_PAIRS, width=12)
         self.pair_combo.set("BTC/USDT")
         self.pair_combo.pack(side=tk.LEFT, padx=5)
+        
+        # Load pairs button
+        self.load_pairs_btn = ttk.Button(pair_row, text="📥 Load All", command=self._load_pairs_from_exchange, state=tk.DISABLED)
+        self.load_pairs_btn.pack(side=tk.LEFT, padx=5)
         
         # Timeframe
         ttk.Label(pair_row, text="Timeframe:").pack(side=tk.LEFT, padx=(20, 5))
@@ -426,11 +435,13 @@ class AutoTradeGUI:
             self.connection_status.config(text="🟢 Connected", foreground="green")
             self.start_btn.config(state=tk.NORMAL)
             self.exchange_combo.config(state=tk.DISABLED)
+            self.load_pairs_btn.config(state=tk.NORMAL)
         else:
             self.connect_btn.config(text="🔌 Connect")
             self.connection_status.config(text="⚪ Disconnected", foreground="gray")
             self.start_btn.config(state=tk.DISABLED)
             self.exchange_combo.config(state='readonly')
+            self.load_pairs_btn.config(state=tk.DISABLED)
     
     def _toggle_trading(self):
         """Toggle trading on/off"""
@@ -655,6 +666,132 @@ class AutoTradeGUI:
             self._log("Config loaded")
         except Exception as e:
             self._log(f"Failed to load config: {e}")
+    
+    def _save_config_manual(self):
+        """Manual save config with file dialog"""
+        from tkinter import filedialog
+        
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialfile="autotrade_config.json",
+            title="Save Config"
+        )
+        
+        if not file_path:
+            return
+        
+        config = {
+            "exchange": self.exchange_combo.get(),
+            "api_key": self.api_key_entry.get(),
+            "secret": self.secret_entry.get(),
+            "pair": self.pair_combo.get(),
+            "timeframe": self.timeframe_combo.get(),
+            "threshold": self.threshold_var.get(),
+            "size": self.size_var.get(),
+            "leverage": self.leverage_var.get(),
+            "tp": self.tp_var.get(),
+            "sl": self.sl_var.get(),
+            "trailing_tp": self.trailing_tp_var.get(),
+            "tp_extend": self.tp_extend_var.get(),
+            "max_tp": self.max_tp_var.get(),
+            "dry_run": self.dry_run_var.get()
+        }
+        
+        try:
+            with open(file_path, 'w') as f:
+                json.dump(config, f, indent=2)
+            self._log(f"Config saved to {os.path.basename(file_path)}")
+        except Exception as e:
+            self._log(f"Failed to save config: {e}")
+            messagebox.showerror("Error", f"Failed to save config: {e}")
+    
+    def _load_config_manual(self):
+        """Manual load config with file dialog"""
+        from tkinter import filedialog
+        
+        file_path = filedialog.askopenfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Load Config"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            with open(file_path, 'r') as f:
+                config = json.load(f)
+            
+            # Clear existing entries
+            self.api_key_entry.delete(0, tk.END)
+            self.secret_entry.delete(0, tk.END)
+            
+            # Load values
+            self.exchange_combo.set(config.get("exchange", "Binance Testnet"))
+            self.api_key_entry.insert(0, config.get("api_key", ""))
+            self.secret_entry.insert(0, config.get("secret", ""))
+            self.pair_combo.set(config.get("pair", "BTC/USDT"))
+            self.timeframe_combo.set(config.get("timeframe", "5m"))
+            self.threshold_var.set(config.get("threshold", "1.0"))
+            self.size_var.set(config.get("size", "100"))
+            self.leverage_var.set(config.get("leverage", "10"))
+            self.tp_var.set(config.get("tp", "0.5"))
+            self.sl_var.set(config.get("sl", "0.3"))
+            self.trailing_tp_var.set(config.get("trailing_tp", True))
+            self.tp_extend_var.set(config.get("tp_extend", "0.3"))
+            self.max_tp_var.set(config.get("max_tp", "10"))
+            self.dry_run_var.set(config.get("dry_run", True))
+            
+            self._log(f"Config loaded from {os.path.basename(file_path)}")
+        except Exception as e:
+            self._log(f"Failed to load config: {e}")
+            messagebox.showerror("Error", f"Failed to load config: {e}")
+    
+    def _load_pairs_from_exchange(self):
+        """Load all trading pairs from connected exchange"""
+        if not self.connected or not self.exchange_client:
+            messagebox.showerror("Error", "Not connected to exchange")
+            return
+        
+        self._log("Loading trading pairs from exchange...")
+        self.load_pairs_btn.config(state=tk.DISABLED, text="Loading...")
+        
+        async def do_load():
+            try:
+                symbols = await self.exchange_client.get_all_symbols()
+                return symbols
+            except Exception as e:
+                logger.error(f"Failed to load symbols: {e}")
+                return []
+        
+        def on_loaded(future):
+            try:
+                symbols = future.result()
+                if symbols:
+                    # Update combobox with new values
+                    current = self.pair_combo.get()
+                    self.root.after(0, lambda: self._update_pairs_combo(symbols, current))
+                    self.root.after(0, lambda: self._log(f"Loaded {len(symbols)} trading pairs"))
+                else:
+                    self.root.after(0, lambda: self._log("No pairs loaded"))
+            except Exception as e:
+                self.root.after(0, lambda: self._log(f"Error loading pairs: {e}"))
+            finally:
+                self.root.after(0, lambda: self.load_pairs_btn.config(state=tk.NORMAL, text="📥 Load All"))
+        
+        future = self._run_async(do_load())
+        if future:
+            future.add_done_callback(on_loaded)
+    
+    def _update_pairs_combo(self, symbols: list, current_value: str):
+        """Update pairs combobox with new symbols"""
+        self.pair_combo['values'] = symbols
+        # Keep current value if it exists in new list
+        if current_value in symbols:
+            self.pair_combo.set(current_value)
+        elif symbols:
+            self.pair_combo.set(symbols[0])
     
     def _on_closing(self):
         """Handle window close"""
