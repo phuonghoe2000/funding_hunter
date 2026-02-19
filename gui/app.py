@@ -3473,9 +3473,23 @@ class FundingHunterGUI:
                         except:
                             risk_threshold = 10.0
                         
-                        if risk_percent >= risk_threshold:
-                            safe_log(f"🚨 Risk {risk_percent:.2f}% >= threshold {risk_threshold}%!")
-                            safe_log(f"🔄 Bắt đầu analyze spread 5 phút trước khi close...")
+                        # Check if BingX is profitable - if so, double the threshold
+                        # to let BingX win more before closing
+                        bingx_pnl = 0.0
+                        if pos['long_exchange'] == Exchange.BINGX:
+                            bingx_pnl = long_pnl
+                        elif pos['short_exchange'] == Exchange.BINGX:
+                            bingx_pnl = short_pnl
+                        
+                        effective_threshold = risk_threshold
+                        if bingx_pnl > 0:
+                            # BingX đang lời → cho phép risk gấp đôi để BingX thắng nhiều hơn
+                            effective_threshold = risk_threshold * 2
+                            safe_log(f"💰 BingX đang +${bingx_pnl:.2f} → threshold x2: {effective_threshold:.1f}%")
+                        
+                        if risk_percent >= effective_threshold:
+                            safe_log(f"🚨 Risk {risk_percent:.2f}% >= threshold {effective_threshold:.1f}%!")
+                            safe_log(f"🔄 Bắt đầu analyze spread 2 phút trước khi close...")
                             
                             # Analyze spread first
                             try:
@@ -3538,16 +3552,32 @@ class FundingHunterGUI:
                                         safe_log(f"⚠️ Spread check error: {e}, retrying...")
                                         await asyncio.sleep(2)
                                 
-                                # Now close position
-                                close_result = await self.manager.close_hedged_position(
-                                    pos['pair'], pos['long_exchange'], pos['short_exchange']
+                                # Now close position with splits
+                                # Get split count from UI
+                                try:
+                                    splits = int(self.split_count_var.get())
+                                    if splits < 1: splits = 1
+                                except:
+                                    splits = 1
+                                
+                                safe_log(f"🔄 Closing position in {splits} split(s)...")
+                                close_result = await self.manager.close_hedged_position_split(
+                                    pos['pair'], 
+                                    pos['long_exchange'], 
+                                    pos['short_exchange'],
+                                    splits=splits,
+                                    interval_seconds=2.0,
+                                    price_spread_min=current_threshold,
+                                    spread_check_interval=2.0,
+                                    progress_callback=lambda s, t, m: safe_log(f"   {m}"),
+                                    cancel_event=None
                                 )
                                 
                                 if close_result.get("success"):
-                                    safe_log(f"✅ Position closed do risk >= {risk_threshold}%")
-                                    self.root.after(0, lambda r=risk_percent: messagebox.showwarning(
+                                    safe_log(f"✅ Position closed do risk >= {effective_threshold:.1f}%")
+                                    self.root.after(0, lambda r=risk_percent, t=effective_threshold: messagebox.showwarning(
                                         "Risk Auto-Close", 
-                                        f"Position closed!\nRisk was {r:.2f}%"
+                                        f"Position closed!\nRisk was {r:.2f}% (threshold: {t:.1f}%)"
                                     ))
                                 else:
                                     safe_log(f"❌ Auto-close failed: {close_result.get('error')}")
