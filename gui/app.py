@@ -79,6 +79,8 @@ from exchanges.binance_client import BinanceClient
 from exchanges.bingx_client import BingXClient
 from exchanges.gate_client import GateClient
 from exchanges.base import BaseExchangeClient, FundingRate
+from core.scalping_strategy import TradingMode, ScalpingConfig
+from core.scalping_bot import ScalpingBot, Notification
 
 logger = logging.getLogger(__name__)
 
@@ -1373,6 +1375,11 @@ class FundingHunterGUI:
         self.analyzing_spread = False
         self.analyze_cancel_event: Optional[threading.Event] = None
         
+        # Scalping mode state
+        self.trading_mode = TradingMode.FUNDING  # Default to funding arbitrage
+        self.scalping_bot: Optional[ScalpingBot] = None
+        self.scalping_config = ScalpingConfig()  # Default config
+        
         # UI update tasks (to prevent spam and manage recurring updates)
         self._pair_info_update_task = None
         self._usdt_update_pending = None
@@ -1749,6 +1756,81 @@ class FundingHunterGUI:
         self.short_exchange.set("Binance")
         self.short_exchange.grid(row=0, column=3, padx=5, pady=5)
         self.short_exchange.bind('<<ComboboxSelected>>', self._on_exchange_changed)
+        
+        # Trading Mode Selection (Funding vs Scalping)
+        mode_frame = ttk.LabelFrame(frame, text="🎯 Trading Mode", padding="10")
+        mode_frame.pack(fill=tk.X, pady=10)
+        
+        self.trading_mode_var = tk.StringVar(value="funding")
+        
+        # Radio buttons for mode selection
+        mode_row = ttk.Frame(mode_frame)
+        mode_row.pack(fill=tk.X)
+        
+        ttk.Radiobutton(
+            mode_row, text="📈 Funding Arbitrage", 
+            variable=self.trading_mode_var, value="funding",
+            command=self._on_trading_mode_changed
+        ).pack(side=tk.LEFT, padx=10)
+        
+        ttk.Radiobutton(
+            mode_row, text="⚡ Scalping (DCA + RSI)", 
+            variable=self.trading_mode_var, value="scalping",
+            command=self._on_trading_mode_changed
+        ).pack(side=tk.LEFT, padx=10)
+        
+        # Scalping config frame (hidden by default)
+        self.scalping_config_frame = ttk.Frame(mode_frame)
+        # Initially hidden, shown when scalping mode is selected
+        
+        # DCA Settings row
+        dca_row = ttk.Frame(self.scalping_config_frame)
+        dca_row.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(dca_row, text="DCA Levels:", font=('Helvetica', 9, 'bold')).pack(side=tk.LEFT, padx=5)
+        ttk.Label(dca_row, text="-0.3%, -0.6%, -1%, -1.5%, -2%", foreground="gray").pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(dca_row, text="Max DCA:").pack(side=tk.LEFT, padx=(20, 5))
+        self.max_dca_var = tk.StringVar(value="3")
+        ttk.Spinbox(dca_row, from_=1, to=5, width=4, textvariable=self.max_dca_var).pack(side=tk.LEFT)
+        ttk.Label(dca_row, text="x").pack(side=tk.LEFT)
+        
+        # RSI & TP Settings row
+        rsi_row = ttk.Frame(self.scalping_config_frame)
+        rsi_row.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(rsi_row, text="RSI Period:").pack(side=tk.LEFT, padx=5)
+        self.rsi_period_var = tk.StringVar(value="14")
+        ttk.Spinbox(rsi_row, from_=5, to=30, width=4, textvariable=self.rsi_period_var).pack(side=tk.LEFT)
+        
+        ttk.Label(rsi_row, text="Timeframe:").pack(side=tk.LEFT, padx=(15, 5))
+        self.rsi_tf_combo = ttk.Combobox(rsi_row, values=["1m", "5m", "15m", "30m", "1h"], width=5, state='readonly')
+        self.rsi_tf_combo.set("5m")
+        self.rsi_tf_combo.pack(side=tk.LEFT)
+        
+        ttk.Label(rsi_row, text="Take Profit:").pack(side=tk.LEFT, padx=(15, 5))
+        self.scalp_tp_var = tk.StringVar(value="0.5")
+        ttk.Entry(rsi_row, textvariable=self.scalp_tp_var, width=5).pack(side=tk.LEFT)
+        ttk.Label(rsi_row, text="%").pack(side=tk.LEFT)
+        
+        # BingX winning side selection
+        side_row = ttk.Frame(self.scalping_config_frame)
+        side_row.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(side_row, text="BingX Side (winning side):", font=('Helvetica', 9, 'bold')).pack(side=tk.LEFT, padx=5)
+        self.bingx_side_var = tk.StringVar(value="SHORT")
+        ttk.Radiobutton(side_row, text="SHORT", variable=self.bingx_side_var, value="SHORT").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(side_row, text="LONG", variable=self.bingx_side_var, value="LONG").pack(side=tk.LEFT, padx=5)
+        ttk.Label(side_row, text="(DCA will be added on BingX when price goes against)", foreground="gray").pack(side=tk.LEFT, padx=10)
+        
+        # Notification status
+        notif_row = ttk.Frame(self.scalping_config_frame)
+        notif_row.pack(fill=tk.X, pady=5)
+        
+        self.scalping_notif_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(notif_row, text="🔔 Notification Mode (signals only, no auto-execute)", 
+                       variable=self.scalping_notif_var, state='disabled').pack(side=tk.LEFT, padx=5)
+        ttk.Label(notif_row, text="← Always enabled for safety", foreground="green").pack(side=tk.LEFT)
         
         # Funding rate info for selected pair
         funding_info_frame = ttk.LabelFrame(frame, text="📊 Selected Pair Info", padding="10")
@@ -2237,6 +2319,11 @@ class FundingHunterGUI:
     def _open_position(self):
         """Open hedged position - analyze spread first, then wait for threshold"""
         if not self.connected:
+            return
+        
+        # Check if in Scalping mode - use different flow
+        if self.trading_mode == TradingMode.SCALPING:
+            self._open_scalping_position()
             return
         
         # If already analyzing or waiting, this is a CANCEL action
@@ -4109,6 +4196,197 @@ class FundingHunterGUI:
         """Handle exchange dropdown selection change in Trading Panel"""
         self._update_pair_info()
         self._update_usdt_volume()
+    
+    def _on_trading_mode_changed(self):
+        """Handle trading mode change between Funding and Scalping"""
+        mode = self.trading_mode_var.get()
+        
+        if mode == "scalping":
+            self.trading_mode = TradingMode.SCALPING
+            # Show scalping config frame
+            self.scalping_config_frame.pack(fill=tk.X, pady=5)
+            
+            # Update exchange selection for scalping (BingX vs Binance)
+            # For scalping, we recommend BingX SHORT and Binance LONG
+            bingx_side = self.bingx_side_var.get()
+            if bingx_side == "SHORT":
+                self.long_exchange.set("Binance")
+                self.short_exchange.set("BingX")
+            else:
+                self.long_exchange.set("BingX")
+                self.short_exchange.set("Binance")
+            
+            self._log("🔄 Switched to SCALPING mode (DCA + RSI)")
+            self._log("📋 Settings: BingX = winning side with DCA, Notification only mode")
+        else:
+            self.trading_mode = TradingMode.FUNDING
+            # Hide scalping config frame
+            self.scalping_config_frame.pack_forget()
+            self._log("🔄 Switched to FUNDING mode (traditional arbitrage)")
+        
+        # Update the Open Position button text
+        self._update_open_button_text()
+    
+    def _update_open_button_text(self):
+        """Update the Open Position button text based on trading mode"""
+        if self.trading_mode == TradingMode.SCALPING:
+            self.open_btn.config(text="⚡ Open Scalping Position")
+        else:
+            self.open_btn.config(text="🚀 Open Hedged Position")
+    
+    def _get_scalping_config(self) -> ScalpingConfig:
+        """Get current scalping configuration from GUI inputs"""
+        try:
+            max_dca = int(self.max_dca_var.get())
+            rsi_period = int(self.rsi_period_var.get())
+            take_profit = float(self.scalp_tp_var.get())
+            timeframe = self.rsi_tf_combo.get()
+            
+            return ScalpingConfig(
+                max_dca_times=max_dca,
+                rsi_period=rsi_period,
+                rsi_timeframe=timeframe,
+                take_profit_pct=take_profit,
+                notify_on_signal=True,
+                notify_on_dca=True,
+                notify_on_take_profit=True
+            )
+        except ValueError as e:
+            self._log(f"⚠️ Invalid scalping config, using defaults: {e}")
+            return ScalpingConfig()
+    
+    def _handle_scalping_notification(self, notification: Notification):
+        """Handle incoming scalping notifications and display them in GUI"""
+        # Format the notification for display
+        timestamp = notification.timestamp.strftime("%H:%M:%S")
+        msg_type = notification.type.value.upper()
+        
+        if notification.requires_action:
+            # Action required - show prominently
+            self._log(f"🚨 [{timestamp}] {msg_type}: {notification.message}")
+            
+            # Show action details if available
+            data = notification.data
+            if "bingx_order" in data:
+                bx = data["bingx_order"]
+                self._log(f"   → BingX: {bx.get('side', '')} {bx.get('size', '')} @ {data.get('entry_price', 'market')}")
+            if "binance_order" in data:
+                bn = data["binance_order"]
+                self._log(f"   → Binance: {bn.get('side', '')} {bn.get('size', '')} @ market")
+            
+            # Flash the log or show popup for critical actions
+            if msg_type in ["DCA", "TAKE_PROFIT", "STOP_LOSS"]:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    f"Scalping Signal: {msg_type}",
+                    f"{notification.message}\n\nCheck log for order details."
+                ))
+        else:
+            # Info notification
+            self._log(f"ℹ️ [{timestamp}] {msg_type}: {notification.message}")
+    
+    def _open_scalping_position(self):
+        """Open a scalping position with DCA monitoring (notification only mode)"""
+        pair = self.pair_combo.get()
+        bingx_side = self.bingx_side_var.get()  # "LONG" or "SHORT"
+        
+        try:
+            size = float(self.size_entry.get())
+            leverage = int(self.leverage_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid size or leverage")
+            return
+        
+        # Validate that we have BingX and Binance clients
+        if Exchange.BINGX not in self.manager.clients:
+            messagebox.showerror("Error", "BingX not connected. Scalping requires BingX.")
+            return
+        if Exchange.BINANCE not in self.manager.clients:
+            messagebox.showerror("Error", "Binance not connected. Scalping requires Binance.")
+            return
+        
+        # Get config from GUI
+        config = self._get_scalping_config()
+        
+        # Confirm with user
+        binance_side = "LONG" if bingx_side == "SHORT" else "SHORT"
+        confirm_msg = (
+            f"Open SCALPING position for {pair}?\n\n"
+            f"Mode: Notification Only (manual execution)\n"
+            f"─────────────────────\n"
+            f"BingX (winning side): {bingx_side}\n"
+            f"Binance (hedge): {binance_side}\n"
+            f"─────────────────────\n"
+            f"Base Size: ${size:.2f}\n"
+            f"Leverage: {leverage}x\n"
+            f"─────────────────────\n"
+            f"DCA Levels: -0.3%, -0.6%, -1%, -1.5%, -2%\n"
+            f"Max DCA: {config.max_dca_times}x base size\n"
+            f"Take Profit: {config.take_profit_pct}%\n"
+            f"RSI: {config.rsi_period} period, {config.rsi_timeframe}\n"
+            f"─────────────────────\n"
+            f"⚠️ You must execute trades manually when signals appear!"
+        )
+        
+        if not messagebox.askyesno("Confirm Scalping Position", confirm_msg):
+            return
+        
+        # Create or reinitialize scalping bot
+        bingx_client = self.manager.clients[Exchange.BINGX]
+        binance_client = self.manager.clients[Exchange.BINANCE]
+        
+        self.scalping_bot = ScalpingBot(
+            bingx_client=bingx_client,
+            binance_client=binance_client,
+            config=config
+        )
+        
+        # Add notification callback
+        self.scalping_bot.add_notification_callback(self._handle_scalping_notification)
+        
+        # Open position in the bot (this registers for monitoring)
+        async def do_open():
+            position = await self.scalping_bot.open_position(
+                pair=pair,
+                size=size,
+                leverage=leverage,
+                bingx_side=bingx_side
+            )
+            
+            if position:
+                # Start the monitoring loop
+                await self.scalping_bot.start()
+                return True
+            return False
+        
+        def on_complete(future):
+            try:
+                success = future.result()
+                if success:
+                    self.root.after(0, lambda: self._log(f"✅ Scalping position registered for {pair}"))
+                    self.root.after(0, lambda: self._log(f"   BingX {bingx_side} | Binance {binance_side} | Size: ${size}"))
+                    self.root.after(0, lambda: self._log(f"   🔔 Monitoring started - watch for DCA signals!"))
+                    self.root.after(0, lambda: self._log(f"   ⚡ Execute trades MANUALLY when alerts appear"))
+                    
+                    # Update button state
+                    self.root.after(0, lambda: self.open_btn.config(text="⏹ Stop Scalping Monitor"))
+                else:
+                    self.root.after(0, lambda: self._log(f"❌ Failed to register scalping position"))
+            except Exception as e:
+                self.root.after(0, lambda: self._log(f"❌ Error: {e}"))
+        
+        future = self._run_async(do_open())
+        if future:
+            future.add_done_callback(on_complete)
+    
+    def _stop_scalping_monitor(self):
+        """Stop the scalping monitor"""
+        if self.scalping_bot:
+            async def do_stop():
+                await self.scalping_bot.stop()
+            
+            self._run_async(do_stop())
+            self._log("⏹ Scalping monitor stopped")
+            self.open_btn.config(text="⚡ Open Scalping Position")
     
     def _update_usdt_volume(self, event=None):
         """Update USDT volume display based on size and current price"""
