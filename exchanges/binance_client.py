@@ -424,9 +424,22 @@ class BinanceClient(BaseExchangeClient):
         symbol: str,
         side: Side,
         size: float,
-        reduce_only: bool = False
+        reduce_only: bool = False,
+        position_side: str = None
     ) -> Order:
-        """Place a market order"""
+        """Place a market order
+        
+        Args:
+            symbol: Trading symbol
+            side: Side.LONG (BUY) or Side.SHORT (SELL)
+            size: Order size
+            reduce_only: For One-way mode - close position only
+            position_side: For Hedge mode - "LONG" or "SHORT"
+                - Opening LONG: side=LONG, position_side="LONG"
+                - Closing LONG: side=SHORT, position_side="LONG"
+                - Opening SHORT: side=SHORT, position_side="SHORT"
+                - Closing SHORT: side=LONG, position_side="SHORT"
+        """
         binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
         
         params = {
@@ -436,10 +449,14 @@ class BinanceClient(BaseExchangeClient):
             "quantity": size,
         }
         
-        if reduce_only:
+        if position_side:
+            # Hedge mode: use positionSide
+            params["positionSide"] = position_side
+        elif reduce_only:
+            # One-way mode: use reduceOnly
             params["reduceOnly"] = "true"
         else:
-            # Set position side for hedge mode
+            # Default: Hedge mode, position_side based on side
             params["positionSide"] = "LONG" if side == Side.LONG else "SHORT"
         
         result = await self._request("POST", "/fapi/v1/order", params)
@@ -457,6 +474,308 @@ class BinanceClient(BaseExchangeClient):
             timestamp=datetime.fromtimestamp(result.get("updateTime", time.time() * 1000) / 1000, tz=timezone.utc),
             raw_data=result
         )
+    
+    async def place_stop_market_order(
+        self,
+        symbol: str,
+        side: Side,
+        size: float,
+        stop_price: float,
+        position_side: str = None
+    ) -> Order:
+        """Place a STOP_MARKET order (Stop Loss) using Algo Order API
+        
+        Args:
+            symbol: Trading symbol
+            side: BUY or SELL (opposite of position direction)
+            size: Order size
+            stop_price: Price at which to trigger the stop
+            position_side: LONG or SHORT (for hedge mode)
+        """
+        binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
+        
+        # Get tick size and round price properly
+        tick_size = await self._get_tick_size(binance_symbol)
+        stop_price = self._round_to_tick(stop_price, tick_size)
+        
+        logger.info(f"Placing STOP_MARKET (Algo): symbol={binance_symbol}, side={side.value}, triggerPrice={stop_price}, qty={size}, posSide={position_side}")
+        
+        params = {
+            "algoType": "CONDITIONAL",
+            "symbol": binance_symbol,
+            "side": "BUY" if side == Side.LONG else "SELL",
+            "type": "STOP_MARKET",
+            "triggerPrice": stop_price,
+            "quantity": size,
+        }
+        
+        # For hedge mode, use positionSide
+        if position_side:
+            params["positionSide"] = position_side
+        else:
+            # One-way mode - use reduceOnly
+            params["reduceOnly"] = "true"
+        
+        result = await self._request("POST", "/fapi/v1/algoOrder", params)
+        
+        algo_id = str(result.get("algoId", ""))
+        logger.info(f"STOP_MARKET order placed: algoId={algo_id}, {side.value} {size} {binance_symbol} @ trigger {stop_price}")
+        
+        return Order(
+            order_id=algo_id,
+            symbol=binance_symbol,
+            side=side,
+            order_type=OrderType.STOP_MARKET,
+            size=float(result.get("quantity", size)),
+            price=stop_price,
+            filled_size=0,
+            avg_price=0,
+            status=result.get("algoStatus", "NEW"),
+            timestamp=datetime.now(timezone.utc),
+            raw_data=result
+        )
+    
+    async def place_take_profit_market_order(
+        self,
+        symbol: str,
+        side: Side,
+        size: float,
+        stop_price: float,
+        position_side: str = None
+    ) -> Order:
+        """Place a TAKE_PROFIT_MARKET order using Algo Order API
+        
+        Args:
+            symbol: Trading symbol
+            side: BUY or SELL (opposite of position direction)
+            size: Order size
+            stop_price: Price at which to trigger take profit
+            position_side: LONG or SHORT (for hedge mode)
+        """
+        binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
+        
+        # Get tick size and round price properly
+        tick_size = await self._get_tick_size(binance_symbol)
+        stop_price = self._round_to_tick(stop_price, tick_size)
+        
+        logger.info(f"Placing TAKE_PROFIT_MARKET (Algo): symbol={binance_symbol}, side={side.value}, triggerPrice={stop_price}, qty={size}, posSide={position_side}")
+        
+        params = {
+            "algoType": "CONDITIONAL",
+            "symbol": binance_symbol,
+            "side": "BUY" if side == Side.LONG else "SELL",
+            "type": "TAKE_PROFIT_MARKET",
+            "triggerPrice": stop_price,
+            "quantity": size,
+        }
+        
+        # For hedge mode, use positionSide
+        if position_side:
+            params["positionSide"] = position_side
+        else:
+            # One-way mode - use reduceOnly
+            params["reduceOnly"] = "true"
+        
+        result = await self._request("POST", "/fapi/v1/algoOrder", params)
+        
+        algo_id = str(result.get("algoId", ""))
+        logger.info(f"TAKE_PROFIT_MARKET order placed: algoId={algo_id}, {side.value} {size} {binance_symbol} @ trigger {stop_price}")
+        
+        return Order(
+            order_id=algo_id,
+            symbol=binance_symbol,
+            side=side,
+            order_type=OrderType.TAKE_PROFIT_MARKET,
+            size=float(result.get("quantity", size)),
+            price=stop_price,
+            filled_size=0,
+            avg_price=0,
+            status=result.get("algoStatus", "NEW"),
+            timestamp=datetime.now(timezone.utc),
+            raw_data=result
+        )
+    
+    def _round_price(self, price: float) -> float:
+        """Round price to appropriate tick size based on price magnitude (fallback)"""
+        if price >= 10000:
+            return round(price, 1)
+        elif price >= 1000:
+            return round(price, 2)
+        elif price >= 100:
+            return round(price, 3)
+        elif price >= 10:
+            return round(price, 4)
+        elif price >= 1:
+            return round(price, 4)
+        elif price >= 0.1:
+            return round(price, 5)
+        else:
+            return round(price, 6)
+    
+    async def _get_tick_size(self, symbol: str) -> float:
+        """Get tick size (price filter) from exchange info
+        
+        Args:
+            symbol: Binance symbol (e.g., BTCUSDT)
+            
+        Returns:
+            Tick size (e.g., 0.1 for BTC, 0.0001 for low-price coins)
+        """
+        # Check cache first
+        if not hasattr(self, '_tick_size_cache'):
+            self._tick_size_cache = {}
+        
+        if symbol in self._tick_size_cache:
+            return self._tick_size_cache[symbol]
+        
+        try:
+            result = await self._request("GET", "/fapi/v1/exchangeInfo", signed=False)
+            
+            for s in result.get("symbols", []):
+                if s.get("symbol") == symbol:
+                    for f in s.get("filters", []):
+                        if f.get("filterType") == "PRICE_FILTER":
+                            tick_size = float(f.get("tickSize", "0.01"))
+                            self._tick_size_cache[symbol] = tick_size
+                            logger.info(f"Tick size for {symbol}: {tick_size}")
+                            return tick_size
+        except Exception as e:
+            logger.warning(f"Failed to get tick size for {symbol}: {e}")
+        
+        # Fallback based on price magnitude
+        return 0.0001
+        
+    async def get_step_size(self, symbol: str) -> float:
+        """Get step size (lot size filter) from exchange info
+        
+        Args:
+            symbol: Binance symbol (e.g., BTCUSDT)
+            
+        Returns:
+            Step size (e.g., 0.001 for BTC, 1 for low-price coins)
+        """
+        # Check cache first
+        if not hasattr(self, '_step_size_cache'):
+            self._step_size_cache = {}
+            
+        if symbol in self._step_size_cache:
+            return self._step_size_cache[symbol]
+            
+        try:
+            result = await self._request("GET", "/fapi/v1/exchangeInfo", signed=False)
+            
+            for s in result.get("symbols", []):
+                if s.get("symbol") == symbol:
+                    for f in s.get("filters", []):
+                        if f.get("filterType") == "LOT_SIZE" or f.get("filterType") == "MARKET_LOT_SIZE":
+                            step_size = float(f.get("stepSize", "1"))
+                            self._step_size_cache[symbol] = step_size
+                            logger.info(f"Step size for {symbol}: {step_size}")
+                            return step_size
+        except Exception as e:
+            logger.warning(f"Failed to get step size for {symbol}: {e}")
+            
+        return 1.0  # Safe fallback for quantity
+
+    
+    def _round_to_tick(self, price: float, tick_size: float) -> float:
+        """Round price to the nearest tick size
+        
+        Args:
+            price: Price to round
+            tick_size: Minimum price increment
+            
+        Returns:
+            Price rounded to tick size
+        """
+        if tick_size <= 0:
+            return price
+        
+        # Calculate decimal places from tick size
+        tick_str = f"{tick_size:.10f}".rstrip('0')
+        if '.' in tick_str:
+            decimals = len(tick_str.split('.')[1])
+        else:
+            decimals = 0
+        
+        # Round to tick size
+        rounded = round(price / tick_size) * tick_size
+        return round(rounded, decimals)
+    
+    async def cancel_order(self, symbol: str, order_id: str, is_algo: bool = True) -> bool:
+        """Cancel an open order
+        
+        Args:
+            symbol: Trading symbol
+            order_id: Order ID (orderId for regular, algoId for algo orders)
+            is_algo: True to try Algo endpoint first, False for regular first
+            
+        Returns:
+            True if cancelled successfully (or order not found - already filled/cancelled)
+        """
+        binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
+        
+        # Try to cancel - if one endpoint fails, try the other
+        # Orders may have been triggered and become regular orders
+        
+        if is_algo:
+            # Try Algo first, then regular
+            endpoints = [
+                ("/fapi/v1/algoOrder", {"symbol": binance_symbol, "algoId": order_id}),
+                ("/fapi/v1/order", {"symbol": binance_symbol, "orderId": order_id}),
+            ]
+        else:
+            # Try regular first, then algo
+            endpoints = [
+                ("/fapi/v1/order", {"symbol": binance_symbol, "orderId": order_id}),
+                ("/fapi/v1/algoOrder", {"symbol": binance_symbol, "algoId": order_id}),
+            ]
+        
+        for endpoint, params in endpoints:
+            try:
+                result = await self._request("DELETE", endpoint, params)
+                # Check if result indicates success
+                if isinstance(result, dict):
+                    status = result.get("algoStatus") or result.get("status")
+                    if status in ["CANCELLED", "EXPIRED", "FILLED", None]:
+                        logger.info(f"Order {order_id} cancelled via {endpoint}")
+                        return True
+                return True
+            except Exception as e:
+                error_msg = str(e)
+                # -2011: Unknown order - may have been filled/cancelled already
+                # code 200: Success (but formatted as error)
+                if "-2011" in error_msg or "code: 200" in error_msg or "success" in error_msg.lower():
+                    continue  # Try next endpoint or return success
+                logger.debug(f"Cancel attempt failed for {order_id} via {endpoint}: {e}")
+                continue
+        
+        # If we get here, order likely doesn't exist (already filled/cancelled)
+        logger.info(f"Order {order_id} not found - may have been filled or cancelled already")
+        return True  # Return True to prevent retry loops
+    
+    async def cancel_all_orders(self, symbol: str) -> bool:
+        """Cancel all open orders for a symbol
+        
+        Args:
+            symbol: Trading symbol
+            
+        Returns:
+            True if cancelled successfully
+        """
+        binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
+        
+        params = {
+            "symbol": binance_symbol,
+        }
+        
+        try:
+            result = await self._request("DELETE", "/fapi/v1/allOpenOrders", params)
+            logger.info(f"All orders cancelled for {binance_symbol}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to cancel all orders for {binance_symbol}: {e}")
+            return False
     
     async def close_position(self, symbol: str, aggressive: bool = False) -> Order:
         """Close position for symbol
@@ -656,8 +975,49 @@ class BinanceClient(BaseExchangeClient):
             "bid": float(result.get("bidPrice", 0)),
             "ask": float(result.get("askPrice", 0)),
             "volume": float(result.get("volume", 0)),
+            "quote_volume": float(result.get("quoteVolume", 0)),  # Volume in USDT
             "raw": result
         }
+    
+    async def get_klines(self, symbol: str, interval: str = "1m", limit: int = 100) -> List[Dict]:
+        """Get kline/candlestick data
+        
+        Args:
+            symbol: Trading symbol
+            interval: Kline interval (1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d, etc.)
+            limit: Number of klines to fetch (max 1500)
+            
+        Returns:
+            List of kline dicts with: open_time, open, high, low, close, volume, quote_volume
+        """
+        binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
+        
+        params = {
+            "symbol": binance_symbol,
+            "interval": interval,
+            "limit": limit
+        }
+        
+        result = await self._request("GET", "/fapi/v1/klines", params, signed=False)
+        
+        klines = []
+        for k in result:
+            # Binance kline format: [open_time, open, high, low, close, volume, close_time, quote_volume, trades, taker_buy_volume, taker_buy_quote_volume, ignore]
+            klines.append({
+                "open_time": k[0],
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),  # Volume in base asset (e.g., BTC)
+                "close_time": k[6],
+                "quote_volume": float(k[7]),  # Volume in quote asset (USDT)
+                "trades": int(k[8]),
+                "taker_buy_volume": float(k[9]),
+                "taker_buy_quote_volume": float(k[10])
+            })
+        
+        return klines
     
     async def set_position_mode(self, hedge_mode: bool = True) -> bool:
         """Set position mode (hedge or one-way)"""
