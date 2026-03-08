@@ -43,7 +43,6 @@ class MomentumConfig:
     use_volume_confirmation: bool = True  # Enabled by default
     volume_multiplier: float = 2.0  # Volume must be 2x average to confirm
     volume_lookback_candles: int = 20  # Number of candles to calculate average volume
-    volume_candle_interval: str = "1m"  # Candle interval for volume check
     
     # RSI filter - reject signals when RSI is overbought/oversold
     use_rsi_filter: bool = True  # Enabled by default
@@ -62,6 +61,13 @@ class MomentumConfig:
     tp_extension_pct: float = 0.3  # Extend TP by this % when hit
     max_tp_extensions: int = 10  # Max number of TP extensions (0 = unlimited)
     
+    # Extra signal filters
+    max_momentum_pct: float = 0.0  # Skip if |momentum| > this (0 = disabled)
+    min_atr_pct: float = 0.0       # Skip if ATR% < this (0 = disabled)
+    use_ema_trend: bool = False     # Skip trades against EMA trend
+    ema_period: int = 50            # EMA period for trend detection
+    ema_slope_candles: int = 3      # Compare EMA now vs N candles ago
+
     # Risk management
     max_positions: int = 1  # Max concurrent positions
     cooldown_seconds: int = 60  # Wait time after closing position
@@ -221,6 +227,7 @@ class MomentumStrategy:
         self._running = False
         self._monitor_task = None
         self._last_trade_time: Dict[str, datetime] = {}
+        self._last_candle_open_ts: int = 0  # Track last candle we ran signal check on
         
         # Symbol being monitored
         self.symbol: Optional[str] = None
@@ -230,9 +237,17 @@ class MomentumStrategy:
         self.symbol = symbol
         self._running = True
         
-        # Initialize tracker
+        # Initialize tracker with enough capacity for lookback
+        # lookback_candles * timeframe_seconds / check_interval = entries needed
+        # E.g. 7 candles × 900s (15m) / 1s check = 6300 entries needed
         if symbol not in self.trackers:
-            self.trackers[symbol] = PriceTracker()
+            entries_needed = int(
+                (self.config.lookback_candles * self.config.timeframe_seconds) 
+                / self.config.check_interval_seconds
+            ) + 200  # buffer
+            max_history = max(1000, entries_needed)
+            self.trackers[symbol] = PriceTracker(max_history=max_history)
+            self.log(f"PriceTracker capacity: {max_history} (lookback {self.config.lookback_candles}×{self.config.timeframe_seconds}s)")
         
         # Fetch historical data to have enough lookback data
         await self._fetch_historical_data(symbol)
@@ -277,31 +292,75 @@ class MomentumStrategy:
         self.log("Momentum strategy stopped")
     
     async def _monitor_loop(self):
-        """Main monitoring loop"""
+        """Main monitoring loop with hard timeout and heartbeat"""
+        import time as _time
+        last_heartbeat = _time.time()
+        
+        self.log(f"🟢 Monitor loop started for {self.symbol}")
+        
         while self._running and self.symbol:
             try:
-                # Fetch current price
-                price = await self._fetch_price(self.symbol)
-                if price:
-                    tracker = self.trackers[self.symbol]
-                    tracker.add_price(price)
-                    
-                    # Check for signals (Only if we DON'T have an active trade)
-                    if self.symbol not in self.active_trades:
-                        signal = await self._check_signal(self.symbol)
-                        if signal and signal.direction != TradeDirection.NONE:
-                            await self._handle_signal(signal)
-                    
-                    # Monitor active trades
-                    await self._monitor_trades()
-                
-                await asyncio.sleep(self.config.check_interval_seconds)
-                
+                # Hard timeout 30s: nếu BẤT KỲ request nào hang, cắt ngay và retry
+                # aiohttp ClientTimeout không phải lúc nào cũng đáng tin khi server
+                # giữ connection mở mà không gửi data
+                await asyncio.wait_for(
+                    self._monitor_one_cycle(),
+                    timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                try:
+                    self.log(f"⚠️ Monitor cycle timeout (30s) - Binance API có thể chậm, retrying...")
+                except Exception:
+                    logger.error("Monitor cycle timeout (30s)")
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self.log(f"Error in monitor loop: {e}")
+                try:
+                    self.log(f"Error in monitor loop: {e}")
+                except Exception:
+                    logger.error(f"Error in monitor loop (log also failed): {e}")
                 await asyncio.sleep(5)
+                continue
+            
+            # Heartbeat mỗi 120s: log xác nhận task còn sống
+            now = _time.time()
+            if now - last_heartbeat > 120:
+                last_heartbeat = now
+                trades_count = len(self.active_trades)
+                try:
+                    self.log(f"💓 Monitor alive | {self.symbol} | Active trades: {trades_count}")
+                except Exception:
+                    pass
+            
+            await asyncio.sleep(self.config.check_interval_seconds)
+        
+        self.log(f"🔴 Monitor loop exited | running={self._running} | symbol={self.symbol}")
+    
+    async def _monitor_one_cycle(self):
+        """Single cycle of the monitor loop - tách ra để wrap asyncio.wait_for()"""
+        # Fetch current price
+        price = await self._fetch_price(self.symbol)
+        if price:
+            tracker = self.trackers[self.symbol]
+            tracker.add_price(price)
+            
+            # Check for signals ONLY on candle close (= khi nến mới vừa mở)
+            # Sync với backtest: backtest check tại candle close, live cũng vậy
+            if self.symbol not in self.active_trades:
+                import time as _time_module
+                now_ts = int(_time_module.time())
+                candle_open_ts = (now_ts // self.config.timeframe_seconds) * self.config.timeframe_seconds
+                
+                if candle_open_ts > self._last_candle_open_ts:
+                    self._last_candle_open_ts = candle_open_ts
+                    candle_time_str = datetime.fromtimestamp(candle_open_ts, tz=timezone.utc).strftime('%H:%M')
+                    self.log(f"🕯️ Nến mới {candle_time_str} UTC — checking signal...")
+                    signal = await self._check_signal(self.symbol)
+                    if signal and signal.direction != TradeDirection.NONE:
+                        await self._handle_signal(signal)
+            
+            # Monitor active trades (mỗi giây vẫn check để TP/SL chính xác)
+            await self._monitor_trades()
     
     async def _fetch_price(self, symbol: str) -> Optional[float]:
         """Fetch current price from exchange"""
@@ -311,46 +370,6 @@ class MomentumStrategy:
         except Exception as e:
             logger.error(f"Error fetching price for {symbol}: {e}")
             return None
-    
-    async def _fetch_volume_ratio(self, symbol: str) -> float:
-        """Fetch volume ratio (current candle volume / average volume) from exchange klines
-        
-        Returns:
-            Volume ratio (current/average). Returns 1.0 if unable to fetch data.
-        """
-        try:
-            # Fetch N+1 candles: N for average + 1 for current
-            limit = self.config.volume_lookback_candles + 1
-            klines = await self.exchange.get_klines(
-                symbol=symbol,
-                interval=self.config.volume_candle_interval,
-                limit=limit
-            )
-            
-            if len(klines) < 2:
-                logger.warning(f"Not enough klines for volume calculation: {len(klines)}")
-                return 1.0
-            
-            # Last candle is current (incomplete), rest are for average
-            current_volume = klines[-1]["quote_volume"]  # Use USDT volume
-            
-            # Calculate average from completed candles (exclude current)
-            historical_volumes = [k["quote_volume"] for k in klines[:-1]]
-            if not historical_volumes:
-                return 1.0
-            
-            avg_volume = sum(historical_volumes) / len(historical_volumes)
-            
-            if avg_volume <= 0:
-                return 1.0
-            
-            ratio = current_volume / avg_volume
-            logger.debug(f"Volume ratio for {symbol}: {ratio:.2f} (current: {current_volume:.0f}, avg: {avg_volume:.0f})")
-            return ratio
-            
-        except Exception as e:
-            logger.warning(f"Error fetching volume ratio for {symbol}: {e}")
-            return 1.0  # Default to 1.0 (no volume filter) on error
     
     @staticmethod
     def _calculate_rsi(close_prices: list, period: int = 14) -> float:
@@ -405,9 +424,12 @@ class MomentumStrategy:
         try:
             # Need rsi_period + 1 data points minimum, fetch extra for accuracy
             limit = self.config.rsi_period + 10
+            # PHẢI dùng đúng timeframe đang trade (15m), KHÔNG phải volume_candle_interval (1m)
+            tf_map = {60: "1m", 300: "5m", 900: "15m", 1800: "30m", 3600: "1h"}
+            interval = tf_map.get(self.config.timeframe_seconds, "5m")
             klines = await self.exchange.get_klines(
                 symbol=symbol,
-                interval=self.config.volume_candle_interval,
+                interval=interval,
                 limit=limit
             )
             
@@ -435,6 +457,18 @@ class MomentumStrategy:
         lookback_period = self.config.lookback_candles * self.config.timeframe_seconds
         price_change = tracker.get_price_change(lookback_period)
         if price_change is None:
+            # Log periodically (not every 1s) to avoid flooding
+            import time as _t
+            now_t = _t.time()
+            if not hasattr(self, '_last_nodata_log') or now_t - self._last_nodata_log > 30:
+                self._last_nodata_log = now_t
+                oldest_age = 0
+                if tracker.prices:
+                    oldest_age = (datetime.now(timezone.utc) - tracker.prices[0].timestamp).total_seconds()
+                self.log(
+                    f"⏳ Chưa đủ dữ liệu lookback: cần {lookback_period}s, có {oldest_age:.0f}s "
+                    f"({len(tracker.prices)}/{tracker.prices.maxlen} entries)"
+                )
             return None
         
         current_price = tracker.get_current_price()
@@ -460,49 +494,44 @@ class MomentumStrategy:
             elif price_change <= -threshold * 1.5:
                 strength = SignalStrength.MEDIUM
         
-        # Volume confirmation - use lookback candles average
-        # Volume confirmation - calculate always for tracking visibility
-        volume_ratio = 1.0
-        if self.config.use_volume_confirmation:
-            # Calculate volume ratio using historical klines
+        # Max momentum filter (skip mean-reversion extremes)
+        if self.config.max_momentum_pct > 0 and abs(price_change) > self.config.max_momentum_pct:
+            logger.debug(f"Max momentum filter: rejected, |change|={abs(price_change):.2f}% > {self.config.max_momentum_pct}%")
+            return None
+
+        # Fetch klines (shared for volume confirmation + ATR filter)
+        import time
+        klines_data = None
+        if self.config.use_volume_confirmation or self.config.min_atr_pct > 0:
             try:
                 tf_map = {60: "1m", 300: "5m", 900: "15m", 1800: "30m", 3600: "1h"}
                 interval = tf_map.get(self.config.timeframe_seconds, "5m")
-                limit = self.config.volume_lookback_candles + 1
-                klines = await self.exchange.get_klines(symbol, interval, limit)
-                if klines and len(klines) >= 2:
-                    current_vol = float(klines[-1].get("volume", 0))
-                    
-                    # CỰC KỲ QUAN TRỌNG: Project volume (Dự phóng volume nến hiện tại)
-                    # Vì nến hiện tại chưa đóng, volume của nó sẽ nhỏ hơn trung bình.
-                    # Khác với backtest (dùng nến đã đóng), app thật phải dự phóng volume.
-                    import time
-                    open_time = klines[-1].get("open_time", 0)
+                limit = self.config.volume_lookback_candles + 16  # extra for ATR (14 candles)
+                klines_data = await self.exchange.get_klines(symbol, interval, limit)
+            except Exception as e:
+                logger.warning(f"Klines fetch error for {symbol}: {e}")
+
+        # Volume confirmation
+        volume_ratio = 1.0
+        if self.config.use_volume_confirmation:
+            if klines_data and len(klines_data) >= 2:
+                try:
                     now_ms = time.time() * 1000
-                    elapsed_ms = now_ms - open_time
-                    interval_ms = self.config.timeframe_seconds * 1000
-                    
-                    # Nếu nến mới mở < 1 phút thì dễ nhiễu, nhưng vẫn project
-                    if 0 < elapsed_ms < interval_ms:
-                        projected_vol = current_vol * (interval_ms / elapsed_ms)
+                    if klines_data[-1].get("close_time", 0) > now_ms:
+                        closed_candle = klines_data[-2]
+                        avg_klines = klines_data[:-2]
                     else:
-                        projected_vol = current_vol
-                        
-                    avg_vol = sum(float(k.get("volume", 0)) for k in klines[:-1]) / (len(klines) - 1)
-                    volume_ratio = projected_vol / avg_vol if avg_vol > 0 else 1.0
-                    
-                    # Log định kỳ mỗi 5s để dễ theo dõi lúc app soi volume 
-                    if not hasattr(self, '_last_vol_log') or (now_ms / 1000) - self._last_vol_log > 5:
-                        self._last_vol_log = now_ms / 1000
-                        rem = (interval_ms - elapsed_ms) / 1000
-                        perc = (elapsed_ms / interval_ms) * 100
-                        self.log(f"📊 Check Vol {symbol}: Cur={current_vol:.0f}, Proj={projected_vol:.0f}, Avg={avg_vol:.0f} | Ratio: {volume_ratio:.2f}x (yêu cầu {self.config.volume_multiplier}x) | Đốt {perc:.1f}% nến (còn {rem:.0f}s)")
-            except Exception:
-                volume_ratio = 1.0
-            
+                        closed_candle = klines_data[-1]
+                        avg_klines = klines_data[:-1]
+                    current_vol = float(closed_candle.get("volume", 0))
+                    avg_vol = sum(float(k.get("volume", 0)) for k in avg_klines) / len(avg_klines) if avg_klines else 1.0
+                    volume_ratio = current_vol / avg_vol if avg_vol > 0 else 1.0
+                    self.log(f"📊 Vol {symbol}: Closed={current_vol:.0f}, Avg={avg_vol:.0f} | Ratio: {volume_ratio:.2f}x (yêu cầu {self.config.volume_multiplier}x)")
+                except Exception as e:
+                    logger.warning(f"Volume check error for {symbol}: {e}")
             if volume_ratio < self.config.volume_multiplier:
                 direction = TradeDirection.NONE
-        
+
         # RSI filter (optional) - reject overbought LONG / oversold SHORT
         rsi = 50.0
         if self.config.use_rsi_filter and direction != TradeDirection.NONE:
@@ -513,7 +542,40 @@ class MomentumStrategy:
             elif direction == TradeDirection.SHORT and rsi < self.config.rsi_oversold:
                 logger.debug(f"RSI filter: SHORT rejected, RSI={rsi:.1f} < {self.config.rsi_oversold} (oversold)")
                 direction = TradeDirection.NONE
-        
+
+        # Min ATR filter (skip flat/sideways markets)
+        if self.config.min_atr_pct > 0 and direction != TradeDirection.NONE:
+            if klines_data and len(klines_data) >= 15:
+                atr_candles = klines_data[-15:-1]  # last 14 closed candles
+                ranges = [float(k.get("high", 0)) - float(k.get("low", 0)) for k in atr_candles]
+                atr = sum(ranges) / len(ranges) if ranges else 0
+                atr_pct = atr / current_price * 100 if current_price > 0 else 0
+                if atr_pct < self.config.min_atr_pct:
+                    logger.debug(f"Min ATR filter: rejected, ATR%={atr_pct:.3f}% < {self.config.min_atr_pct}%")
+                    direction = TradeDirection.NONE
+
+        # EMA trend filter (skip trades against trend)
+        if self.config.use_ema_trend and direction != TradeDirection.NONE:
+            need = self.config.ema_period + self.config.ema_slope_candles + 2
+            if klines_data and len(klines_data) >= need:
+                try:
+                    from backtest import calculate_ema
+                    closes_live = [float(k.get("close", 0)) for k in klines_data]
+                    sc = self.config.ema_slope_candles
+                    p  = self.config.ema_period
+                    ema_now  = calculate_ema(closes_live, p)
+                    ema_prev = calculate_ema(closes_live[:-sc], p)
+                    trending_up   = ema_now > ema_prev
+                    trending_down = ema_now < ema_prev
+                    if direction == TradeDirection.SHORT and trending_up:
+                        logger.debug(f"EMA trend filter: SHORT rejected, EMA dốc lên ({ema_prev:.2f} -> {ema_now:.2f})")
+                        direction = TradeDirection.NONE
+                    elif direction == TradeDirection.LONG and trending_down:
+                        logger.debug(f"EMA trend filter: LONG rejected, EMA dốc xuống ({ema_prev:.2f} -> {ema_now:.2f})")
+                        direction = TradeDirection.NONE
+                except Exception as e:
+                    logger.warning(f"EMA trend filter error: {e}")
+
         if direction == TradeDirection.NONE:
             return None
         
@@ -549,10 +611,20 @@ class MomentumStrategy:
             return
         
         # Check cooldown
+        # Dùng cooldown_seconds nếu set > 0, ngược lại tự tính từ timeframe để sync backtest (cooldown_candles=4)
+        COOLDOWN_CANDLES = 4
+        effective_cooldown = self.config.cooldown_seconds if self.config.cooldown_seconds > 0 else (COOLDOWN_CANDLES * self.config.timeframe_seconds)
+        # Nếu cooldown_seconds nhỏ hơn 1 nến → tự động nâng lên 4 nến để khớp backtest
+        min_cooldown = COOLDOWN_CANDLES * self.config.timeframe_seconds
+        if effective_cooldown < min_cooldown:
+            effective_cooldown = min_cooldown
+
         last_trade = self._last_trade_time.get(symbol)
         if last_trade:
             elapsed = (datetime.now(timezone.utc) - last_trade).total_seconds()
-            if elapsed < self.config.cooldown_seconds:
+            if elapsed < effective_cooldown:
+                remaining = effective_cooldown - elapsed
+                self.log(f"⏸️ Cooldown: còn {remaining:.0f}s ({effective_cooldown/self.config.timeframe_seconds:.0f} nến)")
                 return  # Still in cooldown
         
         # Check max positions

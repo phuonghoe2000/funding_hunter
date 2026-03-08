@@ -191,7 +191,8 @@ class BinanceClient(BaseExchangeClient):
             status = o.get("X") # NEW, FILLED, CANCELED
             order_id = str(o.get("i"))
             
-            logger.info(f"WS: Order {order_id} ({symbol}) update: {status}")
+            # Log at DEBUG level to avoid flooding the user's console when they manual trade other pairs
+            logger.debug(f"WS: Order {order_id} ({symbol}) update: {status}")
 
     async def get_mark_price(self, symbol: str) -> float:
         """Get current mark price"""

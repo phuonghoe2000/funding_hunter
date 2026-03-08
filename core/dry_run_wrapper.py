@@ -73,6 +73,10 @@ class DryRunExchangeWrapper:
         """Pass through to real client"""
         return await self.real_client.get_ticker(symbol)
     
+    async def get_klines(self, symbol: str, interval: str = "1m", limit: int = 100) -> List[Dict]:
+        """Pass through to real client for volume data"""
+        return await self.real_client.get_klines(symbol, interval, limit)
+    
     def get_exchange_name(self) -> str:
         """Return wrapped exchange name with dry run indicator"""
         return f"{self.real_client.get_exchange_name()} (DRY RUN)"
@@ -97,16 +101,18 @@ class DryRunExchangeWrapper:
         symbol: str,
         side: Side,
         size: float,
-        reduce_only: bool = False
+        reduce_only: bool = False,
+        position_side: str = None
     ) -> Order:
         """
         Simulate placing a market order.
         
         Args:
             symbol: Trading symbol
-            side: BUY or SELL
+            side: LONG or SHORT
             size: Order size in contracts/USDT
             reduce_only: If True, only reduces position
+            position_side: For Hedge mode (LONG or SHORT)
             
         Returns:
             Simulated order object
@@ -161,8 +167,8 @@ class DryRunExchangeWrapper:
         
         if existing:
             # Close or modify existing position
-            if reduce_only or (existing.side == Side.BUY and side == Side.SELL) or \
-               (existing.side == Side.SELL and side == Side.BUY):
+            if reduce_only or (existing.side == Side.LONG and side == Side.SHORT) or \
+               (existing.side == Side.SHORT and side == Side.LONG):
                 # Closing position
                 if size >= existing.size:
                     # Fully closed
@@ -182,7 +188,7 @@ class DryRunExchangeWrapper:
                 existing.mark_price = price
         else:
             # Create new position
-            pos_side = Side.BUY if side == Side.BUY else Side.SELL
+            pos_side = Side.LONG if side == Side.LONG else Side.SHORT
             self._simulated_positions[symbol] = Position(
                 symbol=symbol,
                 side=pos_side,
@@ -199,10 +205,94 @@ class DryRunExchangeWrapper:
     
     def _calculate_pnl(self, position: Position, exit_price: float) -> float:
         """Calculate PnL for closing a position"""
-        if position.side == Side.BUY:
+        if position.side == Side.LONG:
             return (exit_price - position.entry_price) * position.size
         else:
             return (position.entry_price - exit_price) * position.size
+    
+    async def place_stop_market_order(
+        self,
+        symbol: str,
+        side: Side,
+        size: float,
+        stop_price: float,
+        position_side: str = None
+    ) -> Order:
+        """Simulate placing a STOP_MARKET order (Stop Loss)"""
+        from config.constants import OrderType
+        
+        self._order_counter += 1
+        order_id = f"DRY_SL_{self._order_counter}_{uuid.uuid4().hex[:8]}"
+        
+        order = Order(
+            order_id=order_id,
+            symbol=symbol,
+            side=side,
+            order_type=OrderType.STOP_MARKET,
+            size=size,
+            price=stop_price,
+            filled_size=0,
+            avg_price=0,
+            status="NEW",
+            timestamp=datetime.now(timezone.utc)
+        )
+        
+        self._simulated_orders.append(order)
+        logger.info(f"[DRY RUN] STOP_MARKET order: {side.value} {size} {symbol} @ stop {stop_price:.2f}")
+        
+        return order
+    
+    async def place_take_profit_market_order(
+        self,
+        symbol: str,
+        side: Side,
+        size: float,
+        stop_price: float,
+        position_side: str = None
+    ) -> Order:
+        """Simulate placing a TAKE_PROFIT_MARKET order"""
+        from config.constants import OrderType
+        
+        self._order_counter += 1
+        order_id = f"DRY_TP_{self._order_counter}_{uuid.uuid4().hex[:8]}"
+        
+        order = Order(
+            order_id=order_id,
+            symbol=symbol,
+            side=side,
+            order_type=OrderType.TAKE_PROFIT_MARKET,
+            size=size,
+            price=stop_price,
+            filled_size=0,
+            avg_price=0,
+            status="NEW",
+            timestamp=datetime.now(timezone.utc)
+        )
+        
+        self._simulated_orders.append(order)
+        logger.info(f"[DRY RUN] TAKE_PROFIT_MARKET order: {side.value} {size} {symbol} @ tp {stop_price:.2f}")
+        
+        return order
+    
+    async def cancel_order(self, symbol: str, order_id: str, is_algo: bool = True) -> bool:
+        """Simulate cancelling an order"""
+        for order in self._simulated_orders:
+            if order.order_id == order_id:
+                order.status = "CANCELLED"
+                logger.info(f"[DRY RUN] Order {order_id} cancelled")
+                return True
+        logger.warning(f"[DRY RUN] Order {order_id} not found")
+        return False
+    
+    async def cancel_all_orders(self, symbol: str) -> bool:
+        """Simulate cancelling all orders for a symbol"""
+        count = 0
+        for order in self._simulated_orders:
+            if order.symbol == symbol and order.status == "NEW":
+                order.status = "CANCELLED"
+                count += 1
+        logger.info(f"[DRY RUN] Cancelled {count} orders for {symbol}")
+        return True
     
     async def close_position(self, symbol: str, aggressive: bool = False) -> Optional[Order]:
         """
@@ -222,7 +312,7 @@ class DryRunExchangeWrapper:
             return None
         
         # Determine close side
-        close_side = Side.SELL if position.side == Side.BUY else Side.BUY
+        close_side = Side.SHORT if position.side == Side.LONG else Side.LONG
         
         return await self.place_market_order(
             symbol=symbol,

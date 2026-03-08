@@ -22,6 +22,8 @@ class OrderType(Enum):
     """Order type"""
     MARKET = "market"
     LIMIT = "limit"
+    STOP_MARKET = "stop_market"
+    TAKE_PROFIT_MARKET = "take_profit_market"
 
 
 class PositionStatus(Enum):

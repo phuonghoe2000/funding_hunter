@@ -16,8 +16,8 @@ import sys
 import os
 import io
 
-# Fix Windows console encoding
-if sys.platform == 'win32':
+# Fix Windows console encoding (only when run directly, not when imported)
+if __name__ == '__main__' and sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 from dataclasses import dataclass, field
@@ -54,6 +54,13 @@ class BacktestConfig:
     rsi_overbought: float = 70.0
     rsi_oversold: float = 30.0
     cooldown_candles: int = 4               # Cooldown sau khi đóng lệnh (= 60s / 15m ≈ 1, dùng 4 cho an toàn)
+    max_momentum_pct: float = 0.0           # Skip if |momentum| > this (0 = disabled)
+    min_atr_pct: float = 0.0               # Skip if ATR% < this (0 = disabled)
+    max_atr_pct: float = 0.0               # Skip if ATR% > this (0 = disabled)
+    blocked_hours: list = None             # Block specific UTC hours e.g. [4,8,21,22]
+    use_ema_trend: bool = False             # Skip trades against EMA trend
+    ema_period: int = 50                    # EMA period for trend detection
+    ema_slope_candles: int = 3             # Compare EMA now vs N candles ago
 
 
 @dataclass
@@ -103,11 +110,23 @@ def calculate_rsi(close_prices: list, period: int = 14) -> float:
     return 100 - (100 / (1 + rs))
 
 
+def calculate_ema(close_prices: list, period: int) -> float:
+    """EMA - Exponential Moving Average"""
+    if len(close_prices) < period:
+        return close_prices[-1] if close_prices else 0.0
+    k = 2.0 / (period + 1)
+    ema = sum(close_prices[:period]) / period
+    for price in close_prices[period:]:
+        ema = price * k + ema * (1 - k)
+    return ema
+
+
 # ==================== Backtest Engine ====================
 
 class BacktestEngine:
-    def __init__(self, config: BacktestConfig):
+    def __init__(self, config: BacktestConfig, silent: bool = False):
         self.config = config
+        self.silent = silent
         self.trades: List[BacktestTrade] = []
         self.active_trade: Optional[BacktestTrade] = None
         self.cooldown_until: int = 0  # candle index until cooldown expires
@@ -115,12 +134,15 @@ class BacktestEngine:
     def run(self, klines: list) -> List[BacktestTrade]:
         """Run backtest trên klines data"""
         n = len(klines)
-        print(f"  Tổng candles: {n}")
-        print(f"  Thời gian: {self._ts(klines[0][0])} → {self._ts(klines[-1][6])}")
-        print()
+        if not self.silent:
+            print(f"  Tổng candles: {n}")
+            print(f"  Thời gian: {self._ts(klines[0][0])} → {self._ts(klines[-1][6])}")
+            print()
 
         close_prices = [float(k[4]) for k in klines]
         volumes = [float(k[5]) for k in klines]
+        highs = [float(k[2]) for k in klines]
+        lows = [float(k[3]) for k in klines]
 
         for i in range(self.config.lookback_candles + self.config.volume_lookback, n):
             candle = klines[i]
@@ -144,7 +166,7 @@ class BacktestEngine:
                 continue
 
             # Check signal
-            signal = self._check_signal(close_prices, volumes, i)
+            signal = self._check_signal(close_prices, volumes, highs, lows, i, candle_time)
             if signal:
                 self._open_trade(signal, current_close, candle_time)
 
@@ -158,7 +180,7 @@ class BacktestEngine:
 
         return self.trades
 
-    def _check_signal(self, closes: list, volumes: list, idx: int) -> Optional[TradeDirection]:
+    def _check_signal(self, closes: list, volumes: list, highs: list, lows: list, idx: int, candle_time: datetime = None) -> Optional[TradeDirection]:
         """Check momentum signal at candle index"""
         lookback = self.config.lookback_candles
         current = closes[idx]
@@ -179,6 +201,17 @@ class BacktestEngine:
         else:
             return None
 
+        # Max momentum filter (skip mean-reversion extremes)
+        if self.config.max_momentum_pct > 0 and abs(price_change_pct) > self.config.max_momentum_pct:
+            return None
+
+        # Blocked hours filter (UTC)
+        if self.config.blocked_hours and candle_time is not None:
+            from datetime import timezone
+            hour = candle_time.astimezone(timezone.utc).hour
+            if hour in self.config.blocked_hours:
+                return None
+
         # Volume confirmation
         if self.config.use_volume_confirmation:
             current_vol = volumes[idx]
@@ -197,6 +230,30 @@ class BacktestEngine:
                 return None
             if direction == TradeDirection.SHORT and rsi < self.config.rsi_oversold:
                 return None
+
+        # Min/Max ATR filter
+        if self.config.min_atr_pct > 0 or self.config.max_atr_pct > 0:
+            atr_ranges = [highs[j] - lows[j] for j in range(max(0, idx - 14), idx)]
+            atr = sum(atr_ranges) / len(atr_ranges) if atr_ranges else 0
+            atr_pct = atr / current * 100 if current > 0 else 0
+            if self.config.min_atr_pct > 0 and atr_pct < self.config.min_atr_pct:
+                return None
+            if self.config.max_atr_pct > 0 and atr_pct > self.config.max_atr_pct:
+                return None
+
+        # EMA trend filter (skip trades against trend)
+        if self.config.use_ema_trend:
+            p = self.config.ema_period
+            sc = self.config.ema_slope_candles
+            if idx >= p + sc:
+                ema_now  = calculate_ema(closes[idx - p - sc: idx + 1], p)
+                ema_prev = calculate_ema(closes[idx - p - sc: idx - sc + 1], p)
+                trending_up   = ema_now > ema_prev
+                trending_down = ema_now < ema_prev
+                if direction == TradeDirection.SHORT and trending_up:
+                    return None  # EMA dốc lên -> cấm SHORT
+                if direction == TradeDirection.LONG and trending_down:
+                    return None  # EMA dốc xuống -> cấm LONG
 
         return direction
 
@@ -341,6 +398,13 @@ def print_report(trades: List[BacktestTrade], config: BacktestConfig):
     print(f"    TP/SL:     {config.take_profit_pct}% / {config.stop_loss_pct}%")
     print(f"    Trailing:  {'ON' if config.use_trailing_tp else 'OFF'} (+{config.tp_extension_pct}%, max {config.max_tp_extensions})")
     print(f"    Filters:   Vol {'ON' if config.use_volume_confirmation else 'OFF'} ({config.volume_multiplier}x) | RSI {'ON' if config.use_rsi_filter else 'OFF'} ({config.rsi_overbought}/{config.rsi_oversold})")
+    max_mom_str = f"{config.max_momentum_pct}%" if config.max_momentum_pct > 0 else "OFF"
+    min_atr_str = f"{config.min_atr_pct}%" if config.min_atr_pct > 0 else "OFF"
+    max_atr_str = f"{config.max_atr_pct}%" if config.max_atr_pct > 0 else "OFF"
+    ema_str = f"EMA{config.ema_period}(slope {config.ema_slope_candles}c)" if config.use_ema_trend else "OFF"
+    blocked_str = str(config.blocked_hours) if config.blocked_hours else "OFF"
+    print(f"    Extra:     MaxMom {max_mom_str} | ATR [{min_atr_str}-{max_atr_str}] | EMA Trend {ema_str}")
+    print(f"    BlockHours:{blocked_str}")
 
     print(f"\n  ─── Tổng quan ───")
     print(f"    Tổng trades:     {len(trades)}")
@@ -466,6 +530,14 @@ def main():
             config.use_rsi_filter = cfg.get("rsi_filter", config.use_rsi_filter)
             config.rsi_overbought = float(cfg.get("rsi_overbought", config.rsi_overbought))
             config.rsi_oversold = float(cfg.get("rsi_oversold", config.rsi_oversold))
+            config.max_momentum_pct = float(cfg.get("max_momentum_pct", config.max_momentum_pct))
+            config.min_atr_pct = float(cfg.get("min_atr_pct", config.min_atr_pct))
+            config.max_atr_pct = float(cfg.get("max_atr_pct", config.max_atr_pct))
+            bh = cfg.get("blocked_hours", None)
+            config.blocked_hours = [int(h) for h in bh] if bh else None
+            config.use_ema_trend = bool(cfg.get("use_ema_trend", config.use_ema_trend))
+            config.ema_period = int(cfg.get("ema_period", config.ema_period))
+            config.ema_slope_candles = int(cfg.get("ema_slope_candles", config.ema_slope_candles))
             print(f"⚙️  Config loaded from autotrade_config.json")
         except Exception as e:
             print(f"⚠️ Failed to load config, using defaults: {e}")

@@ -10,7 +10,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, Union, TYPE_CHECKING
+from typing import Optional, Dict, Any, Union, List, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from core.dry_run_wrapper import DryRunExchangeWrapper
@@ -30,6 +30,8 @@ from core.momentum_strategy import (
     ActiveTrade,
     TradeDirection
 )
+from core.auto_config_scanner import download_klines_data, run_config_scan, get_best_config, format_top_results
+
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,10 @@ class AutoTradeGUI:
         self.is_trading = False
         self.is_dry_run = False  # Track if dry run mode is active
         
+        # Session PnL tracking
+        self.session_trades: list = []  # list of (pnl_usdt, direction, reason)
+        self.session_pnl: float = 0.0
+        
         # Build UI
         self._create_widgets()
         self._setup_logging()
@@ -89,21 +95,26 @@ class AutoTradeGUI:
         main_frame.pack(fill=tk.BOTH, expand=True)
         
         # Title
-        title = ttk.Label(main_frame, text="⚡ Momentum Auto Trade", style='Title.TLabel')
+        title = ttk.Label(main_frame, text="Momentum Auto Trade", style='Title.TLabel')
         title.pack(pady=(0, 10))
         
+        # Build trading content directly in main frame
+        self._create_trading_content(main_frame)
+    
+    def _create_trading_content(self, parent):
+        """Create trading content"""
         # Top section: Exchange + Strategy config
-        top_frame = ttk.Frame(main_frame)
+        top_frame = ttk.Frame(parent)
         top_frame.pack(fill=tk.X, pady=5)
         
         self._create_exchange_frame(top_frame)
         self._create_strategy_frame(top_frame)
         
         # Middle section: Trading controls
-        self._create_trading_frame(main_frame)
+        self._create_trading_frame(parent)
         
-        # Bottom section: Log
-        self._create_log_frame(main_frame)
+        # Log section
+        self._create_log_frame(parent)
     
     def _create_exchange_frame(self, parent):
         """Create exchange connection frame"""
@@ -185,18 +196,30 @@ class AutoTradeGUI:
         ttk.Label(thresh_row, text="Price Change Trigger:").pack(side=tk.LEFT, padx=5)
         self.threshold_var = tk.StringVar(value="1.0")
         ttk.Entry(thresh_row, textvariable=self.threshold_var, width=6).pack(side=tk.LEFT, padx=5)
-        ttk.Label(thresh_row, text="%").pack(side=tk.LEFT)
+        ttk.Label(thresh_row, text="% over").pack(side=tk.LEFT)
+        
+        self.lookback_var = tk.StringVar(value="7")
+        ttk.Entry(thresh_row, textvariable=self.lookback_var, width=4).pack(side=tk.LEFT, padx=5)
+        ttk.Label(thresh_row, text="candles").pack(side=tk.LEFT)
         
         # Position settings
         pos_row = ttk.Frame(frame)
         pos_row.pack(fill=tk.X, pady=5)
         
-        ttk.Label(pos_row, text="Size:").pack(side=tk.LEFT, padx=5)
+        # Volume (USDT) - tool will calculate size = floor(volume/price)
+        ttk.Label(pos_row, text="Volume:").pack(side=tk.LEFT, padx=5)
         self.size_var = tk.StringVar(value="100")
-        ttk.Entry(pos_row, textvariable=self.size_var, width=8).pack(side=tk.LEFT, padx=5)
+        size_entry = ttk.Entry(pos_row, textvariable=self.size_var, width=10)
+        size_entry.pack(side=tk.LEFT, padx=5)
         ttk.Label(pos_row, text="USDT").pack(side=tk.LEFT)
         
-        ttk.Label(pos_row, text="Leverage:").pack(side=tk.LEFT, padx=(20, 5))
+        # Size display (calculated: floor(volume/price))
+        ttk.Label(pos_row, text="→ Size:").pack(side=tk.LEFT, padx=(10, 2))
+        self.usdt_value_label = ttk.Label(pos_row, text="--", font=('Helvetica', 9, 'bold'), foreground="blue")
+        self.usdt_value_label.pack(side=tk.LEFT)
+        ttk.Label(pos_row, text="coins").pack(side=tk.LEFT, padx=(2, 10))
+        
+        ttk.Label(pos_row, text="Leverage:").pack(side=tk.LEFT, padx=(10, 5))
         self.leverage_var = tk.StringVar(value="10")
         ttk.Spinbox(pos_row, from_=1, to=50, width=5, textvariable=self.leverage_var).pack(side=tk.LEFT, padx=5)
         
@@ -231,7 +254,74 @@ class AutoTradeGUI:
         self.max_tp_var = tk.StringVar(value="10")
         ttk.Spinbox(trailing_row, from_=0, to=50, width=4, textvariable=self.max_tp_var).pack(side=tk.LEFT, padx=2)
         ttk.Label(trailing_row, text="(0=unlimited)").pack(side=tk.LEFT, padx=2)
-    
+        
+        # Volume confirmation settings
+        vol_row = ttk.Frame(frame)
+        vol_row.pack(fill=tk.X, pady=5)
+        
+        self.vol_confirm_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(vol_row, text="Volume Confirm", 
+                       variable=self.vol_confirm_var).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(vol_row, text="Multiplier:").pack(side=tk.LEFT, padx=(10, 5))
+        self.vol_multiplier_var = tk.StringVar(value="2.0")
+        ttk.Entry(vol_row, textvariable=self.vol_multiplier_var, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(vol_row, text="x avg").pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(vol_row, text="Lookback:").pack(side=tk.LEFT, padx=(10, 2))
+        self.vol_lookback_var = tk.StringVar(value="20")
+        ttk.Entry(vol_row, textvariable=self.vol_lookback_var, width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Label(vol_row, text="candles").pack(side=tk.LEFT, padx=2)
+        
+        # RSI filter settings
+        rsi_row = ttk.Frame(frame)
+        rsi_row.pack(fill=tk.X, pady=5)
+        
+        self.rsi_filter_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(rsi_row, text="RSI Filter", 
+                       variable=self.rsi_filter_var).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(rsi_row, text="Period:").pack(side=tk.LEFT, padx=(10, 2))
+        self.rsi_period_var = tk.StringVar(value="14")
+        ttk.Entry(rsi_row, textvariable=self.rsi_period_var, width=4).pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(rsi_row, text="OB:").pack(side=tk.LEFT, padx=(10, 2))
+        self.rsi_overbought_var = tk.StringVar(value="70")
+        ttk.Entry(rsi_row, textvariable=self.rsi_overbought_var, width=4).pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(rsi_row, text="OS:").pack(side=tk.LEFT, padx=(10, 2))
+        self.rsi_oversold_var = tk.StringVar(value="30")
+        ttk.Entry(rsi_row, textvariable=self.rsi_oversold_var, width=4).pack(side=tk.LEFT, padx=2)
+
+        # Extra signal filters
+        extra_row = ttk.Frame(frame)
+        extra_row.pack(fill=tk.X, pady=5)
+
+        ttk.Label(extra_row, text="Max Momentum:").pack(side=tk.LEFT, padx=5)
+        self.max_momentum_var = tk.StringVar(value="0.0")
+        ttk.Entry(extra_row, textvariable=self.max_momentum_var, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(extra_row, text="% (0=OFF)").pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(extra_row, text="Min ATR:").pack(side=tk.LEFT, padx=(15, 2))
+        self.min_atr_var = tk.StringVar(value="0.0")
+        ttk.Entry(extra_row, textvariable=self.min_atr_var, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(extra_row, text="% (0=OFF)").pack(side=tk.LEFT, padx=2)
+
+        # EMA trend filter
+        ema_row = ttk.Frame(frame)
+        ema_row.pack(fill=tk.X, pady=5)
+
+        self.ema_trend_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ema_row, text="EMA Trend Filter",
+                        variable=self.ema_trend_var).pack(side=tk.LEFT, padx=5)
+        ttk.Label(ema_row, text="Period:").pack(side=tk.LEFT, padx=(10, 2))
+        self.ema_period_var = tk.StringVar(value="50")
+        ttk.Entry(ema_row, textvariable=self.ema_period_var, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Label(ema_row, text="Slope:").pack(side=tk.LEFT, padx=(10, 2))
+        self.ema_slope_var = tk.StringVar(value="3")
+        ttk.Entry(ema_row, textvariable=self.ema_slope_var, width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Label(ema_row, text="candles").pack(side=tk.LEFT, padx=2)
+
     def _create_trading_frame(self, parent):
         """Create trading control frame"""
         frame = ttk.LabelFrame(parent, text="🎯 Trading Control", padding="10")
@@ -246,6 +336,11 @@ class AutoTradeGUI:
         
         self.trading_status = ttk.Label(btn_row, text="⏹ Stopped", foreground="gray")
         self.trading_status.pack(side=tk.LEFT, padx=20)
+        
+        # Auto Scan Config checkbox
+        self.auto_scan_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(btn_row, text="🔍 Auto Scan Config", 
+                       variable=self.auto_scan_var).pack(side=tk.LEFT, padx=15)
         
         # Current signal display
         signal_frame = ttk.Frame(frame)
@@ -263,6 +358,19 @@ class AutoTradeGUI:
         self.position_label = ttk.Label(pos_frame, text="No position", foreground="gray")
         self.position_label.pack(side=tk.LEFT, padx=10)
         
+        # Session PnL summary
+        pnl_frame = ttk.Frame(frame)
+        pnl_frame.pack(fill=tk.X, pady=3)
+        
+        ttk.Label(pnl_frame, text="Session PnL:", style='Header.TLabel').pack(side=tk.LEFT, padx=5)
+        self.pnl_total_label = ttk.Label(pnl_frame, text="+0.00$", font=('Helvetica', 12, 'bold'), foreground="gray")
+        self.pnl_total_label.pack(side=tk.LEFT, padx=5)
+        
+        self.pnl_stats_label = ttk.Label(pnl_frame, text="0W / 0L | WR: --", foreground="gray")
+        self.pnl_stats_label.pack(side=tk.LEFT, padx=15)
+        
+        ttk.Button(pnl_frame, text="Reset", command=self._reset_session_pnl, width=6).pack(side=tk.LEFT, padx=5)
+        
         # Price display
         price_frame = ttk.Frame(frame)
         price_frame.pack(fill=tk.X, pady=5)
@@ -277,10 +385,10 @@ class AutoTradeGUI:
     
     def _create_log_frame(self, parent):
         """Create log output frame"""
-        frame = ttk.LabelFrame(parent, text="📋 Log", padding="5")
+        frame = ttk.LabelFrame(parent, text="📋 Activity Log", padding="5")
         frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
-        self.log_text = scrolledtext.ScrolledText(frame, height=12, state=tk.DISABLED, font=('Consolas', 9))
+        self.log_text = scrolledtext.ScrolledText(frame, height=15, state=tk.DISABLED, font=('Consolas', 10))
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
         # Clear button
@@ -451,7 +559,14 @@ class AutoTradeGUI:
             self._start_trading()
     
     def _start_trading(self):
-        """Start the trading strategy"""
+        """Start the trading strategy - with optional auto scan"""
+        if self.auto_scan_var.get():
+            self._start_auto_scan_then_trade()
+            return
+        self._do_start_trading()
+    
+    def _do_start_trading(self):
+        """Actually start trading with current UI config"""
         if not self.connected or not self.exchange_client:
             messagebox.showerror("Error", "Not connected to exchange")
             return
@@ -466,12 +581,22 @@ class AutoTradeGUI:
         
         try:
             threshold = float(self.threshold_var.get())
+            lookback = int(self.lookback_var.get())
             size = float(self.size_var.get())
             leverage = int(self.leverage_var.get())
             tp = float(self.tp_var.get())
             sl = float(self.sl_var.get())
             tp_extend = float(self.tp_extend_var.get())
             max_tp = int(self.max_tp_var.get())
+            vol_multiplier = float(self.vol_multiplier_var.get())
+            rsi_overbought = float(self.rsi_overbought_var.get())
+            rsi_oversold = float(self.rsi_oversold_var.get())
+            rsi_period = int(self.rsi_period_var.get())
+            vol_lookback = int(self.vol_lookback_var.get())
+            max_momentum_pct = float(self.max_momentum_var.get())
+            min_atr_pct = float(self.min_atr_var.get())
+            ema_period = int(self.ema_period_var.get())
+            ema_slope = int(self.ema_slope_var.get())
         except ValueError:
             messagebox.showerror("Error", "Invalid numeric values")
             return
@@ -480,22 +605,37 @@ class AutoTradeGUI:
         config = MomentumConfig(
             timeframe_seconds=timeframe_seconds,
             price_change_threshold=threshold,
-            position_size_usdt=size,
+            lookback_candles=lookback,
+            position_volume_usdt=size,
             leverage=leverage,
             take_profit_pct=tp,
             stop_loss_pct=sl,
             use_trailing_tp=self.trailing_tp_var.get(),
             tp_extension_pct=tp_extend,
-            max_tp_extensions=max_tp
+            max_tp_extensions=max_tp,
+            use_volume_confirmation=self.vol_confirm_var.get(),
+            volume_multiplier=vol_multiplier,
+            volume_lookback_candles=vol_lookback,
+            use_rsi_filter=self.rsi_filter_var.get(),
+            rsi_period=rsi_period,
+            rsi_overbought=rsi_overbought,
+            rsi_oversold=rsi_oversold,
+            max_momentum_pct=max_momentum_pct,
+            min_atr_pct=min_atr_pct,
+            use_ema_trend=self.ema_trend_var.get(),
+            ema_period=ema_period,
+            ema_slope_candles=ema_slope
         )
         
         # Create strategy
+        # CRITICAL: on_log must use root.after() for thread safety!
+        # Strategy runs in async thread, but Tkinter widgets can only be modified from GUI thread.
         self.strategy = MomentumStrategy(
             config=config,
             exchange_client=self.exchange_client,
             on_signal=self._on_signal,
             on_trade=self._on_trade,
-            on_log=self._log
+            on_log=lambda msg: self.root.after(0, self._log, msg)
         )
         
         # Get symbol for exchange (use BINANCE as fallback for type checker)
@@ -517,7 +657,20 @@ class AutoTradeGUI:
             max_ext = f"max {max_tp}" if max_tp > 0 else "unlimited"
             trailing_info = f" | Trailing TP: +{tp_extend}% ({max_ext})"
         
-        self._log(f"▶️ Started trading {pair} | Threshold: {threshold}% | TF: {timeframe_str} | TP: {tp}% | SL: {sl}%{trailing_info}")
+        vol_info = ""
+        if self.vol_confirm_var.get():
+            vol_info = f" | Vol: {vol_multiplier}x"
+        
+        rsi_info = ""
+        if self.rsi_filter_var.get():
+            rsi_info = f" | RSI: {rsi_overbought}/{rsi_oversold}"
+        
+        self._log(f"Started trading {pair} | Threshold: {threshold}%/{lookback}candles | TF: {timeframe_str} | TP: {tp}% | SL: {sl}%{trailing_info}{vol_info}{rsi_info}")
+        
+        # Reset session PnL on new trading session
+        self.session_pnl = 0.0
+        self.session_trades = []
+        self._update_session_pnl_display()
         
         # Start price update loop
         self._start_price_updates()
@@ -548,6 +701,110 @@ class AutoTradeGUI:
             self.trading_status.config(text="⏹ Stopped", foreground="gray")
             self.pair_combo.config(state='normal')
             self.timeframe_combo.config(state='readonly')
+    
+    def _start_auto_scan_then_trade(self):
+        """Auto scan configs: download 15m data → backtest grid → pick best → trade"""
+        if not self.connected or not self.exchange_client:
+            messagebox.showerror("Error", "Not connected to exchange")
+            return
+        
+        pair = self.pair_combo.get()
+        self.start_btn.config(state=tk.DISABLED)
+        self.trading_status.config(text="🔍 Scanning configs...", foreground="orange")
+        self._log(f"🔍 Starting auto config scan for {pair}...")
+        self._log(f"📊 Download 15m × 1000 candles → Backtest grid search → Pick best config")
+        
+        def scan_thread():
+            try:
+                # Step 1: Download 15m candle data from Binance
+                clean_symbol = pair.replace("/", "").replace("-", "").upper()
+                klines = download_klines_data(
+                    clean_symbol, "15m", 1000,
+                    on_log=lambda m: self.root.after(0, self._log, m)
+                )
+                
+                if not klines:
+                    self.root.after(0, lambda: self._log("❌ Failed to download data. Auto scan aborted."))
+                    self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
+                    self.root.after(0, lambda: self.trading_status.config(text="⏹ Stopped", foreground="gray"))
+                    return
+                
+                # Step 2: Get volume and leverage from UI
+                try:
+                    volume = float(self.size_var.get())
+                    leverage = int(self.leverage_var.get())
+                except ValueError:
+                    volume = 15.0
+                    leverage = 5
+                
+                # Step 3: Run backtest grid scan
+                def on_progress(current, total):
+                    pct = current / total * 100
+                    self.root.after(0, lambda p=pct: self.trading_status.config(
+                        text=f"🔍 Scanning... {p:.0f}%", foreground="orange"
+                    ))
+                
+                results = run_config_scan(
+                    klines, volume, leverage,
+                    on_log=lambda m: self.root.after(0, self._log, m),
+                    on_progress=on_progress
+                )
+                
+                # Step 4: Show top results in log
+                top_report = format_top_results(results, top_n=5)
+                for line in top_report.split("\n"):
+                    self.root.after(0, self._log, line)
+                
+                # Step 5: Get best config and apply
+                best = get_best_config(results, min_trades=3)
+                
+                if best and best.total_pnl > 0:
+                    # Apply best config to UI fields
+                    self.root.after(0, lambda b=best: self._apply_scan_result(b))
+                    self.root.after(0, lambda b=best: self._log(
+                        f"✅ Best config applied! "
+                        f"Score: {b.score:.1f} | PnL: {b.total_pnl:+.2f}$ | "
+                        f"WR: {b.win_rate:.0f}% | Trades: {b.num_trades} | "
+                        f"PF: {b.profit_factor:.2f}"
+                    ))
+                    # Start trading with best config (slight delay for UI update)
+                    self.root.after(500, self._do_start_trading)
+                else:
+                    self.root.after(0, lambda: self._log("❌ No profitable config found! Try a different pair."))
+                    self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
+                    self.root.after(0, lambda: self.trading_status.config(text="⏹ Stopped", foreground="gray"))
+                
+            except Exception as e:
+                self.root.after(0, lambda err=str(e): self._log(f"❌ Auto scan error: {err}"))
+                self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
+                self.root.after(0, lambda: self.trading_status.config(text="⏹ Stopped", foreground="gray"))
+        
+        threading.Thread(target=scan_thread, daemon=True).start()
+    
+    def _apply_scan_result(self, result):
+        """Apply scan result config to UI fields"""
+        config = result.config
+        self.threshold_var.set(str(config.price_change_threshold))
+        self.lookback_var.set(str(config.lookback_candles))
+        self.tp_var.set(str(config.take_profit_pct))
+        self.sl_var.set(str(config.stop_loss_pct))
+        self.trailing_tp_var.set(config.use_trailing_tp)
+        self.tp_extend_var.set(str(config.tp_extension_pct))
+        self.max_tp_var.set(str(config.max_tp_extensions))
+        self.vol_confirm_var.set(config.use_volume_confirmation)
+        self.vol_multiplier_var.set(str(config.volume_multiplier))
+        self.vol_lookback_var.set(str(config.volume_lookback))
+        self.rsi_filter_var.set(config.use_rsi_filter)
+        self.rsi_period_var.set(str(config.rsi_period))
+        self.rsi_overbought_var.set(str(config.rsi_overbought))
+        self.rsi_oversold_var.set(str(config.rsi_oversold))
+        self.max_momentum_var.set(str(config.max_momentum_pct))
+        self.min_atr_var.set(str(config.min_atr_pct))
+        self.ema_trend_var.set(config.use_ema_trend)
+        self.ema_period_var.set(str(config.ema_period))
+        self.ema_slope_var.set(str(config.ema_slope_candles))
+        # Set timeframe to 15m since we scanned on 15m data
+        self.timeframe_combo.set("15m")
     
     def _on_signal(self, signal: MomentumSignal):
         """Handle momentum signal"""
@@ -588,7 +845,47 @@ class AutoTradeGUI:
                 text="No position",
                 foreground="gray"
             ))
+            # Update session PnL
+            if trade.close_price and trade.entry_price:
+                if trade.direction == TradeDirection.LONG:
+                    pnl_pct = ((trade.close_price - trade.entry_price) / trade.entry_price) * 100
+                else:
+                    pnl_pct = ((trade.entry_price - trade.close_price) / trade.entry_price) * 100
+                config = self.strategy.config if self.strategy else None
+                vol = config.position_volume_usdt if config else 0
+                lev = config.leverage if config else 1
+                pnl_usdt = pnl_pct / 100 * vol * lev
+                self.session_pnl += pnl_usdt
+                self.session_trades.append(pnl_usdt)
+                self.root.after(0, self._update_session_pnl_display)
     
+    def _update_session_pnl_display(self):
+        """Refresh session PnL summary widget"""
+        trades = self.session_trades
+        total = self.session_pnl
+        wins = sum(1 for p in trades if p > 0)
+        losses = sum(1 for p in trades if p <= 0)
+        total_count = len(trades)
+        wr = (wins / total_count * 100) if total_count > 0 else 0
+
+        color = "green" if total > 0 else ("red" if total < 0 else "gray")
+        sign = "+" if total >= 0 else ""
+        self.pnl_total_label.config(text=f"{sign}{total:.2f}$", foreground=color)
+
+        wr_str = f"{wr:.0f}%" if total_count > 0 else "--"
+        self.pnl_stats_label.config(
+            text=f"{wins}W / {losses}L | WR: {wr_str} | {total_count} trades",
+            foreground=color
+        )
+
+    def _reset_session_pnl(self):
+        """Reset session PnL counters"""
+        self.session_pnl = 0.0
+        self.session_trades = []
+        self.pnl_total_label.config(text="+0.00$", foreground="gray")
+        self.pnl_stats_label.config(text="0W / 0L | WR: --", foreground="gray")
+        self._log("🔄 Session PnL reset")
+
     def _start_price_updates(self):
         """Start periodic price updates"""
         def update_price():
@@ -604,6 +901,8 @@ class AutoTradeGUI:
                     
                     if price:
                         self.price_label.config(text=f"${price:,.2f}")
+                        # Update USDT value based on size (coins) and price
+                        self._update_usdt_display(price)
                     
                     if change is not None:
                         color = "green" if change >= 0 else "red"
@@ -615,6 +914,21 @@ class AutoTradeGUI:
         
         self.root.after(1000, update_price)
     
+    def _update_usdt_display(self, price: float):
+        """Update size display based on volume (USDT) and current price: size = floor(volume/price)"""
+        try:
+            volume_usdt = float(self.size_var.get())
+            
+            if price > 0:
+                # Size = floor(Volume / Price)
+                size = int(volume_usdt / price)
+                
+                self.usdt_value_label.config(text=str(size))
+            else:
+                self.usdt_value_label.config(text="--")
+        except (ValueError, ZeroDivisionError):
+            self.usdt_value_label.config(text="--")
+    
     def _save_config(self):
         """Save config to file"""
         config = {
@@ -624,13 +938,26 @@ class AutoTradeGUI:
             "pair": self.pair_combo.get(),
             "timeframe": self.timeframe_combo.get(),
             "threshold": self.threshold_var.get(),
+            "lookback": self.lookback_var.get(),
             "size": self.size_var.get(),
             "leverage": self.leverage_var.get(),
             "tp": self.tp_var.get(),
             "sl": self.sl_var.get(),
             "trailing_tp": self.trailing_tp_var.get(),
             "tp_extend": self.tp_extend_var.get(),
-            "max_tp": self.max_tp_var.get()
+            "max_tp": self.max_tp_var.get(),
+            "vol_confirm": self.vol_confirm_var.get(),
+            "vol_multiplier": self.vol_multiplier_var.get(),
+            "vol_lookback": self.vol_lookback_var.get(),
+            "rsi_filter": self.rsi_filter_var.get(),
+            "rsi_period": self.rsi_period_var.get(),
+            "rsi_overbought": self.rsi_overbought_var.get(),
+            "rsi_oversold": self.rsi_oversold_var.get(),
+            "max_momentum_pct": self.max_momentum_var.get(),
+            "min_atr_pct": self.min_atr_var.get(),
+            "use_ema_trend": self.ema_trend_var.get(),
+            "ema_period": self.ema_period_var.get(),
+            "ema_slope_candles": self.ema_slope_var.get()
         }
         
         try:
@@ -655,6 +982,7 @@ class AutoTradeGUI:
             self.pair_combo.set(config.get("pair", "BTC/USDT"))
             self.timeframe_combo.set(config.get("timeframe", "5m"))
             self.threshold_var.set(config.get("threshold", "1.0"))
+            self.lookback_var.set(config.get("lookback", "7"))
             self.size_var.set(config.get("size", "100"))
             self.leverage_var.set(config.get("leverage", "10"))
             self.tp_var.set(config.get("tp", "0.5"))
@@ -662,6 +990,18 @@ class AutoTradeGUI:
             self.trailing_tp_var.set(config.get("trailing_tp", True))
             self.tp_extend_var.set(config.get("tp_extend", "0.3"))
             self.max_tp_var.set(config.get("max_tp", "10"))
+            self.vol_confirm_var.set(config.get("vol_confirm", True))
+            self.vol_multiplier_var.set(config.get("vol_multiplier", "2.0"))
+            self.vol_lookback_var.set(config.get("vol_lookback", "20"))
+            self.rsi_filter_var.set(config.get("rsi_filter", True))
+            self.rsi_period_var.set(config.get("rsi_period", "14"))
+            self.rsi_overbought_var.set(config.get("rsi_overbought", "70"))
+            self.rsi_oversold_var.set(config.get("rsi_oversold", "30"))
+            self.max_momentum_var.set(config.get("max_momentum_pct", "0.0"))
+            self.min_atr_var.set(config.get("min_atr_pct", "0.0"))
+            self.ema_trend_var.set(config.get("use_ema_trend", False))
+            self.ema_period_var.set(config.get("ema_period", "50"))
+            self.ema_slope_var.set(config.get("ema_slope_candles", "3"))
             
             self._log("Config loaded")
         except Exception as e:
@@ -688,6 +1028,7 @@ class AutoTradeGUI:
             "pair": self.pair_combo.get(),
             "timeframe": self.timeframe_combo.get(),
             "threshold": self.threshold_var.get(),
+            "lookback": self.lookback_var.get(),
             "size": self.size_var.get(),
             "leverage": self.leverage_var.get(),
             "tp": self.tp_var.get(),
@@ -695,7 +1036,14 @@ class AutoTradeGUI:
             "trailing_tp": self.trailing_tp_var.get(),
             "tp_extend": self.tp_extend_var.get(),
             "max_tp": self.max_tp_var.get(),
-            "dry_run": self.dry_run_var.get()
+            "dry_run": self.dry_run_var.get(),
+            "vol_confirm": self.vol_confirm_var.get(),
+            "vol_multiplier": self.vol_multiplier_var.get(),
+            "vol_lookback": self.vol_lookback_var.get(),
+            "rsi_filter": self.rsi_filter_var.get(),
+            "rsi_period": self.rsi_period_var.get(),
+            "rsi_overbought": self.rsi_overbought_var.get(),
+            "rsi_oversold": self.rsi_oversold_var.get()
         }
         
         try:
@@ -734,6 +1082,7 @@ class AutoTradeGUI:
             self.pair_combo.set(config.get("pair", "BTC/USDT"))
             self.timeframe_combo.set(config.get("timeframe", "5m"))
             self.threshold_var.set(config.get("threshold", "1.0"))
+            self.lookback_var.set(config.get("lookback", "7"))
             self.size_var.set(config.get("size", "100"))
             self.leverage_var.set(config.get("leverage", "10"))
             self.tp_var.set(config.get("tp", "0.5"))
@@ -742,6 +1091,18 @@ class AutoTradeGUI:
             self.tp_extend_var.set(config.get("tp_extend", "0.3"))
             self.max_tp_var.set(config.get("max_tp", "10"))
             self.dry_run_var.set(config.get("dry_run", True))
+            self.vol_confirm_var.set(config.get("vol_confirm", True))
+            self.vol_multiplier_var.set(config.get("vol_multiplier", "2.0"))
+            self.vol_lookback_var.set(config.get("vol_lookback", "20"))
+            self.rsi_filter_var.set(config.get("rsi_filter", True))
+            self.rsi_period_var.set(config.get("rsi_period", "14"))
+            self.rsi_overbought_var.set(config.get("rsi_overbought", "70"))
+            self.rsi_oversold_var.set(config.get("rsi_oversold", "30"))
+            self.max_momentum_var.set(config.get("max_momentum_pct", "0.0"))
+            self.min_atr_var.set(config.get("min_atr_pct", "0.0"))
+            self.ema_trend_var.set(config.get("use_ema_trend", False))
+            self.ema_period_var.set(config.get("ema_period", "50"))
+            self.ema_slope_var.set(config.get("ema_slope_candles", "3"))
             
             self._log(f"Config loaded from {os.path.basename(file_path)}")
         except Exception as e:
@@ -792,6 +1153,7 @@ class AutoTradeGUI:
             self.pair_combo.set(current_value)
         elif symbols:
             self.pair_combo.set(symbols[0])
+    
     
     def _on_closing(self):
         """Handle window close"""
