@@ -601,6 +601,62 @@ class OKXClient(BaseExchangeClient):
             print(f"Error getting OKX order history: {e}")
             return []
     
+    async def get_closed_pnl(self, symbol: str, since: Optional[int] = None) -> Dict[str, Any]:
+        """Get realized PnL, commission fees, and funding fees for a closed position"""
+        okx_symbol = symbol if "-SWAP" in symbol else get_exchange_symbol(symbol, Exchange.OKX)
+        
+        realized_pnl = 0.0
+        commission = 0.0
+        funding_fee = 0.0
+        
+        params = {
+            "instType": "SWAP",
+            "instId": okx_symbol,
+            "limit": "100"
+        }
+        if since:
+            params["begin"] = str(since)
+            
+        try:
+            import logging
+            log = logging.getLogger(__name__)
+            # 1. Query Trade bills (type 2) for Realized PnL and Commission
+            trade_params = params.copy()
+            trade_params["type"] = "2" # 2 = Trade
+            
+            trade_bills = await self._request("GET", "/api/v5/account/bills", trade_params)
+            for item in trade_bills.get("data", []):
+                realized_pnl += float(item.get("pnl", 0))
+                # OKX fees are negative numbers when paid by the user
+                fee = float(item.get("fee", 0))
+                commission += abs(fee)
+                
+            # 2. Query Funding Fee bills (type 8)
+            funding_params = params.copy()
+            funding_params["type"] = "8" # 8 = Funding fee
+            
+            funding_bills = await self._request("GET", "/api/v5/account/bills", funding_params)
+            for item in funding_bills.get("data", []):
+                # balChg represents the actual change in balance (+ or -)
+                funding_fee += float(item.get("balChg", 0))
+                
+            net_pnl = realized_pnl - commission + funding_fee
+            
+            return {
+                "realized_pnl": realized_pnl,
+                "commission": commission,
+                "funding_fee": funding_fee,
+                "net_pnl": net_pnl
+            }
+        except Exception as e:
+            print(f"Error getting OKX PnL: {e}")
+            return {
+                "realized_pnl": 0.0,
+                "commission": 0.0,
+                "funding_fee": 0.0,
+                "net_pnl": 0.0
+            }
+    
     def get_exchange_name(self) -> str:
         """Get exchange name"""
         return "OKX"

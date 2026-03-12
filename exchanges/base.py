@@ -140,3 +140,21 @@ class BaseExchangeClient(ABC):
     def get_exchange_name(self) -> str:
         """Get exchange name"""
         pass
+    
+    @abstractmethod
+    async def get_closed_pnl(self, symbol: str, since: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Get realized PnL, commission fees, and funding fees for a closed position.
+        
+        Args:
+            symbol: Trading symbol
+            since: Timestamp in milliseconds of when the position was opened
+            
+        Returns:
+            Dictionary containing:
+            - realized_pnl: Profit/Loss from price difference
+            - commission: Trading fees paid
+            - funding_fee: Funding fees paid/received (positive = received, negative = paid)
+            - net_pnl: realized_pnl - commission + funding_fee
+        """
+        pass

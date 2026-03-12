@@ -10,6 +10,7 @@ class Exchange(Enum):
     BINANCE = "binance"
     BINGX = "bingx"
     GATE = "gate"
+    ASTERDEX = "asterdex"
 
 
 class Side(Enum):
@@ -61,61 +62,71 @@ SYMBOL_MAP = {
         Exchange.OKX: "BTC-USDT-SWAP",
         Exchange.BINANCE: "BTCUSDT",
         Exchange.BINGX: "BTC-USDT",
-        Exchange.GATE: "BTC_USDT"
+        Exchange.GATE: "BTC_USDT",
+        Exchange.ASTERDEX: "BTCUSDT"
     },
     "ETH/USDT": {
         Exchange.OKX: "ETH-USDT-SWAP",
         Exchange.BINANCE: "ETHUSDT",
         Exchange.BINGX: "ETH-USDT",
-        Exchange.GATE: "ETH_USDT"
+        Exchange.GATE: "ETH_USDT",
+        Exchange.ASTERDEX: "ETHUSDT"
     },
     "SOL/USDT": {
         Exchange.OKX: "SOL-USDT-SWAP",
         Exchange.BINANCE: "SOLUSDT",
         Exchange.BINGX: "SOL-USDT",
-        Exchange.GATE: "SOL_USDT"
+        Exchange.GATE: "SOL_USDT",
+        Exchange.ASTERDEX: "SOLUSDT"
     },
     "XRP/USDT": {
         Exchange.OKX: "XRP-USDT-SWAP",
         Exchange.BINANCE: "XRPUSDT",
         Exchange.BINGX: "XRP-USDT",
-        Exchange.GATE: "XRP_USDT"
+        Exchange.GATE: "XRP_USDT",
+        Exchange.ASTERDEX: "XRPUSDT"
     },
     "DOGE/USDT": {
         Exchange.OKX: "DOGE-USDT-SWAP",
         Exchange.BINANCE: "DOGEUSDT",
         Exchange.BINGX: "DOGE-USDT",
-        Exchange.GATE: "DOGE_USDT"
+        Exchange.GATE: "DOGE_USDT",
+        Exchange.ASTERDEX: "DOGEUSDT"
     },
     "ADA/USDT": {
         Exchange.OKX: "ADA-USDT-SWAP",
         Exchange.BINANCE: "ADAUSDT",
         Exchange.BINGX: "ADA-USDT",
-        Exchange.GATE: "ADA_USDT"
+        Exchange.GATE: "ADA_USDT",
+        Exchange.ASTERDEX: "ADAUSDT"
     },
     "AVAX/USDT": {
         Exchange.OKX: "AVAX-USDT-SWAP",
         Exchange.BINANCE: "AVAXUSDT",
         Exchange.BINGX: "AVAX-USDT",
-        Exchange.GATE: "AVAX_USDT"
+        Exchange.GATE: "AVAX_USDT",
+        Exchange.ASTERDEX: "AVAXUSDT"
     },
     "LINK/USDT": {
         Exchange.OKX: "LINK-USDT-SWAP",
         Exchange.BINANCE: "LINKUSDT",
         Exchange.BINGX: "LINK-USDT",
-        Exchange.GATE: "LINK_USDT"
+        Exchange.GATE: "LINK_USDT",
+        Exchange.ASTERDEX: "LINKUSDT"
     },
     "DOT/USDT": {
         Exchange.OKX: "DOT-USDT-SWAP",
         Exchange.BINANCE: "DOTUSDT",
         Exchange.BINGX: "DOT-USDT",
-        Exchange.GATE: "DOT_USDT"
+        Exchange.GATE: "DOT_USDT",
+        Exchange.ASTERDEX: "DOTUSDT"
     },
     "MATIC/USDT": {
         Exchange.OKX: "MATIC-USDT-SWAP",
         Exchange.BINANCE: "MATICUSDT",
         Exchange.BINGX: "MATIC-USDT",
-        Exchange.GATE: "MATIC_USDT"
+        Exchange.GATE: "MATIC_USDT",
+        Exchange.ASTERDEX: "MATICUSDT"
     },
 }
 
@@ -133,7 +144,7 @@ def get_exchange_symbol(pair: str, exchange: Exchange) -> str:
         return f"{base}-{quote}"
     elif exchange == Exchange.GATE:
         return f"{base}_{quote}"
-    else:  # Binance
+    else:  # Binance & Asterdex
         return f"{base}{quote}"
 
 
@@ -156,6 +167,10 @@ EXCHANGE_FEES = {
     Exchange.GATE: {
         "maker": 0.015,     # 0.015%
         "taker": 0.05,      # 0.05%
+    },
+    Exchange.ASTERDEX: {
+        "maker": 0.02,      # 0.02% (Assumption)
+        "taker": 0.05,      # 0.05% (Assumption)
     },
 }
 
@@ -180,7 +195,7 @@ def calculate_break_even(
     short_exchange: Exchange,
     position_size_usd: float,
     funding_rate_pct: float,
-    leverage: int = 10,
+    leverage: int = 3,
     slippage_pct: float = 0.02,
     funding_interval_hours: int = 8
 ) -> dict:
@@ -579,7 +594,7 @@ def get_unified_pair(symbol: str, exchange: Exchange) -> str:
         if len(parts) >= 2:
             return f"{parts[0]}/{parts[1]}"
         return f"{symbol}/USDT"
-    else:  # Binance
+    else:  # Binance & Asterdex
         # Binance format: BTCUSDT -> BTC/USDT
         base = symbol.replace("USDT", "")
         return f"{base}/USDT"

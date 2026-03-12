@@ -78,6 +78,7 @@ from exchanges.okx_client import OKXClient
 from exchanges.binance_client import BinanceClient
 from exchanges.bingx_client import BingXClient
 from exchanges.gate_client import GateClient
+from exchanges.aster_client import AsterClient
 from exchanges.base import BaseExchangeClient, FundingRate
 
 logger = logging.getLogger(__name__)
@@ -1431,6 +1432,12 @@ class FundingHunterGUI:
                     "secret": self.gate_secret.get(),
                     "enabled": self.gate_enabled.get()
                 },
+                "asterdex": {
+                    "api_key": self.asterdex_api_key.get(),
+                    "secret": self.asterdex_secret.get(),
+                    "testnet": self.asterdex_testnet.get(),
+                    "enabled": self.asterdex_enabled.get()
+                },
                 "trading": {
                     "leverage": self.leverage_var.get(),
                     "size": self.size_entry.get(),
@@ -1492,10 +1499,19 @@ class FundingHunterGUI:
                 self.gate_secret.delete(0, tk.END)
                 self.gate_secret.insert(0, config["gate"].get("secret", ""))
                 self.gate_enabled.set(config["gate"].get("enabled", False))
+                
+            # Asterdex
+            if "asterdex" in config:
+                self.asterdex_api_key.delete(0, tk.END)
+                self.asterdex_api_key.insert(0, config["asterdex"].get("api_key", ""))
+                self.asterdex_secret.delete(0, tk.END)
+                self.asterdex_secret.insert(0, config["asterdex"].get("secret", ""))
+                self.asterdex_testnet.set(config["asterdex"].get("testnet", False))
+                self.asterdex_enabled.set(config["asterdex"].get("enabled", False))
             
             # Trading settings
             if "trading" in config:
-                self.leverage_var.set(config["trading"].get("leverage", "10"))
+                self.leverage_var.set(config["trading"].get("leverage", "3"))
                 self.size_entry.delete(0, tk.END)
                 self.size_entry.insert(0, config["trading"].get("size", "0.001"))
                 self.debug_mode.set(config["trading"].get("debug", False))
@@ -1609,6 +1625,24 @@ class FundingHunterGUI:
         self.gate_enabled = tk.BooleanVar(value=False)
         ttk.Checkbutton(gate_frame, text="Enable", variable=self.gate_enabled).grid(row=0, column=5, padx=5)
         
+        # Asterdex Tab
+        asterdex_frame = ttk.Frame(notebook, padding="10")
+        notebook.add(asterdex_frame, text="Asterdex")
+        
+        ttk.Label(asterdex_frame, text="API Key:").grid(row=0, column=0, padx=5, pady=2, sticky='e')
+        self.asterdex_api_key = ttk.Entry(asterdex_frame, width=40, show="*")
+        self.asterdex_api_key.grid(row=0, column=1, padx=5, pady=2)
+        
+        ttk.Label(asterdex_frame, text="Secret:").grid(row=0, column=2, padx=5, pady=2, sticky='e')
+        self.asterdex_secret = ttk.Entry(asterdex_frame, width=40, show="*")
+        self.asterdex_secret.grid(row=0, column=3, padx=5, pady=2)
+        
+        self.asterdex_testnet = tk.BooleanVar(value=False)
+        ttk.Checkbutton(asterdex_frame, text="Testnet", variable=self.asterdex_testnet).grid(row=0, column=4, padx=10)
+        
+        self.asterdex_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(asterdex_frame, text="Enable", variable=self.asterdex_enabled).grid(row=0, column=5, padx=5)
+        
         # Connection buttons
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=tk.X, pady=10)
@@ -1647,6 +1681,10 @@ class FundingHunterGUI:
         ttk.Label(self.balance_frame, text="Gate:").pack(side=tk.LEFT, padx=2)
         self.gate_balance_label = ttk.Label(self.balance_frame, text="$0.00")
         self.gate_balance_label.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(self.balance_frame, text="Aster:").pack(side=tk.LEFT, padx=2)
+        self.asterdex_balance_label = ttk.Label(self.balance_frame, text="$0.00")
+        self.asterdex_balance_label.pack(side=tk.LEFT, padx=5)
     
     def _create_trading_frame(self, parent):
         """Create trading panel with scrollbar"""
@@ -1710,7 +1748,7 @@ class FundingHunterGUI:
         settings_frame.pack(fill=tk.X, pady=5)
         
         ttk.Label(settings_frame, text="Leverage:").pack(side=tk.LEFT, padx=5)
-        self.leverage_var = tk.StringVar(value="10")
+        self.leverage_var = tk.StringVar(value="3")
         self.leverage_spin = ttk.Spinbox(settings_frame, from_=1, to=100, width=5, textvariable=self.leverage_var)
         self.leverage_spin.pack(side=tk.LEFT, padx=5)
         
@@ -1797,7 +1835,7 @@ class FundingHunterGUI:
         ttk.Checkbutton(option_frame, text="Auto-close on funding reversal", 
                        variable=self.auto_close_reversal_var).pack(anchor=tk.W, pady=2)
         
-        self.skip_leverage_var = tk.BooleanVar(value=True)
+        self.skip_leverage_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(option_frame, text="Skip leverage set (faster entry)", 
                        variable=self.skip_leverage_var).pack(anchor=tk.W)
         
@@ -1830,7 +1868,7 @@ class FundingHunterGUI:
         self.refresh_funding_btn.pack(side=tk.LEFT, padx=5)
         
         # Funding table
-        columns = ("Pair", "OKX", "Binance", "BingX", "Gate", "Best Spread", "Recommendation")
+        columns = ("Pair", "OKX", "Binance", "BingX", "Gate", "Asterdex", "Best Spread", "Recommendation")
         self.funding_tree = ttk.Treeview(frame, columns=columns, show="headings", height=10)
         
         self.funding_tree.heading("Pair", text="Pair")
@@ -1838,6 +1876,7 @@ class FundingHunterGUI:
         self.funding_tree.heading("Binance", text="Binance Rate")
         self.funding_tree.heading("BingX", text="BingX Rate")
         self.funding_tree.heading("Gate", text="Gate Rate")
+        self.funding_tree.heading("Asterdex", text="Aster Rate")
         self.funding_tree.heading("Best Spread", text="Best Spread")
         self.funding_tree.heading("Recommendation", text="Recommendation")
         
@@ -1846,6 +1885,7 @@ class FundingHunterGUI:
         self.funding_tree.column("Binance", width=85)
         self.funding_tree.column("BingX", width=85)
         self.funding_tree.column("Gate", width=85)
+        self.funding_tree.column("Asterdex", width=85)
         self.funding_tree.column("Best Spread", width=85)
         self.funding_tree.column("Recommendation", width=140)
         
@@ -1993,7 +2033,8 @@ class FundingHunterGUI:
             "OKX": Exchange.OKX,
             "Binance": Exchange.BINANCE,
             "BingX": Exchange.BINGX,
-            "Gate.io": Exchange.GATE
+            "Gate.io": Exchange.GATE,
+            "Asterdex": Exchange.ASTERDEX
         }
         return mapping.get(name, Exchange.OKX)
     
@@ -2069,6 +2110,20 @@ class FundingHunterGUI:
                 client = GateClient(settings.gate, debug=self.debug_mode.get())
                 if await self.manager.connect_exchange(Exchange.GATE, client):
                     connected.append("Gate.io")
+                    
+        # Asterdex
+        if self.asterdex_enabled.get():
+            aster_key = self.asterdex_api_key.get().strip()
+            aster_secret = self.asterdex_secret.get().strip()
+            
+            if aster_key and aster_secret:
+                settings.asterdex.api_key = aster_key
+                settings.asterdex.secret_key = aster_secret
+                settings.asterdex.testnet = self.asterdex_testnet.get()
+                
+                client = AsterClient(settings.asterdex, debug=self.debug_mode.get())
+                if await self.manager.connect_exchange(Exchange.ASTERDEX, client):
+                    connected.append("Asterdex")
         
         # Get balances
         balances = await self.manager.get_all_balances()
@@ -2116,6 +2171,8 @@ class FundingHunterGUI:
             self.bingx_balance_label.config(text=f"${balances[Exchange.BINGX].available:.6f}")
         if Exchange.GATE in balances:
             self.gate_balance_label.config(text=f"${balances[Exchange.GATE].available:.6f}")
+        if Exchange.ASTERDEX in balances:
+            self.asterdex_balance_label.config(text=f"${balances[Exchange.ASTERDEX].available:.6f}")
         
         # Update exchange dropdowns
         available = connected  # Use exchange names directly from connected list
@@ -3310,83 +3367,95 @@ class FundingHunterGUI:
         self.root.after(0, update_ui)
     
     def _calculate_and_show_final_pnl(self, closed_position: Dict[str, Any]):
-        """Calculate and display final PnL after closing position
-        
-        Simple logic: PnL = Balance After - Balance Before
-        """
+        """Calculate and display final PnL after closing position via API history"""
         long_ex = closed_position.get('long_exchange')
         short_ex = closed_position.get('short_exchange')
         pair = closed_position.get('pair', 'Unknown')
+        open_time = closed_position.get('open_time')
         
         async def calculate_pnl():
-            # Get current balance (after close)
-            balance_after = {}
-            for ex in [long_ex, short_ex]:
-                client = self.manager.clients.get(ex)
-                if client:
-                    try:
-                        bal = await client.get_balance()
-                        if bal:
-                            balance_after[ex] = bal.available
-                    except:
-                        pass
+            # Calculate 'since' timestamp in milliseconds, subtracting 1 minute for safety padding
+            since = None
+            if open_time:
+                since = int(open_time.timestamp() * 1000) - 60000
+                
+            long_client = self.manager.clients.get(long_ex)
+            short_client = self.manager.clients.get(short_ex)
             
-            # Calculate PnL
-            balance_before = getattr(self, 'balance_before_open', {})
+            long_pnl_data = {"realized_pnl": 0, "commission": 0, "funding_fee": 0, "net_pnl": 0}
+            short_pnl_data = {"realized_pnl": 0, "commission": 0, "funding_fee": 0, "net_pnl": 0}
             
-            long_before = balance_before.get(long_ex, 0)
-            long_after = balance_after.get(long_ex, 0)
-            long_pnl = long_after - long_before
+            if long_client:
+                # Need to use specific symbol mapping for the exchange if necessary
+                # Fortunately get_closed_pnl handles this internally using the base symbol
+                try:
+                    long_pnl_data = await long_client.get_closed_pnl(pair, since)
+                except Exception as e:
+                    logger.error(f"Error getting long PnL from {long_ex.value}: {e}")
+                    
+            if short_client:
+                try:
+                    short_pnl_data = await short_client.get_closed_pnl(pair, since)
+                except Exception as e:
+                    logger.error(f"Error getting short PnL from {short_ex.value}: {e}")
             
-            short_before = balance_before.get(short_ex, 0)
-            short_after = balance_after.get(short_ex, 0)
-            short_pnl = short_after - short_before
-            
-            total_pnl = long_pnl + short_pnl
+            total_realized_pnl = long_pnl_data["realized_pnl"] + short_pnl_data["realized_pnl"]
+            total_commission = long_pnl_data["commission"] + short_pnl_data["commission"]
+            total_funding = long_pnl_data["funding_fee"] + short_pnl_data["funding_fee"]
+            total_net_pnl = long_pnl_data["net_pnl"] + short_pnl_data["net_pnl"]
             
             return {
                 "pair": pair,
                 "long_ex": long_ex,
                 "short_ex": short_ex,
-                "long_before": long_before,
-                "long_after": long_after,
-                "long_pnl": long_pnl,
-                "short_before": short_before,
-                "short_after": short_after,
-                "short_pnl": short_pnl,
-                "total_pnl": total_pnl
+                "long": long_pnl_data,
+                "short": short_pnl_data,
+                "total": {
+                    "realized_pnl": total_realized_pnl,
+                    "commission": total_commission,
+                    "funding_fee": total_funding,
+                    "net_pnl": total_net_pnl
+                }
             }
         
         def on_pnl_calculated(future):
             def show_result():
                 try:
-                    result = future.result(timeout=10)
+                    result = future.result(timeout=15)
                     if result:
                         self._log("=" * 50)
-                        self._log(f"FINAL PnL REPORT: {result['pair']}")
+                        self._log(f"FINAL TRADE REPORT: {result['pair']}")
                         self._log("=" * 50)
                         
                         # LONG side
+                        long_data = result['long']
                         self._log(f"LONG ({result['long_ex'].value}):")
-                        self._log(f"   Before: ${result['long_before']:.2f}")
-                        self._log(f"   After:  ${result['long_after']:.2f}")
-                        self._log(f"   PnL:    ${result['long_pnl']:+.2f}")
+                        self._log(f"   Realized PnL: ${long_data['realized_pnl']:+.2f}")
+                        self._log(f"   Trading Fees: -${long_data['commission']:.2f}")
+                        self._log(f"   Funding Fees: ${long_data['funding_fee']:+.2f}")
+                        self._log(f"   Net PnL:      ${long_data['net_pnl']:+.2f}")
                         self._log("")
                         
                         # SHORT side
+                        short_data = result['short']
                         self._log(f"SHORT ({result['short_ex'].value}):")
-                        self._log(f"   Before: ${result['short_before']:.2f}")
-                        self._log(f"   After:  ${result['short_after']:.2f}")
-                        self._log(f"   PnL:    ${result['short_pnl']:+.2f}")
+                        self._log(f"   Realized PnL: ${short_data['realized_pnl']:+.2f}")
+                        self._log(f"   Trading Fees: -${short_data['commission']:.2f}")
+                        self._log(f"   Funding Fees: ${short_data['funding_fee']:+.2f}")
+                        self._log(f"   Net PnL:      ${short_data['net_pnl']:+.2f}")
                         self._log("")
                         
-                        total = result['total_pnl']
-                        pnl_status = "PROFIT" if total >= 0 else "LOSS"
+                        # TOTALS
+                        total = result['total']
+                        pnl_status = "PROFIT" if total['net_pnl'] >= 0 else "LOSS"
                         self._log("-" * 50)
-                        self._log(f">>> TOTAL PnL: ${total:+.2f} ({pnl_status}) <<<")
+                        self._log(f"TOTAL REALIZED PnL: ${total['realized_pnl']:+.2f}")
+                        self._log(f"TOTAL TRADING FEES: -${total['commission']:.2f}")
+                        self._log(f"TOTAL FUNDING FEES: ${total['funding_fee']:+.2f}")
+                        self._log(f">>> FINAL NET PnL: ${total['net_pnl']:+.2f} ({pnl_status}) <<<")
                         self._log("=" * 50)
                         
-                        # Clear balance_before for next trade
+                        # Clear balance_before_open since it's no longer strictly needed, but kept for legacy cleanup
                         self.balance_before_open = {}
                     else:
                         self._log("Could not calculate final PnL")
@@ -3993,6 +4062,17 @@ class FundingHunterGUI:
                             rates[Exchange.GATE] = gate_rate
                         except Exception as e:
                             logger.debug(f"Gate.io rate not available for {pair}: {e}")
+                            
+                    # Get Asterdex rate
+                    aster_client = self.manager.clients.get(Exchange.ASTERDEX)
+                    if aster_client:
+                        try:
+                            from config.constants import get_exchange_symbol
+                            aster_symbol = get_exchange_symbol(pair, Exchange.ASTERDEX)
+                            aster_rate = await aster_client.get_funding_rate(aster_symbol)
+                            rates[Exchange.ASTERDEX] = aster_rate
+                        except Exception as e:
+                            logger.debug(f"Aster rate not available for {pair}: {e}")
                     
                     all_rates[pair] = rates
                     
@@ -4019,7 +4099,14 @@ class FundingHunterGUI:
         self.root.after(0, update_ui)
     
     def _update_funding_table(self, all_rates):
-        """Update funding table - sorted by Best Spread (highest to lowest)"""
+        """Update funding table - sorted by Best Spread (highest to lowest)
+        
+        All rates are normalized to 4h equivalent for fair comparison:
+        - 1h interval: rate * 4
+        - 2h interval: rate * 2  
+        - 4h interval: rate * 1 (baseline)
+        - 8h interval: rate * 0.5
+        """
         for item in self.funding_tree.get_children():
             self.funding_tree.delete(item)
         
@@ -4030,19 +4117,24 @@ class FundingHunterGUI:
         # Cache the funding rates for later use
         self.cached_funding_rates = all_rates
         
+        def normalize_to_4h(rate_obj):
+            """Normalize a funding rate to 4h equivalent"""
+            if not rate_obj:
+                return None
+            interval = getattr(rate_obj, 'funding_interval_hours', 8) or 8
+            multiplier = 4.0 / interval
+            return rate_obj.funding_rate * multiplier
+        
         # Calculate spreads for sorting
         pairs_with_spreads = []
         for pair, rates in all_rates.items():
-            # Collect available rates
+            # Collect normalized rate values
             rate_values = {}
-            if Exchange.OKX in rates:
-                rate_values[Exchange.OKX] = rates[Exchange.OKX].funding_rate
-            if Exchange.BINANCE in rates:
-                rate_values[Exchange.BINANCE] = rates[Exchange.BINANCE].funding_rate
-            if Exchange.BINGX in rates:
-                rate_values[Exchange.BINGX] = rates[Exchange.BINGX].funding_rate
-            if Exchange.GATE in rates:
-                rate_values[Exchange.GATE] = rates[Exchange.GATE].funding_rate
+            for ex_enum in [Exchange.OKX, Exchange.BINANCE, Exchange.BINGX, Exchange.GATE, Exchange.ASTERDEX]:
+                if ex_enum in rates:
+                    norm = normalize_to_4h(rates[ex_enum])
+                    if norm is not None:
+                        rate_values[ex_enum] = norm
             
             # Calculate spread
             spread_value = 0.0
@@ -4056,26 +4148,30 @@ class FundingHunterGUI:
         sorted_pairs = sorted(pairs_with_spreads, key=lambda x: x[2], reverse=True)
         
         for pair, rates, spread_value in sorted_pairs:
-            okx_rate = rates.get(Exchange.OKX)
-            binance_rate = rates.get(Exchange.BINANCE)
-            bingx_rate = rates.get(Exchange.BINGX)
-            gate_rate = rates.get(Exchange.GATE)
+            # Normalize each rate for display
+            def fmt_rate(ex_enum):
+                rate_obj = rates.get(ex_enum)
+                if not rate_obj:
+                    return "-"
+                norm = normalize_to_4h(rate_obj)
+                interval = getattr(rate_obj, 'funding_interval_hours', 8) or 8
+                if interval != 4:
+                    return f"{norm * 100:.6f}% ({interval}h)"
+                return f"{norm * 100:.6f}%"
             
-            okx_val = f"{okx_rate.funding_rate * 100:.6f}%" if okx_rate else "-"
-            binance_val = f"{binance_rate.funding_rate * 100:.6f}%" if binance_rate else "-"
-            bingx_val = f"{bingx_rate.funding_rate * 100:.6f}%" if bingx_rate else "-"
-            gate_val = f"{gate_rate.funding_rate * 100:.6f}%" if gate_rate else "-"
+            okx_val = fmt_rate(Exchange.OKX)
+            binance_val = fmt_rate(Exchange.BINANCE)
+            bingx_val = fmt_rate(Exchange.BINGX)
+            gate_val = fmt_rate(Exchange.GATE)
+            aster_val = fmt_rate(Exchange.ASTERDEX)
             
-            # Find best spread
+            # Find best spread using normalized rates
             rate_values = {}
-            if okx_rate:
-                rate_values[Exchange.OKX] = okx_rate.funding_rate
-            if binance_rate:
-                rate_values[Exchange.BINANCE] = binance_rate.funding_rate
-            if bingx_rate:
-                rate_values[Exchange.BINGX] = bingx_rate.funding_rate
-            if gate_rate:
-                rate_values[Exchange.GATE] = gate_rate.funding_rate
+            for ex_enum in [Exchange.OKX, Exchange.BINANCE, Exchange.BINGX, Exchange.GATE, Exchange.ASTERDEX]:
+                if ex_enum in rates:
+                    norm = normalize_to_4h(rates[ex_enum])
+                    if norm is not None:
+                        rate_values[ex_enum] = norm
             
             best_spread = "-"
             recommendation = "-"
@@ -4089,10 +4185,10 @@ class FundingHunterGUI:
                 recommendation = f"Long {lowest[0].value}, Short {highest[0].value}"
             
             self.funding_tree.insert("", tk.END, values=(
-                pair, okx_val, binance_val, bingx_val, gate_val, best_spread, recommendation
+                pair, okx_val, binance_val, bingx_val, gate_val, aster_val, best_spread, recommendation
             ))
         
-        self._log(f"✅ Loaded {len(sorted_pairs)} pairs sorted by Best Spread (highest to lowest)")
+        self._log(f"✅ Loaded {len(sorted_pairs)} pairs sorted by Best Spread (normalized to 4h)")
     
     def _on_funding_select(self, event):
         """Handle funding row double-click - auto select pair and exchanges in Trading Panel"""
@@ -4118,7 +4214,7 @@ class FundingHunterGUI:
                 short_ex = parts[1].replace("Short ", "").strip().lower()
                 
                 # Map to display names (case-insensitive)
-                name_map = {"okx": "OKX", "binance": "Binance", "bingx": "BingX", "gate": "Gate.io"}
+                name_map = {"okx": "OKX", "binance": "Binance", "bingx": "BingX", "gate": "Gate.io", "asterdex": "Asterdex"}
                 long_display = name_map.get(long_ex, long_ex.upper())
                 short_display = name_map.get(short_ex, short_ex.upper())
                 
@@ -4210,7 +4306,7 @@ class FundingHunterGUI:
             return
         
         # Map display names to Exchange enum
-        exchange_map = {"OKX": Exchange.OKX, "Binance": Exchange.BINANCE, "BingX": Exchange.BINGX, "Gate.io": Exchange.GATE}
+        exchange_map = {"OKX": Exchange.OKX, "Binance": Exchange.BINANCE, "BingX": Exchange.BINGX, "Gate.io": Exchange.GATE, "Asterdex": Exchange.ASTERDEX}
         long_ex = exchange_map.get(long_display)
         short_ex = exchange_map.get(short_display)
         
@@ -4409,73 +4505,6 @@ class FundingHunterGUI:
                     info_text += f"Funding Rate ({long_display}):  {long_rate_str}\n"
                     info_text += f"Funding Rate ({short_display}): {short_rate_str}\n"
                     info_text += f"Net Funding (SHORT-LONG): {net_funding_str}\n"
-                    
-                    # Break-even calculation
-                    info_text += f"─────────────────────────\n"
-                    info_text += f"TRADE ANALYSIS:\n"
-                    
-                    # Get position size from UI (or use default)
-                    try:
-                        position_size = float(self.size_var.get())
-                    except:
-                        position_size = 100.0  # Default
-                    
-                    # Calculate break-even if we have funding rates
-                    if long_funding and short_funding:
-                        net_funding_rate = (short_funding.funding_rate - long_funding.funding_rate) * 100
-                        interval_hours = long_funding.funding_interval_hours or 8
-                        
-                        be_result = calculate_break_even(
-                            long_exchange=long_ex,
-                            short_exchange=short_ex,
-                            position_size_usd=position_size,
-                            funding_rate_pct=net_funding_rate,
-                            leverage=10,
-                            slippage_pct=0.02,
-                            funding_interval_hours=interval_hours
-                        )
-                        
-                        # Price divergence check
-                        div_result = assess_price_divergence(long_price, short_price)
-                        
-                        # Display APR prominently
-                        apr = be_result['apr_pct']
-                        net_apr = be_result['net_apr_pct']
-                        if apr >= 50:
-                            apr_indicator = "EXCELLENT"
-                        elif apr >= 20:
-                            apr_indicator = "GOOD"
-                        elif apr >= 10:
-                            apr_indicator = "FAIR"
-                        else:
-                            apr_indicator = "LOW"
-                        
-                        info_text += f"  APR: {apr:.1f}% ({apr_indicator})\n"
-                        info_text += f"  Net APR: {net_apr:.1f}% (after fees)\n"
-                        info_text += f"  Daily: {be_result['daily_return_pct']:.3f}%\n"
-                        info_text += f"─────────────────────────\n"
-                        
-                        # Display fees
-                        info_text += f"  Fees: {be_result['total_fees_pct']:.3f}% (${be_result['total_cost_usd']:.2f})\n"
-                        info_text += f"  Funding/{interval_hours}h: ${be_result['funding_income_usd']:.2f}\n"
-                        
-                        # Profit/Loss indicator
-                        if be_result['is_profitable']:
-                            profit_str = f"  1st period: +${be_result['net_profit_first_period']:.2f} PROFIT\n"
-                            info_text += profit_str
-                        else:
-                            loss = abs(be_result['net_profit_first_period'])
-                            info_text += f"  1st period: -${loss:.2f} LOSS\n"
-                            info_text += f"  Break-even: {be_result['hours_to_break_even']:.1f}h\n"
-                        
-                        # Price divergence warning
-                        if div_result['divergence_pct'] >= 0.1:
-                            info_text += f"─────────────────────────\n"
-                            info_text += f"  Price Div: {div_result['divergence_pct']:.3f}% ({div_result['risk_level']})\n"
-                    else:
-                        info_text += f"  (Need funding rates to calculate)\n"
-                    
-                    info_text += f"─────────────────────────\n"
                     info_text += f"Next Funding: {time_str}\n"
                     info_text += f"Entry Timing: {entry_status}\n"
                     info_text += f"Funding Interval: {funding_interval_text}"

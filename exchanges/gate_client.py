@@ -628,6 +628,51 @@ class GateClient(BaseExchangeClient):
         except Exception as e:
             print(f"Error getting Gate.io order history: {e}")
             return []
+            
+    async def get_closed_pnl(self, symbol: str, since: Optional[int] = None) -> Dict[str, Any]:
+        """Get realized PnL, commission fees, and funding fees for a closed position"""
+        gate_symbol = symbol if "_" in symbol else get_exchange_symbol(symbol, Exchange.GATE)
+        
+        realized_pnl = 0.0
+        commission = 0.0
+        funding_fee = 0.0
+        
+        try:
+            # We use the existing get_income_history method
+            res_pnl = await self.get_income_history(gate_symbol, limit=100, income_type="REALIZED_PNL")
+            if since:
+                res_pnl = [item for item in res_pnl if item.get("time", 0) >= since]
+            for item in res_pnl:
+                realized_pnl += float(item.get("income", 0))
+                
+            res_fee = await self.get_income_history(gate_symbol, limit=100, income_type="COMMISSION")
+            if since:
+                res_fee = [item for item in res_fee if item.get("time", 0) >= since]
+            for item in res_fee:
+                commission += abs(float(item.get("income", 0)))
+                
+            res_fund = await self.get_income_history(gate_symbol, limit=100, income_type="FUNDING_FEE")
+            if since:
+                res_fund = [item for item in res_fund if item.get("time", 0) >= since]
+            for item in res_fund:
+                funding_fee += float(item.get("income", 0))
+                
+            net_pnl = realized_pnl - commission + funding_fee
+            
+            return {
+                "realized_pnl": realized_pnl,
+                "commission": commission,
+                "funding_fee": funding_fee,
+                "net_pnl": net_pnl
+            }
+        except Exception as e:
+            print(f"Error getting Gate PnL: {e}")
+            return {
+                "realized_pnl": 0.0,
+                "commission": 0.0,
+                "funding_fee": 0.0,
+                "net_pnl": 0.0
+            }
     
     def get_exchange_name(self) -> str:
         """Get exchange name"""

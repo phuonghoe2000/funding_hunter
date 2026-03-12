@@ -88,10 +88,27 @@ class GateConfig:
 
 
 @dataclass
+class AsterdexConfig:
+    """Asterdex API Configuration"""
+    api_key: str = ""
+    secret_key: str = ""
+    # Testnet not explicitly documented, wait for user
+    testnet: bool = False
+    
+    @property
+    def base_url(self) -> str:
+        return "https://fapi.asterdex.com"
+    
+    @property
+    def ws_url(self) -> str:
+        return "wss://fstream.asterdex.com"
+
+
+@dataclass
 class TradingConfig:
     """Trading parameters"""
     # Default leverage
-    default_leverage: int = 10
+    default_leverage: int = 3
     
     # Position monitoring interval (seconds)
     monitor_interval: float = 1.0
@@ -120,6 +137,7 @@ class Settings:
         self.binance = BinanceConfig()
         self.bingx = BingXConfig()
         self.gate = GateConfig()
+        self.asterdex = AsterdexConfig()
         self.trading = TradingConfig()
     
     def load_from_env(self):
@@ -142,6 +160,10 @@ class Settings:
         # Gate.io
         self.gate.api_key = os.getenv("GATE_API_KEY", "")
         self.gate.secret_key = os.getenv("GATE_SECRET_KEY", "")
+        
+        # Asterdex
+        self.asterdex.api_key = os.getenv("ASTERDEX_API_KEY", "")
+        self.asterdex.secret_key = os.getenv("ASTERDEX_SECRET_KEY", "")
         
         # Trading
         self.trading.default_leverage = int(os.getenv("DEFAULT_LEVERAGE", "10"))

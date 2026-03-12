@@ -634,18 +634,44 @@ class BingXClient(BaseExchangeClient):
         return True
     
     async def get_funding_rate(self, symbol: str) -> FundingRate:
-        """Get current funding rate"""
+        """Get current funding rate with interval from history"""
         bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
         
-        result = await self._request("GET", "/openApi/swap/v2/quote/premiumIndex", 
-                                     {"symbol": bingx_symbol}, signed=False)
+        # Fetch premiumIndex and funding rate history concurrently
+        premium_task = asyncio.create_task(
+            self._request("GET", "/openApi/swap/v2/quote/premiumIndex", 
+                         {"symbol": bingx_symbol}, signed=False))
+        history_task = asyncio.create_task(
+            self._request("GET", "/openApi/swap/v2/quote/fundingRate",
+                         {"symbol": bingx_symbol}, signed=False))
+        
+        result = await premium_task
+        
+        # Determine interval from history
+        funding_interval_hours = 8  # fallback
+        try:
+            history_result = await history_task
+            history_items = history_result.get("data", [])
+            if isinstance(history_items, list) and len(history_items) >= 2:
+                t1 = int(history_items[0].get("fundingTime", 0))
+                t2 = int(history_items[1].get("fundingTime", 0))
+                if t1 and t2:
+                    diff_hours = abs(t1 - t2) / 3600000
+                    # Round to nearest standard interval
+                    if diff_hours <= 1.5:
+                        funding_interval_hours = 1
+                    elif diff_hours <= 3:
+                        funding_interval_hours = 2
+                    elif diff_hours <= 6:
+                        funding_interval_hours = 4
+                    else:
+                        funding_interval_hours = 8
+        except Exception as e:
+            logger.debug(f"BingX funding history unavailable for {bingx_symbol}: {e}")
         
         if result.get("code") == 0 and result.get("data"):
             data = result["data"]
             next_funding_time_ms = int(data.get("nextFundingTime", 0))
-            
-            # BingX typically uses 8-hour intervals
-            funding_interval_hours = 8
             
             return FundingRate(
                 symbol=bingx_symbol,
@@ -828,6 +854,66 @@ class BingXClient(BaseExchangeClient):
         except Exception as e:
             print(f"Error getting BingX order history: {e}")
             return []
+            
+    async def get_closed_pnl(self, symbol: str, since: Optional[int] = None) -> Dict[str, Any]:
+        """Get realized PnL, commission fees, and funding fees for a closed position"""
+        bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
+        
+        realized_pnl = 0.0
+        commission = 0.0
+        funding_fee = 0.0
+        
+        params = {
+            "symbol": bingx_symbol,
+            "limit": "100"
+        }
+        if since:
+            params["startTime"] = str(since)
+            
+        try:
+            # 1. Realized PnL
+            r_params = params.copy()
+            r_params["incomeType"] = "REALIZED_PNL"
+            
+            pnl_res = await self._request("GET", "/openApi/swap/v2/user/income", r_params)
+            if pnl_res.get("code") == 0 and pnl_res.get("data"):
+                for item in pnl_res.get("data", []):
+                    realized_pnl += float(item.get("income", 0))
+            
+            # 2. Commission (TRADING_FEE is usually negative)
+            c_params = params.copy()
+            c_params["incomeType"] = "TRADING_FEE"
+            
+            c_res = await self._request("GET", "/openApi/swap/v2/user/income", c_params)
+            if c_res.get("code") == 0 and c_res.get("data"):
+                for item in c_res.get("data", []):
+                    commission += abs(float(item.get("income", 0)))
+            
+            # 3. Funding Fee
+            f_params = params.copy()
+            f_params["incomeType"] = "FUNDING_FEE"
+            
+            f_res = await self._request("GET", "/openApi/swap/v2/user/income", f_params)
+            if f_res.get("code") == 0 and f_res.get("data"):
+                for item in f_res.get("data", []):
+                    funding_fee += float(item.get("income", 0))
+                    
+            net_pnl = realized_pnl - commission + funding_fee
+            
+            return {
+                "realized_pnl": realized_pnl,
+                "commission": commission,
+                "funding_fee": funding_fee,
+                "net_pnl": net_pnl
+            }
+        except Exception as e:
+            print(f"Error getting BingX PnL: {e}")
+            return {
+                "realized_pnl": 0.0,
+                "commission": 0.0,
+                "funding_fee": 0.0,
+                "net_pnl": 0.0
+            }
     
     def get_exchange_name(self) -> str:
         """Get exchange name"""

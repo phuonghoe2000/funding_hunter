@@ -38,7 +38,7 @@ class ArbitragePosition:
     okx_side: Optional[Side] = None
     binance_side: Optional[Side] = None
     size: float = 0.0
-    leverage: int = 10
+    leverage: int = 3
     status: ArbitrageStatus = ArbitrageStatus.NONE
     opened_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
@@ -48,12 +48,12 @@ class ArbitragePosition:
 
 
 class PositionManager:
-    """Manages arbitrage positions across OKX and Binance"""
+    """Manages arbitrage positions across multiple exchanges (Deprecated/Legacy code structure, use MultiExchangeManager)"""
     
     def __init__(
         self,
-        okx_client: OKXClient,
-        binance_client: BinanceClient,
+        okx_client: Any,
+        binance_client: Any,
         on_position_update: Optional[Callable] = None,
         on_liquidation: Optional[Callable] = None,
         on_error: Optional[Callable] = None
@@ -99,7 +99,7 @@ class PositionManager:
         pair: str,
         size: float,
         okx_side: Side,
-        leverage: int = 10
+        leverage: int = 3
     ) -> ArbitragePosition:
         """
         Open hedged position on both exchanges
