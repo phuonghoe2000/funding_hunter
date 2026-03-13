@@ -36,20 +36,20 @@ class TradingEngine:
     # Connection
     # ------------------------------------------------------------------
     async def initialize(self) -> bool:
-        """Connects the enabled exchanges."""
+        """Connects the enabled exchanges (only those with API keys configured)."""
         tasks = []
-        if self.settings.okx:
+        if self.settings.okx and self.settings.okx.api_key:
             tasks.append(self.exchange_manager.connect_exchange(Exchange.OKX, OKXClient(self.settings.okx)))
-        if self.settings.binance:
+        if self.settings.binance and self.settings.binance.api_key:
             tasks.append(self.exchange_manager.connect_exchange(Exchange.BINANCE, BinanceClient(self.settings.binance)))
-        if self.settings.bingx:
+        if self.settings.bingx and self.settings.bingx.api_key:
             tasks.append(self.exchange_manager.connect_exchange(Exchange.BINGX, BingXClient(self.settings.bingx)))
-        if self.settings.gate:
+        if self.settings.gate and self.settings.gate.api_key:
             tasks.append(self.exchange_manager.connect_exchange(Exchange.GATE, GateClient(self.settings.gate)))
-        if getattr(self.settings, 'asterdex', None) or getattr(self.settings, 'aster', None):
-            cfg = getattr(self.settings, 'asterdex', getattr(self.settings, 'aster', None))
+        aster_cfg = getattr(self.settings, 'asterdex', None) or getattr(self.settings, 'aster', None)
+        if aster_cfg and aster_cfg.api_key:
             ex_enum = Exchange.ASTERDEX if hasattr(Exchange, 'ASTERDEX') else getattr(Exchange, 'ASTER')
-            tasks.append(self.exchange_manager.connect_exchange(ex_enum, AsterClient(cfg)))
+            tasks.append(self.exchange_manager.connect_exchange(ex_enum, AsterClient(aster_cfg)))
         if not tasks:
             logger.warning("No exchanges enabled in settings.")
             return False
@@ -62,9 +62,9 @@ class TradingEngine:
     # ------------------------------------------------------------------
     # 1. Scan funding rates
     # ------------------------------------------------------------------
-    async def scan_opportunities(self, min_spread: float = 0.0) -> List[Dict]:
+    async def scan_opportunities(self, min_spread: float = 0.0, top_n: int = 50) -> List[Dict]:
         logger.info("Scanning for funding rate opportunities...")
-        rates = await self.exchange_manager.get_all_funding_rates()
+        rates = await self.exchange_manager.get_all_funding_rates(top_n=top_n)
         if not rates:
             return []
         opportunities = []
@@ -145,9 +145,16 @@ class TradingEngine:
         logger.info(f"🚀 Opening {pair}: LONG {long_ex_name} / SHORT {short_ex_name} | "
                      f"Size: ${size} | Leverage: {leverage}x | Splits: {splits}")
 
-        open_result = await self.exchange_manager.open_hedged_position(
+        open_result = await self.exchange_manager.open_hedged_position_split(
             pair=pair, long_exchange=long_ex, short_exchange=short_ex,
-            size=size, leverage=leverage
+            total_size=size, leverage=leverage,
+            split_count=splits,
+            delay_between_splits=2.0,
+            price_spread_min=price_spread_min,
+            spread_check_interval=2.0,
+            max_wait_per_split=3600.0,
+            log_callback=lambda m: logger.info(m),
+            skip_leverage_set=skip_leverage,
         )
         return open_result
 

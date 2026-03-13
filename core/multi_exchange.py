@@ -63,58 +63,103 @@ class MultiExchangeManager:
                 logger.error(f"Error getting funding rate from {exchange.value}: {e}")
         return rates
         
-    async def get_all_funding_rates(self, pairs: List[str] = None) -> Dict[str, Dict[Exchange, FundingRate]]:
-        """Get funding rates for all pairs across all connected exchanges
+    async def get_all_funding_rates(self, pairs: List[str] = None, top_n: int = 0) -> Dict[str, Dict[Exchange, FundingRate]]:
+        """Get funding rates for all pairs across all connected exchanges.
+        
+        If pairs is None, dynamically discovers ALL pairs from bulk exchanges
+        (e.g. Binance), sorted by abs(funding_rate), then cross-checks others.
+        
+        Args:
+            pairs: Explicit list of pairs to check. If None, auto-discover.
+            top_n: If > 0 and auto-discovering, limit to top N pairs by abs(rate).
+        
         Returns: Dict[pair, Dict[Exchange, FundingRate]]
         """
-        from config.constants import POPULAR_PAIRS
-        pairs = pairs or POPULAR_PAIRS
-        
-        all_rates = {pair: {} for pair in pairs}
-        all_exchange_tasks = []
-        clients_involved = []
-        
-        # Concurrently fetch bulk rates for each exchange
+        # ── Step 1: Bulk fetch from all exchanges that support it ──
+        bulk_exchange_rates: Dict[Exchange, List[FundingRate]] = {}
+        bulk_tasks = []
+        bulk_exchanges = []
         for exchange, client in self.clients.items():
             if hasattr(client, "get_all_funding_rates"):
-                all_exchange_tasks.append(client.get_all_funding_rates())
-                clients_involved.append(exchange)
+                bulk_tasks.append(client.get_all_funding_rates())
+                bulk_exchanges.append(exchange)
                 
-        results = await asyncio.gather(*all_exchange_tasks, return_exceptions=True)
-        
-        for exchange, bulk_rates in zip(clients_involved, results):
-            if isinstance(bulk_rates, Exception):
-                logger.error(f"Failed to bulk fetch funding rates for {exchange.value}: {bulk_rates}")
-                continue
-                
-            # Filter and map the bulk rates to the requested pairs
-            for rate in bulk_rates:
-                pair_name = None
-                for p in pairs:
-                    if get_exchange_symbol(p, exchange) == rate.symbol:
-                        pair_name = p
-                        break
-                        
-                if pair_name:
-                    all_rates[pair_name][exchange] = rate
-
-        # Fallback for exchanges without bulk fetch
-        single_tasks = []
-        single_mapping = []
-        for exchange, client in self.clients.items():
-            if not hasattr(client, "get_all_funding_rates"):
-                for pair in pairs:
-                    symbol = get_exchange_symbol(pair, exchange)
-                    single_tasks.append(client.get_funding_rate(symbol))
-                    single_mapping.append((pair, exchange))
-                    
-        if single_tasks:
-            single_results = await asyncio.gather(*single_tasks, return_exceptions=True)
-            for (pair, exchange), result in zip(single_mapping, single_results):
+        if bulk_tasks:
+            results = await asyncio.gather(*bulk_tasks, return_exceptions=True)
+            for exchange, result in zip(bulk_exchanges, results):
                 if isinstance(result, Exception):
-                    logger.debug(f"Failed to get funding rate for {pair} on {exchange.value}: {result}")
-                elif result:
-                    all_rates[pair][exchange] = result
+                    logger.error(f"Failed to bulk fetch funding rates for {exchange.value}: {result}")
+                else:
+                    bulk_exchange_rates[exchange] = result
+
+        # ── Step 2: Build the pair list ──
+        if pairs is not None:
+            # User specified explicit pairs
+            target_pairs = pairs
+        else:
+            # Auto-discover from the first bulk exchange (prefer Binance)
+            primary_ex = None
+            primary_rates = []
+            for ex in [Exchange.BINANCE, Exchange.ASTERDEX]:
+                if ex in bulk_exchange_rates:
+                    primary_ex = ex
+                    primary_rates = bulk_exchange_rates[ex]
+                    break
+            if not primary_ex and bulk_exchange_rates:
+                primary_ex = list(bulk_exchange_rates.keys())[0]
+                primary_rates = bulk_exchange_rates[primary_ex]
+            
+            if not primary_rates:
+                logger.warning("No bulk funding rates available to discover pairs.")
+                return {}
+            
+            # Sort by abs(funding_rate) descending
+            primary_rates.sort(key=lambda r: abs(r.funding_rate), reverse=True)
+            if top_n > 0:
+                primary_rates = primary_rates[:top_n]
+            
+            # Convert exchange symbols to unified pairs (e.g. BTCUSDT -> BTC/USDT)
+            target_pairs = []
+            for rate in primary_rates:
+                sym = rate.symbol
+                # Strip exchange suffixes: -SWAP, _USDT -> /USDT, -USDT -> /USDT
+                base = sym.replace("-USDT-SWAP", "").replace("-USDT", "").replace("_USDT", "").replace("USDT", "")
+                pair = f"{base}/USDT"
+                if pair not in target_pairs:
+                    target_pairs.append(pair)
+            
+            logger.info(f"Found {len(bulk_exchange_rates.get(primary_ex, []))} pairs on {primary_ex.value}, using {len(target_pairs)}")
+
+        # ── Step 3: Map bulk rates to target pairs ──
+        all_rates: Dict[str, Dict[Exchange, FundingRate]] = {p: {} for p in target_pairs}
+        
+        for exchange, rates_list in bulk_exchange_rates.items():
+            # Build a symbol -> rate lookup
+            sym_lookup = {r.symbol: r for r in rates_list}
+            for pair in target_pairs:
+                ex_symbol = get_exchange_symbol(pair, exchange)
+                if ex_symbol in sym_lookup:
+                    all_rates[pair][exchange] = sym_lookup[ex_symbol]
+
+        # ── Step 4: Cross-check non-bulk exchanges (batched to avoid rate limits) ──
+        BATCH_SIZE = 5
+        for exchange, client in self.clients.items():
+            if exchange in bulk_exchange_rates:
+                continue
+            for i in range(0, len(target_pairs), BATCH_SIZE):
+                batch = target_pairs[i:i+BATCH_SIZE]
+                tasks = []
+                for pair in batch:
+                    symbol = get_exchange_symbol(pair, exchange)
+                    tasks.append(client.get_funding_rate(symbol))
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for pair, result in zip(batch, results):
+                    if isinstance(result, Exception):
+                        logger.debug(f"Failed to get rate for {pair} on {exchange.value}: {result}")
+                    elif result:
+                        all_rates[pair][exchange] = result
+                if i + BATCH_SIZE < len(target_pairs):
+                    await asyncio.sleep(0.5)  # throttle between batches
                     
         # Filter out pairs with no rates
         return {pair: rates for pair, rates in all_rates.items() if rates}

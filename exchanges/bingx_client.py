@@ -684,8 +684,47 @@ class BingXClient(BaseExchangeClient):
         
         raise Exception(f"No funding rate data for {bingx_symbol}")
     
+    async def get_all_funding_rates(self) -> List[FundingRate]:
+        """Get funding rates for ALL BingX perpetual contracts in one call.
+        Uses premiumIndex without symbol parameter to fetch everything."""
+        result = await self._request("GET", "/openApi/swap/v2/quote/premiumIndex", 
+                                     {}, signed=False)
+        rates = []
+        if result.get("code") == 0 and result.get("data"):
+            data_list = result["data"]
+            if isinstance(data_list, dict):
+                data_list = [data_list]
+            for data in data_list:
+                try:
+                    symbol = data.get("symbol", "")
+                    if not symbol or "USDT" not in symbol:
+                        continue
+                    next_ts = int(data.get("nextFundingTime", 0))
+                    next_dt = datetime.fromtimestamp(next_ts / 1000, tz=timezone.utc) if next_ts else datetime.now(timezone.utc)
+                    
+                    # Infer interval from settlement hour pattern:
+                    # 8h → settles at {0, 8, 16}, 4h → {0,4,8,12,16,20}, else 1h
+                    hour = next_dt.hour
+                    if hour % 8 == 0:
+                        funding_interval_hours = 8
+                    elif hour % 4 == 0:
+                        funding_interval_hours = 4
+                    else:
+                        funding_interval_hours = 1
+                    
+                    rates.append(FundingRate(
+                        symbol=symbol,
+                        funding_rate=float(data.get("lastFundingRate", 0)),
+                        next_funding_time=next_dt,
+                        estimated_rate=float(data.get("estimatedSettlePrice", 0)) if data.get("estimatedSettlePrice") else None,
+                        funding_interval_hours=funding_interval_hours,
+                        raw_data=data
+                    ))
+                except Exception as e:
+                    logger.debug(f"Error parsing BingX rate for {data.get('symbol')}: {e}")
+        return rates
+
     async def get_mark_price(self, symbol: str) -> float:
-        """Get current mark price"""
         bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
         
         result = await self._request("GET", "/openApi/swap/v2/quote/premiumIndex",

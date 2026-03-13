@@ -7,6 +7,7 @@ import asyncio
 import argparse
 import logging
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from dataclasses import is_dataclass, asdict
@@ -34,7 +35,16 @@ def _json(data):
 
 
 # ── Logging ────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format='%(message)s')
+logging.basicConfig(level=logging.WARNING, format='%(message)s')
+# Only show INFO from CLI and trading engine, suppress exchange/WS noise
+logging.getLogger("__main__").setLevel(logging.INFO)
+logging.getLogger("core.trading_engine").setLevel(logging.INFO)
+logging.getLogger("core.multi_exchange").setLevel(logging.INFO)
+# Silence all exchange client and websocket logs
+for _mod in ["exchanges", "exchanges.binance_client", "exchanges.bingx_client",
+             "exchanges.okx_client", "exchanges.gate_client", "exchanges.aster_client",
+             "exchanges.websocket_manager"]:
+    logging.getLogger(_mod).setLevel(logging.CRITICAL)
 logger = logging.getLogger(__name__)
 
 
@@ -126,7 +136,7 @@ Examples:
 
 # ── Command Handlers ───────────────────────────────────────────────
 async def cmd_scan(engine, args):
-    opps = await engine.scan_opportunities(min_spread=args.min_spread)
+    opps = await engine.scan_opportunities(min_spread=args.min_spread, top_n=args.top)
     if not opps:
         logger.info("No opportunities found.")
         return
@@ -134,14 +144,14 @@ async def cmd_scan(engine, args):
     for opp in opps[:args.top]:
         table.append([
             opp['symbol'],
-            f"{opp['spread']:.4f}%",
+            f"{opp['spread']*100:.4f}%",
             f"{opp['short_exchange'].upper()} (-)",
-            f"{opp['short_norm']:.4f}%",
+            f"{opp['short_rate']*100:.4f}% ({opp['short_interval']}h)",
             f"{opp['long_exchange'].upper()} (+)",
-            f"{opp['long_norm']:.4f}%",
+            f"{opp['long_rate']*100:.4f}% ({opp['long_interval']}h)",
         ])
     print(tabulate(table,
-                   headers=["Symbol", "Norm Spread (4H)", "Short EX", "Short Rate", "Long EX", "Long Rate"],
+                   headers=["Symbol", "Spread (4H)", "Short EX", "Short Rate (interval)", "Long EX", "Long Rate (interval)"],
                    tablefmt="grid"))
     logger.info(f"\n✅ Found {len(opps)} opportunities (showing top {min(args.top, len(opps))})")
 
@@ -285,10 +295,16 @@ async def main():
         parser.print_help()
         return
 
-    # Initialize
+    # Initialize (suppress noisy print() from exchange clients during connect)
     config = ConfigManager("user_config.json").get_settings()
     engine = TradingEngine(config)
-    connected = await engine.initialize()
+    _real_stdout = sys.stdout
+    sys.stdout = open(os.devnull, 'w')
+    try:
+        connected = await engine.initialize()
+    finally:
+        sys.stdout.close()
+        sys.stdout = _real_stdout
     if not connected:
         logger.error("Failed to connect to any exchange. Check API keys.")
         return

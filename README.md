@@ -1,160 +1,153 @@
 # 🎯 Funding Hunter
 
-**Công cụ Funding Arbitrage cho OKX, Binance và BingX Futures**
+**Multi-Exchange Funding Rate Arbitrage Tool** — Hỗ trợ OKX, Binance, BingX, Gate.io, Asterdex
 
-Tool này cho phép bạn mở lệnh futures đồng thời trên 2 trong 3 sàn (OKX, Binance, BingX) để "ăn" funding rate - một chiến lược arbitrage phổ biến trong thị trường crypto.
+Tool cho phép mở lệnh futures đồng thời trên 2 sàn để "ăn" chênh lệch funding rate. Hỗ trợ cả **GUI** (tkinter) và **CLI** (command line).
 
 ## ✨ Tính năng
 
-- 📊 **Gửi lệnh Market đồng thời** - Long/Short trên 2 sàn bất kỳ cùng lúc
-- 💰 **Theo dõi Funding Rate** - So sánh funding rate của cả 3 sàn
-- 🔄 **Đóng lệnh đồng thời** - Đóng position trên cả 2 sàn cùng lúc
-- ⚠️ **Auto-close khi liquidation** - Tự động đóng bên còn lại nếu 1 bên bị thanh lý
-- 🖥️ **Giao diện GUI** - Dễ sử dụng với tkinter
-- 📈 **Theo dõi PnL realtime** - Xem lãi/lỗ của từng position
-- 🔀 **Chọn sàn linh hoạt** - Chọn bất kỳ 2 trong 3 sàn để arbitrage
+- 📊 **Scan funding rates** — So sánh rates chuẩn hoá 4H trên tất cả sàn
+- 🚀 **Mở lệnh hedge** — Analyze spread + DCA splits trên 2 sàn đồng thời
+- 🛑 **Đóng lệnh hedge** — Analyze spread + split close thông minh
+- 👁 **Monitor realtime** — Theo dõi PnL, Risk%, funding fees liên tục
+- 🔄 **Auto-close** — Tự đóng khi risk vượt ngưỡng hoặc funding đảo chiều
+- 📥 **Load positions** — Tự detect lệnh hedge đang mở trên các sàn
+- 💰 **PnL Report** — Tính lãi/lỗ chi tiết (realized PnL + commission + funding fees)
+- 📈 **Pair info** — Giá, order book, funding rate cho bất kỳ pair nào
+- 🤖 **CLI cho AI Agent** — Toàn bộ tính năng qua command line
 
 ## 🚀 Cài đặt
 
-### 1. Clone repo hoặc copy files
-
 ```bash
 cd funding_hunter
-```
-
-### 2. Cài đặt dependencies
-
-```bash
 pip install -r requirements.txt
 ```
 
-### 3. Chuẩn bị API Keys
+### Chuẩn bị API Keys
 
-Bạn cần tạo API keys trên các sàn muốn dùng (ít nhất 2 sàn):
+Tạo API keys trên ít nhất 2 sàn:
 
-**OKX:**
-1. Vào Account → API → Create API Key
-2. Chọn permissions: Trade
-3. Lưu lại: API Key, Secret Key, Passphrase
+| Sàn | Cần | Lưu ý |
+|-----|-----|-------|
+| **OKX** | API Key, Secret, Passphrase | Cần permission Trade |
+| **Binance** | API Key, Secret | Enable Futures |
+| **BingX** | API Key, Secret | ⚠️ Không có testnet |
+| **Gate.io** | API Key, Secret | Enable Futures |
+| **Asterdex** | API Key, Secret | — |
 
-**Binance:**
-1. Vào Account → API Management → Create API
-2. Enable Futures
-3. Lưu lại: API Key, Secret Key
+Cấu hình API keys trong file `user_config.json` (hoặc `dist/user_config.json`).
 
-**BingX:**
-1. Vào Account → API Management → Create API
-2. Enable Futures trading
-3. Lưu lại: API Key, Secret Key
-4. ⚠️ BingX không có testnet, chỉ trade thật
+## 📖 Sử dụng
 
-## 📖 Cách sử dụng
-
-### 1. Chạy ứng dụng
+### GUI Mode
 
 ```bash
 python main.py
 ```
 
-### 2. Kết nối
+### CLI Mode
 
-1. Nhập API credentials cho OKX và Binance
-2. Chọn Testnet nếu muốn test trước
-3. Click "Connect"
+```bash
+# Scan cơ hội funding rate
+python cli.py scan [--min-spread 0.001] [--top 15]
 
-### 3. Mở position
+# Xem balance & positions
+python cli.py status
 
-1. Chọn trading pair (BTC/USDT, ETH/USDT, ...)
-2. Nhập size (số lượng contracts)
-3. Chọn leverage
-4. **Chọn sàn LONG** (sàn sẽ mở lệnh Long)
-5. **Chọn sàn SHORT** (sàn sẽ mở lệnh Short)
-6. Click "Open Hedged Position"
+# Detect lệnh hedge đang mở
+python cli.py positions
 
-### 4. Theo dõi funding
+# Xem chi tiết pair (giá, funding, orderbook)
+python cli.py info --pair BTC/USDT --long binance --short bingx
 
-1. Click "Refresh Rates" để xem funding rate hiện tại của cả 3 sàn
-2. Tool sẽ tự động tính spread và gợi ý cặp sàn tốt nhất
-3. Double-click vào hàng để tự động chọn pair và cặp sàn gợi ý
+# Mở lệnh hedge (analyze spread → DCA entry)
+python cli.py open --pair BTC/USDT --long gate --short binance \
+    --size 100 --leverage 3 [--splits 5] [--skip-leverage]
 
-### 5. Đóng position
+# Đóng lệnh hedge (analyze spread → split close)
+python cli.py close --pair BTC/USDT --long gate --short binance [--splits 3]
 
-- Click "Close All Positions" để đóng tất cả
-- Hoặc chọn position trong bảng và click "Close Selected"
+# Monitor PnL realtime + auto-close
+python cli.py monitor --pair BTC/USDT --long gate --short binance \
+    [--auto-close-risk 10] [--auto-close-reversal] [--interval 5]
+
+# Tính PnL từ trade history
+python cli.py pnl --pair BTC/USDT --long gate --short binance \
+    [--since "2026-03-12 10:00:00"]
+
+# Analyze price spread (open/close mode)
+python cli.py analyze --pair BTC/USDT --long gate --short binance \
+    [--duration 120] [--mode close]
+```
 
 ## 💡 Chiến lược Funding Arbitrage
 
 ### Nguyên lý
 
-Funding rate là khoản thanh toán giữa người Long và người Short mỗi 8 giờ:
-- **Funding rate dương**: Long trả tiền cho Short
-- **Funding rate âm**: Short trả tiền cho Long
+Funding rate là khoản thanh toán giữa Long và Short định kỳ (1h/4h/8h tuỳ sàn):
+- **Rate dương**: Long trả Short
+- **Rate âm**: Short trả Long
 
 ### Cách "ăn" funding
 
-1. **Tìm spread**: So sánh funding rate giữa OKX và Binance
-2. **Hedge position**: 
-   - Long trên sàn có funding rate thấp hơn (nhận ít/trả ít)
-   - Short trên sàn có funding rate cao hơn (nhận nhiều)
-3. **Thu lợi nhuận**: Chênh lệch funding rate trừ phí giao dịch
-
-### Ví dụ
+1. **Scan spread**: `python cli.py scan` — tìm pair có chênh lệch lớn nhất
+2. **Hedge**: Long sàn có rate thấp, Short sàn có rate cao
+3. **Monitor**: Theo dõi PnL + auto-close khi funding đảo chiều
+4. **Thu lợi**: Chênh lệch funding rate trừ phí giao dịch
 
 ```
-OKX Funding Rate: 0.01% (Long trả Short)
-Binance Funding Rate: 0.03% (Long trả Short)
-BingX Funding Rate: 0.02% (Long trả Short)
-
-Chiến lược tốt nhất: Long OKX, Short Binance
-- OKX: Trả 0.01%
-- Binance: Nhận 0.03%
-- Net: +0.02% mỗi 8 giờ
+Ví dụ:
+  Binance Funding Rate: 0.03%   →  Short Binance (nhận 0.03%)
+  Gate.io Funding Rate: 0.01%   →  Long Gate (trả 0.01%)
+  Net: +0.02% mỗi funding period
 ```
 
 ## ⚠️ Cảnh báo rủi ro
 
-1. **Slippage**: Giá có thể khác nhau giữa 2 sàn khi mở/đóng lệnh
-2. **Liquidation**: Nếu giá di chuyển quá mạnh, 1 bên có thể bị liquidate
-3. **Funding rate thay đổi**: Funding rate có thể đảo chiều bất ngờ
-4. **API errors**: Có thể xảy ra lỗi khi gửi lệnh
-5. **Phí giao dịch**: Cần tính vào phí maker/taker của cả 2 sàn
+1. **Slippage** — Giá khác nhau giữa 2 sàn khi mở/đóng lệnh
+2. **Liquidation** — Giá di chuyển quá mạnh có thể liquidate 1 bên
+3. **Funding reversal** — Funding rate có thể đảo chiều bất ngờ
+4. **API errors** — Lỗi kết nối, rate limit từ sàn
+5. **Phí giao dịch** — Cần tính phí maker/taker cả 2 sàn
 
 ## 🔧 Cấu trúc project
 
 ```
 funding_hunter/
 ├── config/
-│   ├── __init__.py
-│   ├── settings.py      # Cấu hình API (OKX, Binance, BingX)
-│   └── constants.py     # Constants và enums
+│   ├── settings.py          # Cấu hình API (OKX, Binance, BingX, Gate, Aster)
+│   └── constants.py         # Constants, enums, helper functions
 ├── exchanges/
-│   ├── __init__.py
-│   ├── base.py          # Base client interface
-│   ├── okx_client.py    # OKX API client
-│   ├── binance_client.py # Binance API client
-│   └── bingx_client.py  # BingX API client
+│   ├── base.py              # Base client interface
+│   ├── okx_client.py        # OKX API client
+│   ├── binance_client.py    # Binance API client
+│   ├── bingx_client.py      # BingX API client
+│   ├── gate_client.py       # Gate.io API client
+│   └── aster_client.py      # Asterdex API client
 ├── core/
-│   ├── __init__.py
+│   ├── config_manager.py    # Load config không cần GUI
+│   ├── multi_exchange.py    # Quản lý multi-exchange (decoupled)
+│   ├── trading_engine.py    # Core trading logic cho CLI
 │   ├── position_manager.py  # Quản lý positions
 │   └── funding_monitor.py   # Theo dõi funding rates
 ├── gui/
-│   ├── __init__.py
-│   └── app.py           # GUI application
-├── main.py              # Entry point
+│   └── app.py               # GUI application (tkinter)
+├── cli.py                   # ⭐ CLI entry point (9 subcommands)
+├── main.py                  # GUI entry point
 ├── requirements.txt
 └── README.md
 ```
 
 ## 📝 Notes
 
-- Tool này dùng **Hedge Mode** (có thể giữ cả Long và Short cùng lúc)
 - Mặc định dùng **Cross Margin**
 - OKX và Binance hỗ trợ cả Mainnet và Testnet
-- **BingX chỉ có Mainnet** - cẩn thận khi test
-- Cần kết nối ít nhất 2 sàn để trade
+- **BingX chỉ có Mainnet** — cẩn thận khi test
+- Funding rates được chuẩn hoá về **4H** để so sánh công bằng giữa các sàn
+- CLI hỗ trợ đầy đủ tính năng cho **AI Agent** tự động trade
 
 ## ⚖️ Disclaimer
 
-Tool này chỉ dùng cho mục đích giáo dục và nghiên cứu. Trading cryptocurrency có rủi ro cao và có thể mất toàn bộ vốn. Tác giả không chịu trách nhiệm cho bất kỳ tổn thất nào từ việc sử dụng tool này.
+Tool này chỉ dùng cho mục đích giáo dục và nghiên cứu. Trading cryptocurrency có rủi ro cao và có thể mất toàn bộ vốn. Tác giả không chịu trách nhiệm cho bất kỳ tổn thất nào.
 
 **USE AT YOUR OWN RISK!**
