@@ -43,7 +43,7 @@ class BinanceClient(BaseExchangeClient):
         self._order_cache: Dict[str, Order] = {} # order_id -> Order
         self._funding_info_cache: list = []  # cached /fapi/v1/fundingInfo response
         self._funding_info_cache_time: float = 0  # timestamp of last cache
-        self.hedge_mode = True
+        self.hedge_mode = False  # One-Way mode (synced from API on connect)
         
     async def connect(self) -> bool:
         """Connect to Binance API and WS"""
@@ -711,11 +711,16 @@ class BinanceClient(BaseExchangeClient):
             self.hedge_mode = hedge_mode
             return True
         except Exception as e:
-            # Might fail if already in the requested mode
+            # Already in the requested mode
             if "No need to change position side" in str(e) or "-4059" in str(e):
                 self.hedge_mode = hedge_mode
                 return True
-            print(f"Error setting position mode: {e}")
+            # Can't change because existing positions - query actual mode
+            try:
+                result = await self._request("GET", "/fapi/v1/positionSide/dual", signed=True)
+                self.hedge_mode = result.get("dualSidePosition", False)
+            except:
+                self.hedge_mode = False  # Safe default for Binance
             return False
     
     async def get_income_history(self, income_type: str = "FUNDING_FEE", limit: int = 100, symbol: Optional[str] = None) -> List[Dict]:
