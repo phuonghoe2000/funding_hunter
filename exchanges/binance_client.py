@@ -422,11 +422,25 @@ class BinanceClient(BaseExchangeClient):
         """Place a market order"""
         binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
         
+        # Get current price to convert USDT size to asset size
+        current_price = await self.get_mark_price(binance_symbol)
+        asset_size = size / current_price if current_price else size
+        
+        # Format size based on symbol to avoid precision errors
+        if "BTC" in binance_symbol:
+            asset_size = round(asset_size, 3)
+        elif "ETH" in binance_symbol:
+            asset_size = round(asset_size, 2)
+        elif asset_size < 1:
+            asset_size = round(asset_size, 4)
+        else:
+            asset_size = self._round_quantity(binance_symbol, asset_size)
+            
         params = {
             "symbol": binance_symbol,
             "side": "BUY" if side == Side.LONG else "SELL",
             "type": "MARKET",
-            "quantity": size,
+            "quantity": asset_size,
         }
         
         if reduce_only:

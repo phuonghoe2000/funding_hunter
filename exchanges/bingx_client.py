@@ -438,12 +438,26 @@ class BingXClient(BaseExchangeClient):
         """Place a market order"""
         bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
         
+        # Get current price to convert USDT size to asset size
+        current_price = await self.get_mark_price(bingx_symbol)
+        asset_size = size / current_price if current_price else size
+        
+        # Format size based on symbol to avoid precision errors
+        if "BTC" in bingx_symbol:
+            asset_size = round(asset_size, 3)
+        elif "ETH" in bingx_symbol:
+            asset_size = round(asset_size, 2)
+        elif asset_size < 1:
+            asset_size = round(asset_size, 4)
+        else:
+            asset_size = round(asset_size, 1)
+            
         # BingX expects quantity as a string to avoid floating point precision issues
         params = {
             "symbol": bingx_symbol,
             "side": "BUY" if side == Side.LONG else "SELL",
             "type": "MARKET",
-            "quantity": str(size),
+            "quantity": str(asset_size),
             "positionSide": "LONG" if side == Side.LONG else "SHORT"
         }
         

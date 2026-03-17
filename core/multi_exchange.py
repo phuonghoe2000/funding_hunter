@@ -3,7 +3,7 @@ import logging
 import time
 import threading
 from typing import Dict, List, Optional, Any, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 from config.constants import Exchange, get_exchange_symbol, Side
 from exchanges.base import BaseExchangeClient, FundingRate
 
