@@ -1,6 +1,6 @@
 """
 Main GUI Application for Funding Hunter - Multi Exchange Support
-Supports OKX, Binance, BingX, and Bybit
+Supports Binance, BingX, Bybit, and AsterDex
 """
 import asyncio
 import threading
@@ -75,7 +75,7 @@ def sync_windows_time() -> tuple[bool, str]:
         return False, f"❌ Lỗi sync time: {e}"
 
 from config.constants import POPULAR_PAIRS, Side, Exchange, get_exchange_symbol
-from exchanges.okx_client import OKXClient
+from exchanges.aster_client import AsterClient
 from exchanges.binance_client import BinanceClient
 from exchanges.bingx_client import BingXClient
 from exchanges.bybit_client import BybitClient
@@ -909,13 +909,6 @@ class FundingHunterGUI:
         """Save current config to file"""
         try:
             config = {
-                "okx": {
-                    "api_key": self.okx_api_key.get(),
-                    "secret": self.okx_secret.get(),
-                    "passphrase": self.okx_passphrase.get(),
-                    "testnet": self.okx_testnet.get(),
-                    "enabled": self.okx_enabled.get()
-                },
                 "binance": {
                     "api_key": self.binance_api_key.get(),
                     "secret": self.binance_secret.get(),
@@ -932,6 +925,11 @@ class FundingHunterGUI:
                     "secret": self.bybit_secret.get(),
                     "testnet": self.bybit_testnet.get(),
                     "enabled": self.bybit_enabled.get()
+                },
+                "aster": {
+                    "api_key": self.aster_api_key.get(),
+                    "secret": self.aster_secret.get(),
+                    "enabled": self.aster_enabled.get()
                 },
                 "trading": {
                     "leverage": self.leverage_var.get(),
@@ -959,17 +957,6 @@ class FundingHunterGUI:
             with open(CONFIG_FILE, 'r') as f:
                 config = json.load(f)
             
-            # OKX
-            if "okx" in config:
-                self.okx_api_key.delete(0, tk.END)
-                self.okx_api_key.insert(0, config["okx"].get("api_key", ""))
-                self.okx_secret.delete(0, tk.END)
-                self.okx_secret.insert(0, config["okx"].get("secret", ""))
-                self.okx_passphrase.delete(0, tk.END)
-                self.okx_passphrase.insert(0, config["okx"].get("passphrase", ""))
-                self.okx_testnet.set(config["okx"].get("testnet", True))
-                self.okx_enabled.set(config["okx"].get("enabled", True))
-            
             # Binance
             if "binance" in config:
                 self.binance_api_key.delete(0, tk.END)
@@ -995,6 +982,14 @@ class FundingHunterGUI:
                 self.bybit_secret.insert(0, config["bybit"].get("secret", ""))
                 self.bybit_testnet.set(config["bybit"].get("testnet", False))
                 self.bybit_enabled.set(config["bybit"].get("enabled", False))
+            
+            # AsterDex
+            if "aster" in config:
+                self.aster_api_key.delete(0, tk.END)
+                self.aster_api_key.insert(0, config["aster"].get("api_key", ""))
+                self.aster_secret.delete(0, tk.END)
+                self.aster_secret.insert(0, config["aster"].get("secret", ""))
+                self.aster_enabled.set(config["aster"].get("enabled", False))
             
             # Trading settings
             if "trading" in config:
@@ -1037,28 +1032,6 @@ class FundingHunterGUI:
         # Notebook for exchanges
         notebook = ttk.Notebook(frame)
         notebook.pack(fill=tk.X, pady=5)
-        
-        # OKX Tab
-        okx_frame = ttk.Frame(notebook, padding="10")
-        notebook.add(okx_frame, text="OKX")
-        
-        ttk.Label(okx_frame, text="API Key:").grid(row=0, column=0, padx=5, pady=2, sticky='e')
-        self.okx_api_key = ttk.Entry(okx_frame, width=40, show="*")
-        self.okx_api_key.grid(row=0, column=1, padx=5, pady=2)
-        
-        ttk.Label(okx_frame, text="Secret:").grid(row=0, column=2, padx=5, pady=2, sticky='e')
-        self.okx_secret = ttk.Entry(okx_frame, width=40, show="*")
-        self.okx_secret.grid(row=0, column=3, padx=5, pady=2)
-        
-        ttk.Label(okx_frame, text="Passphrase:").grid(row=0, column=4, padx=5, pady=2, sticky='e')
-        self.okx_passphrase = ttk.Entry(okx_frame, width=20, show="*")
-        self.okx_passphrase.grid(row=0, column=5, padx=5, pady=2)
-        
-        self.okx_testnet = tk.BooleanVar(value=True)
-        ttk.Checkbutton(okx_frame, text="Testnet", variable=self.okx_testnet).grid(row=0, column=6, padx=10)
-        
-        self.okx_enabled = tk.BooleanVar(value=True)
-        ttk.Checkbutton(okx_frame, text="Enable", variable=self.okx_enabled).grid(row=0, column=7, padx=5)
         
         # Binance Tab
         binance_frame = ttk.Frame(notebook, padding="10")
@@ -1113,6 +1086,23 @@ class FundingHunterGUI:
         self.bybit_enabled = tk.BooleanVar(value=False)
         ttk.Checkbutton(bybit_frame, text="Enable", variable=self.bybit_enabled).grid(row=0, column=5, padx=5)
         
+        # AsterDex Tab
+        aster_frame = ttk.Frame(notebook, padding="10")
+        notebook.add(aster_frame, text="AsterDex")
+        
+        ttk.Label(aster_frame, text="API Key:").grid(row=0, column=0, padx=5, pady=2, sticky='e')
+        self.aster_api_key = ttk.Entry(aster_frame, width=40, show="*")
+        self.aster_api_key.grid(row=0, column=1, padx=5, pady=2)
+        
+        ttk.Label(aster_frame, text="Secret:").grid(row=0, column=2, padx=5, pady=2, sticky='e')
+        self.aster_secret = ttk.Entry(aster_frame, width=40, show="*")
+        self.aster_secret.grid(row=0, column=3, padx=5, pady=2)
+        
+        ttk.Label(aster_frame, text="(No Testnet)", foreground='gray').grid(row=0, column=4, padx=10)
+        
+        self.aster_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(aster_frame, text="Enable", variable=self.aster_enabled).grid(row=0, column=5, padx=5)
+        
         # Connection buttons
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=tk.X, pady=10)
@@ -1136,10 +1126,6 @@ class FundingHunterGUI:
         self.balance_frame = ttk.Frame(btn_frame)
         self.balance_frame.pack(side=tk.RIGHT, padx=10)
         
-        ttk.Label(self.balance_frame, text="OKX:").pack(side=tk.LEFT, padx=2)
-        self.okx_balance_label = ttk.Label(self.balance_frame, text="$0.00")
-        self.okx_balance_label.pack(side=tk.LEFT, padx=5)
-        
         ttk.Label(self.balance_frame, text="Binance:").pack(side=tk.LEFT, padx=2)
         self.binance_balance_label = ttk.Label(self.balance_frame, text="$0.00")
         self.binance_balance_label.pack(side=tk.LEFT, padx=5)
@@ -1151,6 +1137,10 @@ class FundingHunterGUI:
         ttk.Label(self.balance_frame, text="Bybit:").pack(side=tk.LEFT, padx=2)
         self.bybit_balance_label = ttk.Label(self.balance_frame, text="$0.00")
         self.bybit_balance_label.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(self.balance_frame, text="Aster:").pack(side=tk.LEFT, padx=2)
+        self.aster_balance_label = ttk.Label(self.balance_frame, text="$0.00")
+        self.aster_balance_label.pack(side=tk.LEFT, padx=5)
     
     def _create_trading_frame(self, parent):
         """Create trading panel with scrollbar"""
@@ -1240,11 +1230,11 @@ class FundingHunterGUI:
         ex_frame = ttk.LabelFrame(frame, text="Select Exchanges for Arbitrage", padding="10")
         ex_frame.pack(fill=tk.X, pady=10)
         
-        exchanges = ["OKX", "Binance", "BingX", "Bybit"]
+        exchanges = ["Binance", "BingX", "Bybit", "AsterDex"]
         
         ttk.Label(ex_frame, text="LONG Exchange:", style='Header.TLabel').grid(row=0, column=0, padx=5, pady=5, sticky='e')
         self.long_exchange = ttk.Combobox(ex_frame, values=exchanges, width=12, state='readonly')
-        self.long_exchange.set("OKX")
+        self.long_exchange.set("Binance")
         self.long_exchange.grid(row=0, column=1, padx=5, pady=5)
         self.long_exchange.bind('<<ComboboxSelected>>', self._on_exchange_changed)
         
@@ -1345,18 +1335,18 @@ class FundingHunterGUI:
         self.refresh_funding_btn.pack(side=tk.LEFT, padx=5)
         
         # Funding table
-        columns = ("Pair", "OKX", "Binance", "BingX", "Best Spread", "Recommendation")
+        columns = ("Pair", "AsterDex", "Binance", "BingX", "Best Spread", "Recommendation")
         self.funding_tree = ttk.Treeview(frame, columns=columns, show="headings", height=10)
         
         self.funding_tree.heading("Pair", text="Pair")
-        self.funding_tree.heading("OKX", text="OKX Rate")
+        self.funding_tree.heading("AsterDex", text="AsterDex Rate")
         self.funding_tree.heading("Binance", text="Binance Rate")
         self.funding_tree.heading("BingX", text="BingX Rate")
         self.funding_tree.heading("Best Spread", text="Best Spread")
         self.funding_tree.heading("Recommendation", text="Recommendation")
         
         self.funding_tree.column("Pair", width=80)
-        self.funding_tree.column("OKX", width=90)
+        self.funding_tree.column("AsterDex", width=90)
         self.funding_tree.column("Binance", width=90)
         self.funding_tree.column("BingX", width=90)
         self.funding_tree.column("Best Spread", width=90)
@@ -1503,12 +1493,12 @@ class FundingHunterGUI:
     def _get_exchange_enum(self, name: str) -> Exchange:
         """Convert exchange name to enum"""
         mapping = {
-            "OKX": Exchange.OKX,
             "Binance": Exchange.BINANCE,
             "BingX": Exchange.BINGX,
-            "Bybit": Exchange.BYBIT
+            "Bybit": Exchange.BYBIT,
+            "AsterDex": Exchange.ASTER
         }
-        return mapping.get(name, Exchange.OKX)
+        return mapping.get(name, Exchange.BINANCE)
     
     def _connect(self):
         """Connect to exchanges"""
@@ -1526,22 +1516,6 @@ class FundingHunterGUI:
         # Sync Windows time trước khi connect
         success, msg = sync_windows_time()
         self._log(msg)
-        
-        # OKX
-        if self.okx_enabled.get():
-            okx_key = self.okx_api_key.get().strip()
-            okx_secret = self.okx_secret.get().strip()
-            okx_pass = self.okx_passphrase.get().strip()
-            
-            if okx_key and okx_secret and okx_pass:
-                settings.okx.api_key = okx_key
-                settings.okx.secret_key = okx_secret
-                settings.okx.passphrase = okx_pass
-                settings.okx.testnet = self.okx_testnet.get()
-                
-                client = OKXClient(settings.okx, debug=self.debug_mode.get())
-                if await self.manager.connect_exchange(Exchange.OKX, client):
-                    connected.append("OKX")
         
         # Binance
         if self.binance_enabled.get():
@@ -1584,6 +1558,20 @@ class FundingHunterGUI:
                 if await self.manager.connect_exchange(Exchange.BYBIT, client):
                     connected.append("Bybit")
         
+        # AsterDex
+        if self.aster_enabled.get():
+            aster_key = self.aster_api_key.get().strip()
+            aster_secret = self.aster_secret.get().strip()
+            
+            if aster_key and aster_secret:
+                settings.aster.api_key = aster_key
+                settings.aster.secret_key = aster_secret
+                
+                from exchanges.aster_client import AsterClient
+                client = AsterClient(settings.aster, debug=self.debug_mode.get())
+                if await self.manager.connect_exchange(Exchange.ASTER, client):
+                    connected.append("AsterDex")
+        
         # Get balances
         balances = await self.manager.get_all_balances()
         
@@ -1622,14 +1610,14 @@ class FundingHunterGUI:
             self.load_pairs_btn.config(state=tk.NORMAL)
         
         # Update balances
-        if Exchange.OKX in balances:
-            self.okx_balance_label.config(text=f"${balances[Exchange.OKX].available:.6f}")
         if Exchange.BINANCE in balances:
             self.binance_balance_label.config(text=f"${balances[Exchange.BINANCE].available:.6f}")
         if Exchange.BINGX in balances:
             self.bingx_balance_label.config(text=f"${balances[Exchange.BINGX].available:.6f}")
         if Exchange.BYBIT in balances:
             self.bybit_balance_label.config(text=f"${balances[Exchange.BYBIT].available:.6f}")
+        if Exchange.ASTER in balances:
+            self.aster_balance_label.config(text=f"${balances[Exchange.ASTER].available:.6f}")
         
         # Update exchange dropdowns
         available = connected  # Use exchange names directly from connected list
@@ -2620,7 +2608,7 @@ class FundingHunterGUI:
         self._update_position_display()
         
         # Update exchange selectors
-        exchange_name_map = {Exchange.OKX: "OKX", Exchange.BINANCE: "Binance", Exchange.BINGX: "BingX", Exchange.BYBIT: "Bybit"}
+        exchange_name_map = {Exchange.BINANCE: "Binance", Exchange.BINGX: "BingX", Exchange.BYBIT: "Bybit", Exchange.ASTER: "AsterDex"}
         self.long_exchange.set(exchange_name_map.get(long_ex, ""))
         self.short_exchange.set(exchange_name_map.get(short_ex, ""))
         
@@ -2982,8 +2970,8 @@ class FundingHunterGUI:
                 
                 # Call get_income_history based on exchange type
                 from exchanges.binance_client import BinanceClient
-                from exchanges.okx_client import OKXClient
                 from exchanges.bingx_client import BingXClient
+                from exchanges.aster_client import AsterClient
                 
                 if isinstance(long_client, BinanceClient):
                     # Binance format: BTCUSDT
@@ -2993,9 +2981,10 @@ class FundingHunterGUI:
                         if item.get('time', 0) >= start_time:
                             total_funding += float(item.get('income', 0))
                 
-                elif isinstance(long_client, OKXClient):
-                    # OKX format: BTC-USDT-SWAP
-                    income = await long_client.get_income_history(symbol, limit=100)
+                elif isinstance(long_client, AsterClient):
+                    # AsterDex format: BTCUSDT (same as Binance)
+                    aster_symbol = symbol.replace('/', '')
+                    income = await long_client.get_income_history("FUNDING_FEE", limit=100, symbol=aster_symbol)
                     for item in income:
                         if item.get('time', 0) >= start_time:
                             total_funding += float(item.get('income', 0))
@@ -3017,8 +3006,8 @@ class FundingHunterGUI:
                 symbol = get_exchange_symbol(position['pair'], position['short_exchange'])
                 
                 from exchanges.binance_client import BinanceClient
-                from exchanges.okx_client import OKXClient
                 from exchanges.bingx_client import BingXClient
+                from exchanges.aster_client import AsterClient
                 
                 if isinstance(short_client, BinanceClient):
                     binance_symbol = symbol.replace('/', '')
@@ -3027,8 +3016,9 @@ class FundingHunterGUI:
                         if item.get('time', 0) >= start_time:
                             total_funding += float(item.get('income', 0))
                 
-                elif isinstance(short_client, OKXClient):
-                    income = await short_client.get_income_history(symbol, limit=100)
+                elif isinstance(short_client, AsterClient):
+                    aster_symbol = symbol.replace('/', '')
+                    income = await short_client.get_income_history("FUNDING_FEE", limit=100, symbol=aster_symbol)
                     for item in income:
                         if item.get('time', 0) >= start_time:
                             total_funding += float(item.get('income', 0))
@@ -3111,16 +3101,16 @@ class FundingHunterGUI:
                     
                     rates = {Exchange.BINANCE: binance_rate}
                     
-                    # Get OKX rate
-                    okx_client = self.manager.clients.get(Exchange.OKX)
-                    if okx_client:
+                    # Get AsterDex rate
+                    aster_client = self.manager.clients.get(Exchange.ASTER)
+                    if aster_client:
                         try:
                             from config.constants import get_exchange_symbol
-                            okx_symbol = get_exchange_symbol(pair, Exchange.OKX)
-                            okx_rate = await okx_client.get_funding_rate(okx_symbol)
-                            rates[Exchange.OKX] = okx_rate
+                            aster_symbol = get_exchange_symbol(pair, Exchange.ASTER)
+                            aster_rate = await aster_client.get_funding_rate(aster_symbol)
+                            rates[Exchange.ASTER] = aster_rate
                         except Exception as e:
-                            logger.debug(f"OKX rate not available for {pair}: {e}")
+                            logger.debug(f"AsterDex rate not available for {pair}: {e}")
                     
                     # Get BingX rate
                     bingx_client = self.manager.clients.get(Exchange.BINGX)
@@ -3174,8 +3164,8 @@ class FundingHunterGUI:
         for pair, rates in all_rates.items():
             # Collect available rates
             rate_values = {}
-            if Exchange.OKX in rates:
-                rate_values[Exchange.OKX] = rates[Exchange.OKX].funding_rate
+            if Exchange.ASTER in rates:
+                rate_values[Exchange.ASTER] = rates[Exchange.ASTER].funding_rate
             if Exchange.BINANCE in rates:
                 rate_values[Exchange.BINANCE] = rates[Exchange.BINANCE].funding_rate
             if Exchange.BINGX in rates:
@@ -3193,18 +3183,18 @@ class FundingHunterGUI:
         sorted_pairs = sorted(pairs_with_spreads, key=lambda x: x[2], reverse=True)
         
         for pair, rates, spread_value in sorted_pairs:
-            okx_rate = rates.get(Exchange.OKX)
+            aster_rate = rates.get(Exchange.ASTER)
             binance_rate = rates.get(Exchange.BINANCE)
             bingx_rate = rates.get(Exchange.BINGX)
             
-            okx_val = f"{okx_rate.funding_rate * 100:.6f}%" if okx_rate else "-"
+            aster_val = f"{aster_rate.funding_rate * 100:.6f}%" if aster_rate else "-"
             binance_val = f"{binance_rate.funding_rate * 100:.6f}%" if binance_rate else "-"
             bingx_val = f"{bingx_rate.funding_rate * 100:.6f}%" if bingx_rate else "-"
             
             # Find best spread
             rate_values = {}
-            if okx_rate:
-                rate_values[Exchange.OKX] = okx_rate.funding_rate
+            if aster_rate:
+                rate_values[Exchange.ASTER] = aster_rate.funding_rate
             if binance_rate:
                 rate_values[Exchange.BINANCE] = binance_rate.funding_rate
             if bingx_rate:
@@ -3222,7 +3212,7 @@ class FundingHunterGUI:
                 recommendation = f"Long {lowest[0].value}, Short {highest[0].value}"
             
             self.funding_tree.insert("", tk.END, values=(
-                pair, okx_val, binance_val, bingx_val, best_spread, recommendation
+                pair, aster_val, binance_val, bingx_val, best_spread, recommendation
             ))
         
         self._log(f"✅ Loaded {len(sorted_pairs)} pairs sorted by Best Spread (highest to lowest)")
@@ -3244,14 +3234,14 @@ class FundingHunterGUI:
         
         # Parse and set exchanges from recommendation
         if recommendation != "-":
-            # Parse recommendation like "Long okx, Short binance"
+            # Parse recommendation like "Long aster, Short binance"
             parts = recommendation.split(", ")
             if len(parts) == 2:
                 long_ex = parts[0].replace("Long ", "").strip().lower()
                 short_ex = parts[1].replace("Short ", "").strip().lower()
                 
                 # Map to display names (case-insensitive)
-                name_map = {"okx": "OKX", "binance": "Binance", "bingx": "BingX", "bybit": "Bybit"}
+                name_map = {"aster": "AsterDex", "binance": "Binance", "bingx": "BingX", "bybit": "Bybit"}
                 long_display = name_map.get(long_ex, long_ex.upper())
                 short_display = name_map.get(short_ex, short_ex.upper())
                 
@@ -3343,7 +3333,7 @@ class FundingHunterGUI:
             return
         
         # Map display names to Exchange enum
-        exchange_map = {"OKX": Exchange.OKX, "Binance": Exchange.BINANCE, "BingX": Exchange.BINGX, "Bybit": Exchange.BYBIT}
+        exchange_map = {"Binance": Exchange.BINANCE, "BingX": Exchange.BINGX, "Bybit": Exchange.BYBIT, "AsterDex": Exchange.ASTER}
         long_ex = exchange_map.get(long_display)
         short_ex = exchange_map.get(short_display)
         
@@ -3641,9 +3631,10 @@ class FundingHunterGUI:
             "🎯 Funding Hunter v2.0\n\n"
             "Multi-Exchange Funding Arbitrage Tool\n\n"
             "Supported Exchanges:\n"
-            "• OKX\n"
             "• Binance\n"
-            "• BingX\n\n"
+            "• BingX\n"
+            "• Bybit\n"
+            "• AsterDex\n\n"
             "⚠️ USE AT YOUR OWN RISK!")
     
     def _on_closing(self):

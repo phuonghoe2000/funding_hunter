@@ -88,6 +88,22 @@ class BybitConfig:
 
 
 @dataclass
+class AsterdexConfig:
+    """AsterDex API Configuration"""
+    api_key: str = ""
+    secret_key: str = ""
+    testnet: bool = False
+    
+    @property
+    def base_url(self) -> str:
+        return "https://fapi.asterdex.com"
+    
+    @property
+    def ws_url(self) -> str:
+        return "wss://fstream.asterdex.com/ws"
+
+
+@dataclass
 class TradingConfig:
     """Trading parameters"""
     # Default leverage
@@ -120,6 +136,7 @@ class Settings:
         self.binance = BinanceConfig()
         self.bingx = BingXConfig()
         self.bybit = BybitConfig()
+        self.aster = AsterdexConfig()
         self.trading = TradingConfig()
     
     def load_from_env(self):
@@ -143,6 +160,10 @@ class Settings:
         self.bybit.api_key = os.getenv("BYBIT_API_KEY", "")
         self.bybit.secret_key = os.getenv("BYBIT_SECRET_KEY", "")
         self.bybit.testnet = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
+        
+        # AsterDex
+        self.aster.api_key = os.getenv("ASTER_API_KEY", "")
+        self.aster.secret_key = os.getenv("ASTER_SECRET_KEY", "")
         
         # Trading
         self.trading.default_leverage = int(os.getenv("DEFAULT_LEVERAGE", "10"))

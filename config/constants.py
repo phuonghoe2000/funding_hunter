@@ -10,6 +10,7 @@ class Exchange(Enum):
     BINANCE = "binance"
     BINGX = "bingx"
     BYBIT = "bybit"
+    ASTER = "aster"
 
 
 class Side(Enum):
@@ -131,7 +132,7 @@ def get_exchange_symbol(pair: str, exchange: Exchange) -> str:
         return f"{base}-{quote}-SWAP"
     elif exchange == Exchange.BINGX:
         return f"{base}-{quote}"
-    else:  # Binance, Bybit
+    else:  # Binance, Bybit, Aster
         return f"{base}{quote}"
 
 
@@ -154,7 +155,7 @@ def get_unified_pair(symbol: str, exchange: Exchange) -> str:
         # Fallback: assume USDT pair
         base = symbol.replace("USDT", "").replace("-", "")
         return f"{base}/USDT"
-    else:  # Binance, Bybit
-        # Binance/Bybit format: BTCUSDT -> BTC/USDT
+    else:  # Binance, Bybit, Aster
+        # Binance/Bybit/Aster format: BTCUSDT -> BTC/USDT
         base = symbol.replace("USDT", "")
         return f"{base}/USDT"
