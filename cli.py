@@ -90,12 +90,13 @@ Examples:
     p.add_argument("--pair", required=True, help="Trading pair (e.g. BTC/USDT)")
     p.add_argument("--long", required=True, help="Long exchange")
     p.add_argument("--short", required=True, help="Short exchange")
-    p.add_argument("--size", type=float, required=True, help="Position size in USDT")
+    p.add_argument("--size", type=float, required=True, help="Position size in base asset (token quantity, e.g. 500 for 500 KITE)")
     p.add_argument("--leverage", type=int, default=3, help="Leverage (default: 3)")
     p.add_argument("--splits", type=int, default=1, help="Number of DCA splits (default: 1)")
     p.add_argument("--price-spread-min", type=float, default=None, help="Skip analyze; use this spread threshold")
     p.add_argument("--skip-leverage", action="store_true", help="Skip leverage setup (faster entry)")
     p.add_argument("--analyze-duration", type=float, default=120.0, help="Spread analysis duration in seconds")
+    p.add_argument("--skip-spread-check", action="store_true", help="Skip spread analysis and execute splits immediately")
 
     # ── close ──
     p = sub.add_parser("close", help="Close hedged position with spread analysis & splits")
@@ -105,6 +106,7 @@ Examples:
     p.add_argument("--splits", type=int, default=1, help="Number of close splits (default: 1)")
     p.add_argument("--price-spread-min", type=float, default=None, help="Skip analyze; use this spread threshold")
     p.add_argument("--analyze-duration", type=float, default=120.0, help="Spread analysis duration")
+    p.add_argument("--skip-spread-check", action="store_true", help="Skip spread analysis and execute splits immediately")
 
     # ── monitor ──
     p = sub.add_parser("monitor", help="Live monitor position PnL, risk %%, with optional auto-close")
@@ -211,6 +213,7 @@ async def cmd_open(engine, args):
         size=args.size, leverage=args.leverage, splits=args.splits,
         price_spread_min=args.price_spread_min, skip_leverage=args.skip_leverage,
         analyze_duration=args.analyze_duration,
+        skip_spread_check=args.skip_spread_check
     )
     _json(result)
 
@@ -220,6 +223,7 @@ async def cmd_close(engine, args):
         pair=args.pair, long_ex_name=args.long, short_ex_name=args.short,
         splits=args.splits, price_spread_min=args.price_spread_min,
         analyze_duration=args.analyze_duration,
+        skip_spread_check=args.skip_spread_check
     )
     _json(result)
 

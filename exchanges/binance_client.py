@@ -434,7 +434,7 @@ class BinanceClient(BaseExchangeClient):
         elif asset_size < 1:
             asset_size = round(asset_size, 4)
         else:
-            asset_size = self._round_quantity(binance_symbol, asset_size)
+            asset_size = round(asset_size, 0) # For low price coins like ANKR
             
         params = {
             "symbol": binance_symbol,
@@ -456,7 +456,7 @@ class BinanceClient(BaseExchangeClient):
             symbol=binance_symbol,
             side=side,
             order_type=OrderType.MARKET,
-            size=float(result.get("origQty", size)),
+            size=float(result.get("origQty", asset_size)),
             price=None,
             filled_size=float(result.get("executedQty", 0)),
             avg_price=float(result.get("avgPrice", 0)),

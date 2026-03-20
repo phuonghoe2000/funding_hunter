@@ -196,13 +196,15 @@ class WebSocketManager:
                             logger.warning("WS connection closed by server")
                             break
                         
-                        # Dispatch message to callbacks
+                        # Dispatch message to callbacks asynchronously
+                        # Using call_soon avoids blocking the WS recv loop if a callback is slow
                         if data:
-                            for cb in self._callbacks:
+                            loop = asyncio.get_event_loop()
+                            for cb in list(self._callbacks):
                                 try:
-                                    cb(data)
+                                    loop.call_soon(cb, data)
                                 except Exception as e:
-                                    logger.error(f"Callback error: {e}")
+                                    logger.error(f"Callback dispatch error: {e}")
                     
                     self._connected = False
                     logger.warning("WS Disconnected")

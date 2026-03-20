@@ -174,7 +174,7 @@ class BingXClient(BaseExchangeClient):
             
         # 2. Ping (Respond with Pong? Docs say server pushes Pong, maybe we need to pong back if server pings?)
         if "ping" in msg:
-            asyncio.create_task(self.ws_manager.send_json({"pong": msg["ping"]}))
+            asyncio.ensure_future(self.ws_manager.send_json({"pong": msg["ping"]}))
             return
 
         # 3. Data Format: {"code": 0, "dataType": "...", "data": ...}
@@ -447,10 +447,12 @@ class BingXClient(BaseExchangeClient):
             asset_size = round(asset_size, 3)
         elif "ETH" in bingx_symbol:
             asset_size = round(asset_size, 2)
-        elif asset_size < 1:
-            asset_size = round(asset_size, 4)
+        elif asset_size >= 100:
+            asset_size = round(asset_size, 0) # For low price coins like ANKR
+        elif asset_size >= 1:
+            asset_size = round(asset_size, 2)
         else:
-            asset_size = round(asset_size, 1)
+            asset_size = round(asset_size, 4)
             
         # BingX expects quantity as a string to avoid floating point precision issues
         params = {
@@ -477,7 +479,7 @@ class BingXClient(BaseExchangeClient):
             symbol=bingx_symbol,
             side=side,
             order_type=OrderType.MARKET,
-            size=float(order_data.get("origQty", size)),
+            size=float(order_data.get("origQty", asset_size)),
             price=None,
             filled_size=float(order_data.get("executedQty", 0)),
             avg_price=float(order_data.get("avgPrice", 0)),

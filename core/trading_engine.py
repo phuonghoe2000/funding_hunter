@@ -122,12 +122,13 @@ class TradingEngine:
                             size: float, leverage: int = 3, splits: int = 1,
                             price_spread_min: Optional[float] = None,
                             skip_leverage: bool = False,
-                            analyze_duration: float = 120.0) -> Dict:
+                            analyze_duration: float = 120.0,
+                            skip_spread_check: bool = False) -> Dict:
         long_ex = _resolve_exchange(long_ex_name)
         short_ex = _resolve_exchange(short_ex_name)
 
-        # Step 1: Analyze spread to determine threshold
-        if price_spread_min is None:
+        # Step 1: Analyze spread to determine threshold (unless skipping check)
+        if price_spread_min is None and not skip_spread_check:
             logger.info(f"📊 Analyzing open spread for {analyze_duration:.0f}s...")
             result = await self.exchange_manager.analyze_spread(
                 pair, long_ex, short_ex,
@@ -140,6 +141,8 @@ class TradingEngine:
             else:
                 price_spread_min = -100.0
                 logger.warning(f"Analyze failed: {result.get('error')}. Using no threshold.")
+        elif price_spread_min is None and skip_spread_check:
+            price_spread_min = -100.0  # safe default since we skip checking anyway
 
         # Step 2: Open via MultiExchangeManager with splits
         logger.info(f"🚀 Opening {pair}: LONG {long_ex_name} / SHORT {short_ex_name} | "
@@ -155,6 +158,7 @@ class TradingEngine:
             max_wait_per_split=3600.0,
             log_callback=lambda m: logger.info(m),
             skip_leverage_set=skip_leverage,
+            skip_spread_check=skip_spread_check
         )
         return open_result
 
@@ -163,12 +167,13 @@ class TradingEngine:
     # ------------------------------------------------------------------
     async def close_position(self, pair: str, long_ex_name: str, short_ex_name: str,
                              splits: int = 1, price_spread_min: Optional[float] = None,
-                             analyze_duration: float = 120.0) -> Dict:
+                             analyze_duration: float = 120.0,
+                             skip_spread_check: bool = False) -> Dict:
         long_ex = _resolve_exchange(long_ex_name)
         short_ex = _resolve_exchange(short_ex_name)
 
-        # Step 1: Analyze close spread
-        if price_spread_min is None:
+        # Step 1: Analyze close spread (unless skipping check)
+        if price_spread_min is None and not skip_spread_check:
             logger.info(f"📊 Analyzing close spread for {analyze_duration:.0f}s...")
             result = await self.exchange_manager.analyze_spread(
                 pair, long_ex, short_ex,
@@ -181,6 +186,8 @@ class TradingEngine:
             else:
                 price_spread_min = -100.0
                 logger.warning(f"Analyze failed. Using no threshold.")
+        elif price_spread_min is None and skip_spread_check:
+            price_spread_min = -100.0
 
         # Step 2: Close with splits
         logger.info(f"🛑 Closing {pair} in {splits} split(s)...")
@@ -189,6 +196,7 @@ class TradingEngine:
             splits=splits, interval_seconds=2.0,
             price_spread_min=price_spread_min, spread_check_interval=2.0,
             progress_callback=lambda s, t, m: logger.info(f"   {m}"),
+            skip_spread_check=skip_spread_check
         )
         return close_result
 

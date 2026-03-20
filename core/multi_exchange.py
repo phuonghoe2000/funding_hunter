@@ -23,7 +23,10 @@ class MultiExchangeManager:
             if success:
                 self.clients[exchange] = client
                 self.connected_exchanges.append(exchange)
-                await client.set_position_mode(hedge_mode=True)
+                # NOTE: Do NOT call set_position_mode here.
+                # Each client's connect() already syncs the actual position mode
+                # from the exchange (e.g. BinanceClient._sync_position_mode).
+                # Forcing hedge_mode=True here would override the user's One-Way setting.
                 return True
             return False
         except Exception as e:
@@ -421,7 +424,8 @@ class MultiExchangeManager:
         spread_check_interval: float = 2.0,
         max_wait_per_split: float = 3600.0,
         progress_callback = None,
-        cancel_event: Optional[threading.Event] = None
+        cancel_event: Optional[threading.Event] = None,
+        skip_spread_check: bool = False
     ) -> Dict[str, Any]:
         """Close hedged position in multiple splits
         
@@ -536,6 +540,10 @@ class MultiExchangeManager:
                     check_count = 0
                     
                     while True:
+                        if skip_spread_check:
+                            log_msg(f"⚠️ Split {split_num}: Skipping spread check as requested.")
+                            break
+
                         if is_cancelled():
                             log_msg("🛑 Cancelled waiting for spread")
                             results["cancelled"] = True
@@ -931,7 +939,8 @@ class MultiExchangeManager:
         log_callback = None,
         on_first_split_complete = None,
         skip_leverage_set: bool = False,
-        cancel_event: Optional[threading.Event] = None
+        cancel_event: Optional[threading.Event] = None,
+        skip_spread_check: bool = False
     ) -> Dict[str, Any]:
         """
         Open hedged position in multiple splits (DCA style)
@@ -952,6 +961,7 @@ class MultiExchangeManager:
             on_first_split_complete: Optional callback called after first split completes (to start monitoring)
             skip_leverage_set: Skip setting leverage (use if leverage already set)
             cancel_event: Optional threading.Event to signal cancellation (thread-safe)
+            skip_spread_check: If True, bypass spread checks and execute immediately
         
         Returns:
             Dict with success status and details
@@ -1094,31 +1104,34 @@ class MultiExchangeManager:
                 # Check spread before each split (except first one which was already checked)
                 # Always check spread regardless of threshold being positive or negative
                 if i > 0:
-                    # Only log waiting message for first few splits or every N splits
-                    if should_log_this_split:
-                        log_important(f"⏳ Split {split_num}/{split_count}: Checking spread...")
-                    wait_start = asyncio.get_event_loop().time()
-                    check_count = 0  # Counter for threshold reduction
-                    
-                    while True:
-                        # Check for cancellation while waiting for spread
-                        if is_cancelled():
-                            log_important(f"🛑 Cancelled while waiting for spread (split {split_num}/{split_count})")
-                            results["cancelled"] = True
-                            results["error"] = "Cancelled by user"
-                            if results["splits_completed"] > 0:
-                                results["success"] = True
-                            return results
+                    if skip_spread_check:
+                        log_msg(f"⚡ Split {split_num}/{split_count}: Tiến hành ngay (bỏ qua check spread)", force=should_log_this_split)
+                    else:
+                        # Only log waiting message for first few splits or every N splits
+                        if should_log_this_split:
+                            log_important(f"⏳ Split {split_num}/{split_count}: Checking spread...")
+                        wait_start = asyncio.get_event_loop().time()
+                        check_count = 0  # Counter for threshold reduction
                         
-                        is_ok, spread_pct, long_price, short_price = await check_spread()
-                        
-                        # Check against current threshold (not original)
-                        is_ok = spread_pct >= current_threshold
-                        
-                        if is_ok:
-                            # Only log spread OK for important splits
-                            log_msg(f"✅ Split {split_num}: Spread {spread_pct:.4f}% >= {current_threshold:.4f}% OK", force=should_log_this_split)
-                            break
+                        while True:
+                            # Check for cancellation while waiting for spread
+                            if is_cancelled():
+                                log_important(f"🛑 Cancelled while waiting for spread (split {split_num}/{split_count})")
+                                results["cancelled"] = True
+                                results["error"] = "Cancelled by user"
+                                if results["splits_completed"] > 0:
+                                    results["success"] = True
+                                return results
+                            
+                            is_ok, spread_pct, long_price, short_price = await check_spread()
+                            
+                            # Check against current threshold (not original)
+                            is_ok = spread_pct >= current_threshold
+                            
+                            if is_ok:
+                                # Only log spread OK for important splits
+                                log_msg(f"✅ Split {split_num}: Spread {spread_pct:.4f}% >= {current_threshold:.4f}% OK", force=should_log_this_split)
+                                break
                         
                         check_count += 1
                         

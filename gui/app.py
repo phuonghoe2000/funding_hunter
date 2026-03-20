@@ -596,6 +596,10 @@ class FundingHunterGUI:
         self.skip_leverage_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(option_frame, text="Skip leverage set (faster entry)", 
                        variable=self.skip_leverage_var).pack(anchor=tk.W)
+
+        self.skip_spread_check_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(option_frame, text="Skip spread check (execute splits immediately)", 
+                       variable=self.skip_spread_check_var).pack(anchor=tk.W, pady=2)
         
         # Threshold settings
         threshold_frame = ttk.Frame(option_frame)
@@ -1120,6 +1124,7 @@ class FundingHunterGUI:
         self._stop_all_background_tasks()
         
         # Store parameters
+        skip_spread = self.skip_spread_check_var.get()
         self.price_spread_params = {
             "pair": pair,
             "long_ex": long_ex,
@@ -1128,23 +1133,32 @@ class FundingHunterGUI:
             "short_ex_name": short_ex_name,
             "size": size,
             "leverage": leverage,
-            "price_spread_min": None,  # Will be set after analyze
+            "price_spread_min": -100.0 if skip_spread else None,  # Will be set after analyze if not skipping
             "split_count": split_count,
-            "skip_leverage": self.skip_leverage_var.get()
+            "skip_leverage": self.skip_leverage_var.get(),
+            "skip_spread_check": skip_spread
         }
         
-        # Start analyze phase
-        self.analyzing_spread = True
-        self.analyze_cancel_event = threading.Event()
-        self.open_btn.configure(text="📊 Analyzing... (Cancel)")
-        self._log(f"📊 Bắt đầu analyze spread 5 phút cho {pair}...")
-        self._log(f"   LONG: {long_ex_name} | SHORT: {short_ex_name}")
-        
-        # Subscribe to WS Market Data
-        self._run_async(self.manager.subscribe_market_data(pair, long_ex, short_ex))
-        
-        # Start analyze
-        self._start_analyze_for_open()
+        # Start analyze phase OR skip directly to open
+        if skip_spread:
+            self._log(f"⚡ Bỏ qua analyze spread, tiến hành mở lệnh ngay cho {pair}...")
+            self._log(f"   LONG: {long_ex_name} | SHORT: {short_ex_name}")
+            # Skip direct to spreading check/execute (threshold=-100 so it fires immediately)
+            self.waiting_for_price_spread = True
+            self.open_btn.configure(text="⏳ Opening... (Cancel)")
+            self._check_price_spread_and_open()
+        else:
+            self.analyzing_spread = True
+            self.analyze_cancel_event = threading.Event()
+            self.open_btn.configure(text="📊 Analyzing... (Cancel)")
+            self._log(f"📊 Bắt đầu analyze spread 2 phút cho {pair}...")
+            self._log(f"   LONG: {long_ex_name} | SHORT: {short_ex_name}")
+            
+            # Subscribe to WS Market Data
+            self._run_async(self.manager.subscribe_market_data(pair, long_ex, short_ex))
+            
+            # Start analyze
+            self._start_analyze_for_open()
     
     def _start_analyze_for_open(self):
         """Run analyze spread and then start waiting for open"""
@@ -1360,14 +1374,15 @@ class FundingHunterGUI:
                     params["size"], 
                     params["leverage"],
                     split_count=split_count,
-                    delay_between_splits=2.0,  # Reduced from 13s to 2s for faster execution
+                    delay_between_splits=5.0,  # Reduced from 13s to 2s for faster execution
                     price_spread_min=params["price_spread_min"],
                     spread_check_interval=2.0,
                     max_wait_per_split=3600.0,
                     log_callback=safe_log,
                     on_first_split_complete=on_first_split,
                     skip_leverage_set=params.get("skip_leverage", False),
-                    cancel_event=self.split_cancel_event
+                    cancel_event=self.split_cancel_event,
+                    skip_spread_check=params.get("skip_spread_check", False)
                 )
                 
                 # Clear cancel event after done
@@ -1649,8 +1664,14 @@ class FundingHunterGUI:
             if splits < 1: splits = 1
         except:
             splits = 1
+            
+        skip_spread = self.skip_spread_check_var.get()
         
-        confirm_msg = f"Close position in {splits} split(s)?\nWill analyze spread 5 minutes first."
+        if skip_spread:
+            confirm_msg = f"Close position in {splits} split(s)?\nWill skip spread check and close immediately."
+        else:
+            confirm_msg = f"Close position in {splits} split(s)?\nWill analyze spread 2 minutes first."
+            
         if not messagebox.askyesno("Confirm", confirm_msg):
             return
         
@@ -1661,9 +1682,12 @@ class FundingHunterGUI:
         self._stop_all_background_tasks()
         
         # Update UI state
-        self.analyzing_close = True
+        self.analyzing_close = not skip_spread
         self.close_cancel_event = threading.Event()
-        self.close_btn.configure(text="📊 Analyzing... (Cancel)", state=tk.NORMAL)
+        if skip_spread:
+            self.close_btn.configure(text="🛑 Closing... (Cancel)", state=tk.NORMAL)
+        else:
+            self.close_btn.configure(text="📊 Analyzing... (Cancel)", state=tk.NORMAL)
         self.open_btn.configure(state=tk.DISABLED)
         
         # Store close params
@@ -1672,16 +1696,20 @@ class FundingHunterGUI:
             "long_exchange": pos["long_exchange"],
             "short_exchange": pos["short_exchange"],
             "splits": splits,
-            "price_spread_min": None  # Will be set after analyze
+            "price_spread_min": -100.0 if skip_spread else None,  # Will be set after analyze
+            "skip_spread_check": skip_spread
         }
         
         # Subscribe to WS Market Data
         self._run_async(self.manager.subscribe_market_data(pos['pair'], pos['long_exchange'], pos['short_exchange']))
         
-        self._log(f"📊 Bắt đầu analyze spread 5 phút cho CLOSE...")
-        
-        # Start analyze for close
-        self._start_analyze_for_close()
+        if skip_spread:
+            self._log(f"⚡ Bỏ qua analyze spread, tiến hành đóng lệnh ngay cho {pos['pair']}...")
+            self._execute_close_with_splits()
+        else:
+            self._log(f"📊 Bắt đầu analyze spread 2 phút cho CLOSE...")
+            # Start analyze for close
+            self._start_analyze_for_close()
     
     def _start_analyze_for_close(self):
         """Run analyze spread and then start closing"""
@@ -1764,7 +1792,8 @@ class FundingHunterGUI:
                 price_spread_min=params['price_spread_min'],
                 spread_check_interval=2.0,
                 progress_callback=progress_callback,
-                cancel_event=self.split_cancel_event
+                cancel_event=self.split_cancel_event,
+                skip_spread_check=params.get('skip_spread_check', False)
             )
         
         future = self._run_async(async_close())

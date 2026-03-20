@@ -136,6 +136,10 @@ def get_exchange_symbol(pair: str, exchange: Exchange) -> str:
     if pair in SYMBOL_MAP and exchange in SYMBOL_MAP[pair]:
         return SYMBOL_MAP[pair][exchange]
     
+    # If pair already looks like an exchange symbol (no slash), return as is
+    if "/" not in pair:
+        return pair
+        
     # Generate symbol if not in map
     base, quote = pair.split("/")
     if exchange == Exchange.OKX:
