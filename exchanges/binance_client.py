@@ -419,22 +419,25 @@ class BinanceClient(BaseExchangeClient):
         size: float,
         reduce_only: bool = False
     ) -> Order:
-        """Place a market order"""
+        """Place a market order
+
+        Args:
+            symbol: Trading symbol
+            side: LONG or SHORT
+            size: Quantity in asset units (e.g., 20 SIREN, 0.01 BTC)
+            reduce_only: If True, only reduces position
+        """
         binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
-        
-        # Get current price to convert USDT size to asset size
-        current_price = await self.get_mark_price(binance_symbol)
-        asset_size = size / current_price if current_price else size
-        
-        # Format size based on symbol to avoid precision errors
+
+        # Size is already in asset units - just round for precision
         if "BTC" in binance_symbol:
-            asset_size = round(asset_size, 3)
+            asset_size = round(size, 3)
         elif "ETH" in binance_symbol:
-            asset_size = round(asset_size, 2)
-        elif asset_size < 1:
-            asset_size = round(asset_size, 4)
+            asset_size = round(size, 2)
+        elif size < 1:
+            asset_size = round(size, 4)
         else:
-            asset_size = round(asset_size, 0) # For low price coins like ANKR
+            asset_size = round(size, 0)  # For low price coins like ANKR
             
         params = {
             "symbol": binance_symbol,

@@ -133,7 +133,7 @@ class AsterClient(BaseExchangeClient):
 
     async def subscribe_book_ticker(self, symbol: str):
         """Subscribe to best bid/ask for symbol via WS"""
-        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTERDEX if hasattr(Exchange, 'ASTERDEX') else getattr(Exchange, 'ASTER', None))
+        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTERDEX)
         # Stream name needs to be lowercase for Aster
         stream_name = f"{aster_symbol.lower()}@bookTicker"
         
@@ -212,7 +212,7 @@ class AsterClient(BaseExchangeClient):
 
     async def get_mark_price(self, symbol: str) -> float:
         """Get current mark price"""
-        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTER)
+        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTERDEX)
         
         result = await self._request("GET", "/fapi/v1/premiumIndex", {"symbol": aster_symbol}, signed=False)
         
@@ -220,7 +220,7 @@ class AsterClient(BaseExchangeClient):
     
     async def get_order_book(self, symbol: str, limit: int = 20) -> Dict[str, Any]:
         """Get order book (depth)"""
-        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTER)
+        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTERDEX)
         
         # 1. OPTIMIZATION: Check Ticker Cache for Best Bid/Ask
         # If we have recent data from WS, return it as a 1-depth orderbook
@@ -347,7 +347,7 @@ class AsterClient(BaseExchangeClient):
     
     async def get_position(self, symbol: str, force_rest: bool = False) -> Optional[Position]:
         """Get position for symbol (Check CACHE then REST)"""
-        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTER)
+        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTERDEX)
         
         # 1. Check Cache (skip if force_rest=True)
         if not force_rest and self.ws_manager.connected and aster_symbol in self._position_cache:
@@ -420,7 +420,7 @@ class AsterClient(BaseExchangeClient):
         reduce_only: bool = False
     ) -> Order:
         """Place a market order"""
-        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTER)
+        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTERDEX)
         
         params = {
             "symbol": aster_symbol,
@@ -458,7 +458,7 @@ class AsterClient(BaseExchangeClient):
             symbol: Trading symbol
             aggressive: If True, uses aggressive limit order (5% off market) for guaranteed fill
         """
-        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTER)
+        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTERDEX)
         
         position = await self.get_position(aster_symbol)
         
@@ -532,7 +532,7 @@ class AsterClient(BaseExchangeClient):
     
     async def close_position_partial(self, symbol: str, size: float) -> Order:
         """Close partial position with specific size"""
-        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTER)
+        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTERDEX)
         
         position = await self.get_position(aster_symbol)
         
@@ -588,7 +588,7 @@ class AsterClient(BaseExchangeClient):
     
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         """Set leverage for symbol"""
-        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTER)
+        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTERDEX)
         
         try:
             await self._request("POST", "/fapi/v1/leverage", {
@@ -622,7 +622,7 @@ class AsterClient(BaseExchangeClient):
         aster_symbol = symbol
         if "/" in symbol:
             from config.constants import get_exchange_symbol, Exchange
-            aster_symbol = get_exchange_symbol(symbol, Exchange.ASTERDEX if hasattr(Exchange, 'ASTERDEX') else getattr(Exchange, 'ASTER', None))
+            aster_symbol = get_exchange_symbol(symbol, Exchange.ASTERDEX)
         elif "-" in symbol:
             aster_symbol = symbol.replace("-", "")
              
@@ -679,7 +679,7 @@ class AsterClient(BaseExchangeClient):
     
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
         """Get ticker data"""
-        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTER)
+        aster_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.ASTERDEX)
         
         result = await self._request("GET", "/fapi/v1/ticker/24hr", {"symbol": aster_symbol}, signed=False)
         
@@ -751,7 +751,7 @@ class AsterClient(BaseExchangeClient):
     
     async def get_closed_pnl(self, symbol: str, since: Optional[int] = None) -> Dict[str, Any]:
         """Get realized PnL, commission fees, and funding fees for a closed position"""
-        aster_symbol = get_exchange_symbol(symbol, Exchange.ASTERDEX if hasattr(Exchange, 'ASTERDEX') else getattr(Exchange, 'ASTER', None))
+        aster_symbol = get_exchange_symbol(symbol, Exchange.ASTERDEX)
         
         params = {"symbol": aster_symbol}
         if since:

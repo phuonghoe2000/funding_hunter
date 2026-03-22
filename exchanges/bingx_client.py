@@ -435,24 +435,27 @@ class BingXClient(BaseExchangeClient):
         size: float,
         reduce_only: bool = False
     ) -> Order:
-        """Place a market order"""
+        """Place a market order
+
+        Args:
+            symbol: Trading symbol
+            side: LONG or SHORT
+            size: Quantity in asset units (e.g., 20 SIREN, 0.01 BTC)
+            reduce_only: If True, only reduces position
+        """
         bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
-        
-        # Get current price to convert USDT size to asset size
-        current_price = await self.get_mark_price(bingx_symbol)
-        asset_size = size / current_price if current_price else size
-        
-        # Format size based on symbol to avoid precision errors
+
+        # Size is already in asset units - just round for precision
         if "BTC" in bingx_symbol:
-            asset_size = round(asset_size, 3)
+            asset_size = round(size, 3)
         elif "ETH" in bingx_symbol:
-            asset_size = round(asset_size, 2)
-        elif asset_size >= 100:
-            asset_size = round(asset_size, 0) # For low price coins like ANKR
-        elif asset_size >= 1:
-            asset_size = round(asset_size, 2)
+            asset_size = round(size, 2)
+        elif size >= 100:
+            asset_size = round(size, 0)  # For low price coins like ANKR
+        elif size >= 1:
+            asset_size = round(size, 2)
         else:
-            asset_size = round(asset_size, 4)
+            asset_size = round(size, 4)
             
         # BingX expects quantity as a string to avoid floating point precision issues
         params = {

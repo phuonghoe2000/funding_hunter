@@ -2102,13 +2102,16 @@ class FundingHunterGUI:
         self._update_position_display()
         
         # Update exchange selectors
-        exchange_name_map = {Exchange.OKX: "OKX", Exchange.BINANCE: "Binance", Exchange.BINGX: "BingX", Exchange.GATE: "Gate.io"}
+        exchange_name_map = {Exchange.OKX: "OKX", Exchange.BINANCE: "Binance", Exchange.BINGX: "BingX", Exchange.GATE: "Gate.io", Exchange.ASTERDEX: "Asterdex"}
         self.long_exchange.set(exchange_name_map.get(long_ex, ""))
         self.short_exchange.set(exchange_name_map.get(short_ex, ""))
         
-        # Set pair in combo
-        if pair in list(self.pair_combo['values']):
-            self.pair_combo.set(pair)
+        # Set pair in combo (add it if not present)
+        current_values = list(self.pair_combo['values'])
+        if pair not in current_values:
+            current_values.append(pair)
+            self.pair_combo['values'] = current_values
+        self.pair_combo.set(pair)
         
         self._log(f"✅ Position loaded! You can now monitor or close it.")
 
