@@ -425,10 +425,11 @@ class MultiExchangeManager:
         max_wait_per_split: float = 3600.0,
         progress_callback = None,
         cancel_event: Optional[threading.Event] = None,
-        skip_spread_check: bool = False
+        skip_spread_check: bool = False,
+        close_size: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Close hedged position in multiple splits
-        
+
         Args:
             pair: Trading pair
             long_exchange: Exchange with LONG position
@@ -440,6 +441,7 @@ class MultiExchangeManager:
             max_wait_per_split: Maximum seconds to wait for spread per split
             progress_callback: Callback function(split_num, total_splits, message)
             cancel_event: Optional threading.Event to signal cancellation
+            close_size: Optional token amount to close. None = close all.
         """
         def log_msg(msg: str):
             # Only use callback, don't call logger.info directly
@@ -515,7 +517,13 @@ class MultiExchangeManager:
             
             long_total = long_pos.size if long_pos else 0
             short_total = short_pos.size if short_pos else 0
-            
+
+            # If partial close_size specified, cap to that amount
+            if close_size is not None:
+                long_total = min(long_total, close_size)
+                short_total = min(short_total, close_size)
+                log_msg(f"Partial close: {close_size} tokens ({(close_size / (long_pos.size if long_pos else close_size)) * 100:.1f}% of position)")
+
             long_per_split = long_total / splits if long_total > 0 else 0
             short_per_split = short_total / splits if short_total > 0 else 0
             
@@ -599,9 +607,10 @@ class MultiExchangeManager:
                 # Determine sizes to close for this split
                 long_size_to_close = 0
                 short_size_to_close = 0
-                
-                if is_last:
-                    # Last split: close all remaining
+                is_full_close = close_size is None  # True = closing entire position
+
+                if is_last and is_full_close:
+                    # Last split of a FULL close: close all remaining
                     if long_pos:
                         try:
                             current_long = await long_client.get_position(long_symbol)
@@ -617,13 +626,16 @@ class MultiExchangeManager:
                 else:
                     long_size_to_close = long_per_split
                     short_size_to_close = short_per_split
-                
+
+                # For partial close, always use close_position_partial (never close_position)
+                use_close_all = is_last and is_full_close
+
                 # Close LONG first with retries
                 long_closed = False
                 if long_size_to_close > 0:
                     for attempt in range(3):
                         try:
-                            if is_last:
+                            if use_close_all:
                                 await long_client.close_position(long_symbol)
                             else:
                                 await long_client.close_position_partial(long_symbol, long_size_to_close)
@@ -645,7 +657,7 @@ class MultiExchangeManager:
                 if short_size_to_close > 0:
                     for attempt in range(3):
                         try:
-                            if is_last:
+                            if use_close_all:
                                 await short_client.close_position(short_symbol)
                             else:
                                 await short_client.close_position_partial(short_symbol, short_size_to_close)

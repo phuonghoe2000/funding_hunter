@@ -562,9 +562,17 @@ class FundingHunterGUI:
                                    command=self._open_position, state=tk.DISABLED)
         self.open_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
         
-        self.close_btn = ttk.Button(btn_frame, text="🛑 Close Position", 
+        self.close_btn = ttk.Button(btn_frame, text="🛑 Close Position",
                                     command=self._close_position, state=tk.DISABLED)
         self.close_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+
+        # Partial close size input (empty = close all)
+        partial_frame = ttk.Frame(btn_frame)
+        partial_frame.pack(side=tk.LEFT, padx=2)
+        ttk.Label(partial_frame, text="Size:", font=("Segoe UI", 8)).pack(side=tk.LEFT)
+        self.close_size_var = tk.StringVar(value="")
+        ttk.Entry(partial_frame, textvariable=self.close_size_var, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Label(partial_frame, text="(empty=all)", font=("Segoe UI", 7), foreground="gray").pack(side=tk.LEFT)
         
         self.load_pos_btn = ttk.Button(btn_frame, text="📥 Load Positions", 
                                        command=self._load_existing_positions, state=tk.DISABLED)
@@ -1649,11 +1657,11 @@ class FundingHunterGUI:
         self.root.after(0, update_ui)
     
     def _close_position(self):
-        """Close position - analyze spread first, then close in splits"""
+        """Close position - analyze spread first, then close in splits. Supports partial close."""
         if not self.active_position:
             messagebox.showinfo("Info", "No active position")
             return
-        
+
         # If already analyzing or waiting, this is a CANCEL action
         if getattr(self, 'analyzing_close', False) or getattr(self, 'waiting_for_close', False):
             self._cancel_close_process()
@@ -1664,18 +1672,43 @@ class FundingHunterGUI:
             if splits < 1: splits = 1
         except:
             splits = 1
-            
+
         skip_spread = self.skip_spread_check_var.get()
-        
-        if skip_spread:
-            confirm_msg = f"Close position in {splits} split(s)?\nWill skip spread check and close immediately."
-        else:
-            confirm_msg = f"Close position in {splits} split(s)?\nWill analyze spread 2 minutes first."
-            
-        if not messagebox.askyesno("Confirm", confirm_msg):
-            return
-        
+
+        # Parse partial close size
+        close_size_str = self.close_size_var.get().strip()
+        close_size = None  # None = close all
+        if close_size_str:
+            try:
+                close_size = float(close_size_str)
+                if close_size <= 0:
+                    messagebox.showerror("Error", "Close size must be > 0")
+                    return
+            except ValueError:
+                messagebox.showerror("Error", "Invalid close size. Enter a number or leave empty for full close.")
+                return
+
         pos = self.active_position
+
+        # Build confirm message with % info
+        if close_size is not None:
+            total_size = pos.get('size', 0) or pos.get('long_size', 0) or pos.get('short_size', 0)
+            if total_size > 0:
+                pct = (close_size / total_size) * 100
+                pct_str = f"{pct:.1f}%"
+            else:
+                pct_str = "?%"
+            size_info = f"Partial close: {close_size} tokens ({pct_str} of position)"
+        else:
+            size_info = "Full close: 100% of position"
+
+        if skip_spread:
+            confirm_msg = f"{size_info}\nSplits: {splits}\nSkip spread check, close immediately."
+        else:
+            confirm_msg = f"{size_info}\nSplits: {splits}\nAnalyze spread 2 minutes first."
+
+        if not messagebox.askyesno("Confirm Close", confirm_msg):
+            return
         self._log(f"📤 Bắt đầu quá trình đóng position {pos['pair']}...")
         
         # STOP ALL BACKGROUND TASKS
@@ -1697,7 +1730,8 @@ class FundingHunterGUI:
             "short_exchange": pos["short_exchange"],
             "splits": splits,
             "price_spread_min": -100.0 if skip_spread else None,  # Will be set after analyze
-            "skip_spread_check": skip_spread
+            "skip_spread_check": skip_spread,
+            "close_size": close_size,  # None = full close, float = partial close (token amount)
         }
         
         # Subscribe to WS Market Data
@@ -1775,17 +1809,17 @@ class FundingHunterGUI:
         params = self.close_params
         if not params:
             return
-        
+
         # Create cancel event for splits
         self.split_cancel_event = threading.Event()
-        
+
         def progress_callback(split_num, total_splits, message):
             self.root.after(0, lambda: self._log(f"   {message}"))
-        
+
         async def async_close():
             return await self.manager.close_hedged_position_split(
-                params['pair'], 
-                params['long_exchange'], 
+                params['pair'],
+                params['long_exchange'],
                 params['short_exchange'],
                 splits=params['splits'],
                 interval_seconds=2.0,
@@ -1793,7 +1827,8 @@ class FundingHunterGUI:
                 spread_check_interval=2.0,
                 progress_callback=progress_callback,
                 cancel_event=self.split_cancel_event,
-                skip_spread_check=params.get('skip_spread_check', False)
+                skip_spread_check=params.get('skip_spread_check', False),
+                close_size=params.get('close_size'),
             )
         
         future = self._run_async(async_close())
@@ -2781,95 +2816,113 @@ class FundingHunterGUI:
             self._update_pair_info()
     
     def _refresh_funding(self):
-        """Refresh funding rates"""
+        """Refresh funding rates - scan ALL pairs from all exchanges"""
         if not self.connected:
             return
-        
-        self._log("Refreshing funding rates from all exchanges...")
-        
+
+        self._log("Scanning ALL funding rates from all exchanges...")
+
         async def async_refresh():
-            all_rates = {}
-            
-            # Get Binance client
+            from config.constants import get_exchange_symbol, get_unified_pair
+
+            # ── Step 1: Bulk fetch from exchanges that support it ──
+            bulk_tasks = {}
+
             binance_client = self.manager.clients.get(Exchange.BINANCE)
-            if not binance_client:
-                logger.error("Binance not connected. Cannot fetch funding rates.")
+            if binance_client:
+                bulk_tasks[Exchange.BINANCE] = binance_client.get_all_funding_rates()
+
+            aster_client = self.manager.clients.get(Exchange.ASTERDEX)
+            if aster_client:
+                bulk_tasks[Exchange.ASTERDEX] = aster_client.get_all_funding_rates()
+
+            bingx_client = self.manager.clients.get(Exchange.BINGX)
+            if bingx_client:
+                bulk_tasks[Exchange.BINGX] = bingx_client.get_all_funding_rates()
+
+            if not bulk_tasks:
+                logger.error("No exchange connected for bulk funding rate fetch")
                 return {}
-            
-            # Get all funding rates from Binance
-            try:
-                # Import to check type
-                from exchanges.binance_client import BinanceClient
-                if not isinstance(binance_client, BinanceClient):
-                    logger.error("Invalid Binance client type")
-                    return {}
-                
-                binance_rates = await binance_client.get_all_funding_rates()
-                # Sort by funding rate (highest to lowest) and take top 15
-                binance_rates.sort(key=lambda x: abs(x.funding_rate), reverse=True)
-                top_binance_rates = binance_rates[:15]
-                
-                self._log(f"Found {len(binance_rates)} pairs on Binance, showing top 15 by funding rate")
-                
-                # For each Binance pair, get rates from other exchanges
-                for binance_rate in top_binance_rates:
-                    binance_symbol = binance_rate.symbol
-                    # Convert Binance symbol to unified pair (e.g., BTCUSDT -> BTC/USDT)
-                    base = binance_symbol.replace("USDT", "")
-                    pair = f"{base}/USDT"
-                    
-                    rates = {Exchange.BINANCE: binance_rate}
-                    
-                    # Get OKX rate
-                    okx_client = self.manager.clients.get(Exchange.OKX)
+
+            # Fetch all in parallel
+            exchanges_list = list(bulk_tasks.keys())
+            results = await asyncio.gather(*bulk_tasks.values(), return_exceptions=True)
+
+            # ── Step 2: Build unified pair map from all bulk results ──
+            # pair -> {Exchange: FundingRate}
+            all_rates = {}
+            total_pairs_scanned = 0
+
+            for ex, result in zip(exchanges_list, results):
+                if isinstance(result, Exception):
+                    logger.warning(f"Failed to fetch {ex.value} rates: {result}")
+                    continue
+
+                total_pairs_scanned += len(result)
+                for rate_obj in result:
+                    pair = get_unified_pair(rate_obj.symbol, ex)
+                    if pair not in all_rates:
+                        all_rates[pair] = {}
+                    all_rates[pair][ex] = rate_obj
+
+            self._log(f"Bulk fetched {total_pairs_scanned} rates from {len(exchanges_list)} exchanges, {len(all_rates)} unique pairs")
+
+            # ── Step 3: Pre-calculate spreads to find top candidates ──
+            def normalize_to_4h(rate_obj):
+                if not rate_obj:
+                    return None
+                interval = getattr(rate_obj, 'funding_interval_hours', 8) or 8
+                return rate_obj.funding_rate * (4.0 / interval)
+
+            pair_spreads = []
+            for pair, rates in all_rates.items():
+                normed = {}
+                for ex, r in rates.items():
+                    v = normalize_to_4h(r)
+                    if v is not None:
+                        normed[ex] = v
+                if len(normed) >= 2:
+                    vals = sorted(normed.values())
+                    spread = abs(vals[-1] - vals[0])
+                else:
+                    spread = 0.0
+                pair_spreads.append((pair, spread))
+
+            # Sort by spread, take top 20 candidates for OKX/Gate lookup
+            pair_spreads.sort(key=lambda x: x[1], reverse=True)
+            top_candidates = [p for p, _ in pair_spreads[:20]]
+
+            # ── Step 4: Fetch OKX / Gate for top candidates only ──
+            okx_client = self.manager.clients.get(Exchange.OKX)
+            gate_client = self.manager.clients.get(Exchange.GATE)
+
+            if okx_client or gate_client:
+                async def fetch_single_rate(client, ex, pair):
+                    try:
+                        symbol = get_exchange_symbol(pair, ex)
+                        return pair, ex, await asyncio.wait_for(client.get_funding_rate(symbol), timeout=8.0)
+                    except Exception:
+                        return pair, ex, None
+
+                single_tasks = []
+                for pair in top_candidates:
                     if okx_client:
-                        try:
-                            from config.constants import get_exchange_symbol
-                            okx_symbol = get_exchange_symbol(pair, Exchange.OKX)
-                            okx_rate = await okx_client.get_funding_rate(okx_symbol)
-                            rates[Exchange.OKX] = okx_rate
-                        except Exception as e:
-                            logger.debug(f"OKX rate not available for {pair}: {e}")
-                    
-                    # Get BingX rate
-                    bingx_client = self.manager.clients.get(Exchange.BINGX)
-                    if bingx_client:
-                        try:
-                            from config.constants import get_exchange_symbol
-                            bingx_symbol = get_exchange_symbol(pair, Exchange.BINGX)
-                            bingx_rate = await bingx_client.get_funding_rate(bingx_symbol)
-                            rates[Exchange.BINGX] = bingx_rate
-                        except Exception as e:
-                            logger.debug(f"BingX rate not available for {pair}: {e}")
-                    
-                    # Get Gate.io rate
-                    gate_client = self.manager.clients.get(Exchange.GATE)
+                        single_tasks.append(fetch_single_rate(okx_client, Exchange.OKX, pair))
                     if gate_client:
-                        try:
-                            from config.constants import get_exchange_symbol
-                            gate_symbol = get_exchange_symbol(pair, Exchange.GATE)
-                            gate_rate = await gate_client.get_funding_rate(gate_symbol)
-                            rates[Exchange.GATE] = gate_rate
-                        except Exception as e:
-                            logger.debug(f"Gate.io rate not available for {pair}: {e}")
-                            
-                    # Get Asterdex rate
-                    aster_client = self.manager.clients.get(Exchange.ASTERDEX)
-                    if aster_client:
-                        try:
-                            from config.constants import get_exchange_symbol
-                            aster_symbol = get_exchange_symbol(pair, Exchange.ASTERDEX)
-                            aster_rate = await aster_client.get_funding_rate(aster_symbol)
-                            rates[Exchange.ASTERDEX] = aster_rate
-                        except Exception as e:
-                            logger.debug(f"Aster rate not available for {pair}: {e}")
-                    
-                    all_rates[pair] = rates
-                    
-            except Exception as e:
-                logger.error(f"Error getting Binance rates: {e}")
-                return {}
-            
+                        single_tasks.append(fetch_single_rate(gate_client, Exchange.GATE, pair))
+
+                if single_tasks:
+                    single_results = await asyncio.gather(*single_tasks, return_exceptions=True)
+                    for res in single_results:
+                        if isinstance(res, Exception) or res is None:
+                            continue
+                        pair, ex, rate_obj = res
+                        if rate_obj:
+                            if pair not in all_rates:
+                                all_rates[pair] = {}
+                            all_rates[pair][ex] = rate_obj
+
+            self._log(f"Total: {len(all_rates)} pairs scanned, showing top 10 by spread")
             return all_rates
         
         future = self._run_async(async_refresh())
@@ -2934,10 +2987,11 @@ class FundingHunterGUI:
             
             pairs_with_spreads.append((pair, rates, spread_value))
         
-        # Sort by spread (highest to lowest)
+        # Sort by spread (highest to lowest), show top 10
         sorted_pairs = sorted(pairs_with_spreads, key=lambda x: x[2], reverse=True)
-        
-        for pair, rates, spread_value in sorted_pairs:
+        top_pairs = sorted_pairs[:10]
+
+        for pair, rates, spread_value in top_pairs:
             # Normalize each rate for display
             def fmt_rate(ex_enum):
                 rate_obj = rates.get(ex_enum)
@@ -2978,7 +3032,7 @@ class FundingHunterGUI:
                 pair, okx_val, binance_val, bingx_val, gate_val, aster_val, best_spread, recommendation
             ))
         
-        self._log(f"✅ Loaded {len(sorted_pairs)} pairs sorted by Best Spread (normalized to 4h)")
+        self._log(f"Loaded top 10 from {len(sorted_pairs)} pairs sorted by Best Spread (normalized to 4h)")
     
     def _on_funding_select(self, event):
         """Handle funding row double-click - auto select pair and exchanges in Trading Panel"""
