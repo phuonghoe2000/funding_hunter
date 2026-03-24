@@ -383,10 +383,11 @@ class MultiExchangeManager:
         short_exchange: Exchange,
         splits: int = 1,
         interval_seconds: float = 2.0,
-        progress_callback = None
+        progress_callback = None,
+        close_size: Optional[float] = None
     ) -> Dict[str, Any]:
         """Close hedged position in multiple splits
-        
+
         Args:
             pair: Trading pair
             long_exchange: Exchange with LONG position
@@ -394,6 +395,7 @@ class MultiExchangeManager:
             splits: Number of splits to close
             interval_seconds: Seconds between each split
             progress_callback: Callback function(split_num, total_splits, message)
+            close_size: If set, only close this amount (partial close)
         """
         results = {"success": False, "error": None, "closed_splits": 0}
         
@@ -419,7 +421,13 @@ class MultiExchangeManager:
             # Calculate size per split
             long_total = long_pos.size if long_pos else 0
             short_total = short_pos.size if short_pos else 0
-            
+
+            # Cap by close_size for partial close
+            is_full_close = close_size is None
+            if close_size is not None:
+                long_total = min(long_total, close_size)
+                short_total = min(short_total, close_size)
+
             long_per_split = long_total / splits if long_total > 0 else 0
             short_per_split = short_total / splits if short_total > 0 else 0
             
@@ -430,17 +438,28 @@ class MultiExchangeManager:
                 
                 close_tasks = []
                 
-                # For last split, close remaining position entirely
+                # For last split, close remaining position
                 if is_last:
-                    # Re-check positions for final close
-                    if long_pos:
-                        current_long = await long_client.get_position(long_symbol)
-                        if current_long:
-                            close_tasks.append(long_client.close_position(long_symbol))
-                    if short_pos:
-                        current_short = await short_client.get_position(short_symbol)
-                        if current_short:
-                            close_tasks.append(short_client.close_position(short_symbol))
+                    if is_full_close:
+                        # Full close: use close_position() to ensure everything is closed
+                        if long_pos:
+                            current_long = await long_client.get_position(long_symbol)
+                            if current_long:
+                                close_tasks.append(long_client.close_position(long_symbol))
+                        if short_pos:
+                            current_short = await short_client.get_position(short_symbol)
+                            if current_short:
+                                close_tasks.append(short_client.close_position(short_symbol))
+                    else:
+                        # Partial close: use close_position_partial() for last split too
+                        if long_per_split > 0:
+                            close_tasks.append(
+                                long_client.close_position_partial(long_symbol, long_per_split)
+                            )
+                        if short_per_split > 0:
+                            close_tasks.append(
+                                short_client.close_position_partial(short_symbol, short_per_split)
+                            )
                 else:
                     # Close partial amount
                     if long_per_split > 0:
@@ -1260,9 +1279,17 @@ class FundingHunterGUI:
                                    command=self._open_position, state=tk.DISABLED)
         self.open_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
         
-        self.close_btn = ttk.Button(btn_frame, text="🛑 Close Position", 
+        self.close_btn = ttk.Button(btn_frame, text="🛑 Close Position",
                                     command=self._close_position, state=tk.DISABLED)
         self.close_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+
+        # Partial close size input (empty = close all)
+        partial_frame = ttk.Frame(btn_frame)
+        partial_frame.pack(side=tk.LEFT, padx=2)
+        ttk.Label(partial_frame, text="Size:", font=("Segoe UI", 8)).pack(side=tk.LEFT)
+        self.close_size_var = tk.StringVar(value="")
+        ttk.Entry(partial_frame, textvariable=self.close_size_var, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Label(partial_frame, text="(empty=all)", font=("Segoe UI", 7), foreground="gray").pack(side=tk.LEFT)
         
         self.load_pos_btn = ttk.Button(btn_frame, text="📥 Load Positions", 
                                        command=self._load_existing_positions, state=tk.DISABLED)
@@ -2356,11 +2383,11 @@ class FundingHunterGUI:
         self.root.after(0, update_ui)
     
     def _close_position(self):
-        """Close position in splits"""
+        """Close position in splits (supports partial close)"""
         if not self.active_position:
             messagebox.showinfo("Info", "No active position")
             return
-        
+
         # Get split count from UI (same as open position)
         try:
             splits = int(self.split_count_var.get())
@@ -2368,32 +2395,62 @@ class FundingHunterGUI:
                 splits = 1
         except:
             splits = 1
-        
-        confirm_msg = f"Close the hedged position in {splits} split(s)?\n(2 seconds between each split)"
+
+        # Parse partial close size
+        close_size = None
+        close_size_str = self.close_size_var.get().strip()
+        if close_size_str:
+            try:
+                close_size = float(close_size_str)
+                if close_size <= 0:
+                    messagebox.showerror("Error", "Size must be positive")
+                    return
+            except ValueError:
+                messagebox.showerror("Error", "Invalid size value")
+                return
+
+        pos = self.active_position
+
+        # Build confirm message with % info for partial close
+        if close_size:
+            pos_size = pos.get('size', 0)
+            if pos_size > 0:
+                pct = (close_size / pos_size) * 100
+                confirm_msg = (f"Partial close: {close_size} tokens ({pct:.1f}% of position)\n"
+                              f"in {splits} split(s)?\n(2 seconds between each split)")
+            else:
+                confirm_msg = (f"Partial close: {close_size} tokens\n"
+                              f"in {splits} split(s)?\n(2 seconds between each split)")
+        else:
+            confirm_msg = f"Close the hedged position in {splits} split(s)?\n(2 seconds between each split)"
+
         if not messagebox.askyesno("Confirm", confirm_msg):
             return
-        
-        pos = self.active_position
-        self._log(f"📤 Closing position for {pos['pair']} in {splits} split(s)...")
-        
+
+        if close_size:
+            self._log(f"📤 Partial closing {close_size} tokens for {pos['pair']} in {splits} split(s)...")
+        else:
+            self._log(f"📤 Closing position for {pos['pair']} in {splits} split(s)...")
+
         # Disable close button during operation
         self.close_btn.config(state=tk.DISABLED)
-        
+
         def progress_callback(split_num, total_splits, message):
             def update():
                 self._log(f"   🔄 {message}")
             self.root.after(0, update)
-        
+
         async def async_close():
             return await self.manager.close_hedged_position_split(
-                pos['pair'], 
-                pos['long_exchange'], 
+                pos['pair'],
+                pos['long_exchange'],
                 pos['short_exchange'],
                 splits=splits,
                 interval_seconds=2.0,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                close_size=close_size
             )
-        
+
         future = self._run_async(async_close())
         if future:
             future.add_done_callback(self._on_close_complete)
