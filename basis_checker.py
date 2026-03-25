@@ -19,6 +19,8 @@ ASTER_PREMIUM_URL = "https://fapi.asterdex.com/fapi/v1/premiumIndex"
 BINANCE_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
 BINANCE_EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 ASTER_EXCHANGE_INFO_URL = "https://fapi.asterdex.com/fapi/v1/exchangeInfo"
+BINANCE_DEPTH_URL = "https://fapi.binance.com/fapi/v1/depth"
+ASTER_DEPTH_URL = "https://fapi.asterdex.com/fapi/v1/depth"
 
 # Config file for Telegram settings
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "basis_config.json")
@@ -122,6 +124,53 @@ async def fetch_all_data():
     return binance_data, aster_data, tickers
 
 
+def _price_fmt(price):
+    """Get decimal format string based on price magnitude"""
+    if price > 1000:
+        return ".2f"
+    elif price > 1:
+        return ".4f"
+    elif price > 0.01:
+        return ".6f"
+    else:
+        return ".8f"
+
+
+def _qty_fmt(qty):
+    """Format quantity for display"""
+    if qty >= 10000:
+        return f"{qty:,.0f}"
+    elif qty >= 100:
+        return f"{qty:,.1f}"
+    elif qty >= 1:
+        return f"{qty:.2f}"
+    else:
+        return f"{qty:.4f}"
+
+
+async def fetch_order_books(symbol, limit=10):
+    """Fetch order books from both Binance and AsterDEX"""
+    async with aiohttp.ClientSession() as session:
+        async def fetch_one(base_url):
+            url = f"{base_url}?symbol={symbol}&limit={limit}"
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    data = await resp.json()
+                    return {
+                        "bids": [(float(p), float(q)) for p, q in data.get("bids", [])],
+                        "asks": [(float(p), float(q)) for p, q in data.get("asks", [])],
+                    }
+            except Exception as e:
+                print(f"Error fetching depth from {base_url}: {e}")
+                return {"bids": [], "asks": []}
+
+        bn_book, as_book = await asyncio.gather(
+            fetch_one(BINANCE_DEPTH_URL),
+            fetch_one(ASTER_DEPTH_URL)
+        )
+    return bn_book, as_book
+
+
 async def send_telegram_message(bot_token, chat_id, message):
     """Send message via Telegram bot"""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -217,16 +266,14 @@ class BasisCheckerApp:
         table_frame = ttk.LabelFrame(right_frame, text="Top 10 Basis (auto-refresh 10s)")
         table_frame.pack(fill="both", expand=True)
 
-        cols = ("symbol", "change_24h", "binance_price", "aster_price", "diff", "diff_pct",
+        cols = ("symbol", "binance_price", "aster_price", "diff_pct",
                 "bn_funding", "as_funding", "funding_diff")
         self.basis_tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=20)
 
         headers = {
             "symbol": ("Symbol", 100),
-            "change_24h": ("24h %", 80),
             "binance_price": ("Binance Price", 120),
             "aster_price": ("Aster Price", 120),
-            "diff": ("Diff (USD)", 100),
             "diff_pct": ("Diff %", 80),
             "bn_funding": ("BN FR", 90),
             "as_funding": ("AS FR", 90),
@@ -244,6 +291,9 @@ class BasisCheckerApp:
         self.basis_tree.tag_configure("positive", foreground="#00aa00")
         self.basis_tree.tag_configure("negative", foreground="#cc0000")
         self.basis_tree.tag_configure("neutral", foreground="#666666")
+
+        # Double-click to open order book detail
+        self.basis_tree.bind("<Double-1>", self._on_basis_double_click)
 
         # Telegram config frame
         tg_frame = ttk.LabelFrame(right_frame, text="Telegram Alert")
@@ -409,17 +459,19 @@ class BasisCheckerApp:
                 fmt = ".6f"
 
             diff_pct = row["diff_pct"]
-            if abs(diff_pct) > 0.1:
-                tag = "negative" if diff_pct < 0 else "positive"
+            fr_diff = row["funding_diff"]
+            # Same sign = funding supports basis (green), opposite = red
+            if diff_pct * fr_diff > 0:
+                tag = "positive"  # aligned - green
+            elif diff_pct * fr_diff < 0:
+                tag = "negative"  # opposed - red
             else:
                 tag = "neutral"
 
             values = (
                 row["symbol"],
-                f"{row['change_24h']:+.2f}%",
                 f"{bp:{fmt}}",
                 f"{row['aster_price']:{fmt}}",
-                f"{row['diff']:{fmt}}",
                 f"{diff_pct:+.4f}%",
                 f"{row['bn_funding']:.4f}%",
                 f"{row['as_funding']:.4f}%",
@@ -528,6 +580,220 @@ class BasisCheckerApp:
             header += f"Time: {time.strftime('%H:%M:%S')}\n\n"
             msg = header + "\n\n".join(alerts)
             self._run_async(send_telegram_message(self.tg_token, self.tg_chat_id, msg))
+
+    # ── Order Book Detail ─────────────────────────────────────
+    def _on_basis_double_click(self, event):
+        sel = self.basis_tree.selection()
+        if not sel:
+            return
+        values = self.basis_tree.item(sel[0], "values")
+        if values:
+            self._show_order_book(values[0])
+
+    def _show_order_book(self, symbol):
+        """Show order book detail window for a symbol"""
+        if hasattr(self, '_ob_window') and self._ob_window and self._ob_window.winfo_exists():
+            self._ob_window.destroy()
+
+        win = tk.Toplevel(self.root)
+        win.title(f"{symbol} - Bid/Ask Analysis")
+        win.geometry("950x700")
+        win.minsize(850, 550)
+        self._ob_window = win
+        self._ob_symbol = symbol
+        self._ob_running = True
+
+        # Top
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=5, pady=5)
+        ttk.Label(top, text=symbol, font=("Segoe UI", 14, "bold")).pack(side="left")
+        self._ob_status = ttk.Label(top, text="Loading...", foreground="gray")
+        self._ob_status.pack(side="right")
+
+        # Order books side by side
+        books_frame = ttk.Frame(win)
+        books_frame.pack(fill="both", expand=True, padx=5, pady=2)
+
+        ob_cols = ("price", "quantity", "total_usd")
+
+        # Binance order book
+        bn_frame = ttk.LabelFrame(books_frame, text="Binance")
+        bn_frame.pack(side="left", fill="both", expand=True, padx=(0, 3))
+        self._bn_ob_tree = ttk.Treeview(bn_frame, columns=ob_cols, show="headings", height=22)
+        for col, title, w in [("price", "Price", 130), ("quantity", "Qty", 110), ("total_usd", "Total $", 100)]:
+            self._bn_ob_tree.heading(col, text=title)
+            self._bn_ob_tree.column(col, width=w, anchor="e")
+        self._bn_ob_tree.pack(fill="both", expand=True)
+        self._bn_ob_tree.tag_configure("ask", foreground="#cc0000")
+        self._bn_ob_tree.tag_configure("bid", foreground="#00aa00")
+        self._bn_ob_tree.tag_configure("spread", foreground="#888888", background="#f0f0f0")
+
+        # AsterDEX order book
+        as_frame = ttk.LabelFrame(books_frame, text="AsterDEX")
+        as_frame.pack(side="left", fill="both", expand=True, padx=(3, 0))
+        self._as_ob_tree = ttk.Treeview(as_frame, columns=ob_cols, show="headings", height=22)
+        for col, title, w in [("price", "Price", 130), ("quantity", "Qty", 110), ("total_usd", "Total $", 100)]:
+            self._as_ob_tree.heading(col, text=title)
+            self._as_ob_tree.column(col, width=w, anchor="e")
+        self._as_ob_tree.pack(fill="both", expand=True)
+        self._as_ob_tree.tag_configure("ask", foreground="#cc0000")
+        self._as_ob_tree.tag_configure("bid", foreground="#00aa00")
+        self._as_ob_tree.tag_configure("spread", foreground="#888888", background="#f0f0f0")
+
+        # Analysis
+        analysis_frame = ttk.LabelFrame(win, text="Analysis & Recommendation")
+        analysis_frame.pack(fill="x", padx=5, pady=(2, 5))
+        self._analysis_text = tk.Text(analysis_frame, height=7, font=("Consolas", 10),
+                                       wrap="word", state="disabled", bg="#fafafa")
+        self._analysis_text.pack(fill="x", padx=5, pady=5)
+        self._analysis_text.tag_configure("green", foreground="#00aa00")
+        self._analysis_text.tag_configure("red", foreground="#cc0000")
+        self._analysis_text.tag_configure("bold", font=("Consolas", 10, "bold"))
+        self._analysis_text.tag_configure("header", font=("Consolas", 11, "bold"))
+
+        win.protocol("WM_DELETE_WINDOW", self._close_ob_window)
+        self._fetch_order_book()
+
+    def _close_ob_window(self):
+        self._ob_running = False
+        if hasattr(self, '_ob_window') and self._ob_window:
+            self._ob_window.destroy()
+
+    def _fetch_order_book(self):
+        if not self._ob_running:
+            return
+        if not hasattr(self, '_ob_window') or not self._ob_window.winfo_exists():
+            self._ob_running = False
+            return
+        future = self._run_async(fetch_order_books(self._ob_symbol))
+        if future:
+            self._ob_window.after(100, lambda: self._check_ob_result(future))
+
+    def _check_ob_result(self, future):
+        if not self._ob_running:
+            return
+        if not hasattr(self, '_ob_window') or not self._ob_window.winfo_exists():
+            self._ob_running = False
+            return
+        if not future.done():
+            self._ob_window.after(100, lambda: self._check_ob_result(future))
+            return
+        try:
+            bn_book, as_book = future.result()
+            self._update_ob_display(bn_book, as_book)
+            self._ob_status.config(text=f"Updated {time.strftime('%H:%M:%S')} (auto-refresh 3s)")
+        except Exception as e:
+            self._ob_status.config(text=f"Error: {e}")
+        if self._ob_running:
+            self._ob_window.after(3000, self._fetch_order_book)
+
+    def _update_ob_display(self, bn_book, as_book):
+        def populate(tree, book):
+            tree.delete(*tree.get_children())
+
+            # Asks reversed (highest at top, best ask at bottom near spread)
+            asks = sorted(book["asks"][:10], key=lambda x: x[0], reverse=True)
+            for price, qty in asks:
+                fmt = _price_fmt(price)
+                tree.insert("", "end", values=(
+                    f"{price:{fmt}}", _qty_fmt(qty), f"${price * qty:,.1f}"
+                ), tags=("ask",))
+
+            # Spread line
+            if book["asks"] and book["bids"]:
+                best_ask = book["asks"][0][0]
+                best_bid = book["bids"][0][0]
+                spread_pct = ((best_ask - best_bid) / best_bid * 100) if best_bid > 0 else 0
+                tree.insert("", "end", values=(
+                    f"--- Spread: {spread_pct:.4f}% ---", "", ""
+                ), tags=("spread",))
+
+            # Bids (best bid at top, near spread)
+            for price, qty in book["bids"][:10]:
+                fmt = _price_fmt(price)
+                tree.insert("", "end", values=(
+                    f"{price:{fmt}}", _qty_fmt(qty), f"${price * qty:,.1f}"
+                ), tags=("bid",))
+
+        populate(self._bn_ob_tree, bn_book)
+        populate(self._as_ob_tree, as_book)
+        self._update_analysis(bn_book, as_book)
+
+    def _update_analysis(self, bn_book, as_book):
+        symbol = self._ob_symbol
+        t = self._analysis_text
+        t.config(state="normal")
+        t.delete("1.0", "end")
+
+        bn_bid = bn_book["bids"][0][0] if bn_book["bids"] else 0
+        bn_ask = bn_book["asks"][0][0] if bn_book["asks"] else 0
+        as_bid = as_book["bids"][0][0] if as_book["bids"] else 0
+        as_ask = as_book["asks"][0][0] if as_book["asks"] else 0
+
+        # Mark price basis
+        bn_data = self.binance_data.get(symbol, {})
+        as_data = self.aster_data.get(symbol, {})
+        bn_mark = bn_data.get("mark_price", 0)
+        as_mark = as_data.get("mark_price", 0)
+        mark_basis = ((as_mark - bn_mark) / bn_mark * 100) if bn_mark > 0 else 0
+
+        # Funding
+        bn_fr = bn_data.get("last_funding", 0) * 100
+        as_fr = as_data.get("last_funding", 0) * 100
+        fr_diff = as_fr - bn_fr
+
+        # Individual spreads
+        bn_spread = ((bn_ask - bn_bid) / bn_bid * 100) if bn_bid > 0 else 0
+        as_spread = ((as_ask - as_bid) / as_bid * 100) if as_bid > 0 else 0
+
+        # Depth (total USD on each side)
+        bn_bid_depth = sum(p * q for p, q in bn_book["bids"][:10])
+        bn_ask_depth = sum(p * q for p, q in bn_book["asks"][:10])
+        as_bid_depth = sum(p * q for p, q in as_book["bids"][:10])
+        as_ask_depth = sum(p * q for p, q in as_book["asks"][:10])
+
+        t.insert("end", f"Mark Basis: {mark_basis:+.4f}%", "header")
+        t.insert("end", f"  |  BN Spread: {bn_spread:.4f}%  |  AS Spread: {as_spread:.4f}%\n")
+        t.insert("end", f"Depth (10 lvl):  BN ${bn_bid_depth:,.0f} bid / ${bn_ask_depth:,.0f} ask")
+        t.insert("end", f"  |  AS ${as_bid_depth:,.0f} bid / ${as_ask_depth:,.0f} ask\n")
+
+        # Executable basis
+        if mark_basis >= 0:
+            # Aster > Binance -> Long BN (buy at ask), Short AS (sell at bid)
+            exec_basis = ((as_bid - bn_ask) / bn_ask * 100) if bn_ask > 0 else 0
+            rec_long, rec_short = "Binance", "AsterDEX"
+            fmt = _price_fmt(bn_ask)
+            t.insert("end", f"Executable Basis: {exec_basis:+.4f}%", "bold")
+            t.insert("end", f"  (AS Bid {as_bid:{fmt}} - BN Ask {bn_ask:{fmt}})\n")
+        else:
+            # Binance > Aster -> Long AS (buy at ask), Short BN (sell at bid)
+            exec_basis = ((bn_bid - as_ask) / as_ask * 100) if as_ask > 0 else 0
+            rec_long, rec_short = "AsterDEX", "Binance"
+            fmt = _price_fmt(as_ask)
+            t.insert("end", f"Executable Basis: {exec_basis:+.4f}%", "bold")
+            t.insert("end", f"  (BN Bid {bn_bid:{fmt}} - AS Ask {as_ask:{fmt}})\n")
+
+        # Recommendation
+        t.insert("end", "Recommendation: ", "bold")
+        t.insert("end", f"LONG {rec_long}", "green")
+        t.insert("end", " / ")
+        t.insert("end", f"SHORT {rec_short}\n", "red")
+
+        # Executable check
+        if exec_basis > 0:
+            t.insert("end", "  OK  Executable basis positive - opportunity is REAL\n", "green")
+        else:
+            t.insert("end", f"  X  Executable basis negative ({exec_basis:+.4f}%) - spread eats profit\n", "red")
+
+        # Funding alignment
+        if mark_basis * fr_diff > 0:
+            t.insert("end", f"  OK  Funding ({fr_diff:+.4f}%) supports basis - ALIGNED", "green")
+        elif mark_basis * fr_diff < 0:
+            t.insert("end", f"  X  Funding ({fr_diff:+.4f}%) opposes basis", "red")
+        else:
+            t.insert("end", f"  ~  Funding diff is zero or basis is zero")
+
+        t.config(state="disabled")
 
     # ── Run / Close ─────────────────────────────────────────
     def run(self):
