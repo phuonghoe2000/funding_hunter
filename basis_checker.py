@@ -12,6 +12,14 @@ import aiohttp
 import time
 import json
 import os
+import logging
+
+from config.settings import BinanceConfig, AsterdexConfig
+from config.constants import Side
+from exchanges.binance_client import BinanceClient
+from exchanges.aster_client import AsterClient
+
+logger = logging.getLogger(__name__)
 
 # Public API endpoints (no auth needed)
 BINANCE_PREMIUM_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
@@ -21,6 +29,8 @@ BINANCE_EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 ASTER_EXCHANGE_INFO_URL = "https://fapi.asterdex.com/fapi/v1/exchangeInfo"
 BINANCE_DEPTH_URL = "https://fapi.binance.com/fapi/v1/depth"
 ASTER_DEPTH_URL = "https://fapi.asterdex.com/fapi/v1/depth"
+BINANCE_FUNDING_INFO_URL = "https://fapi.binance.com/fapi/v1/fundingInfo"
+ASTER_FUNDING_INFO_URL = "https://fapi.asterdex.com/fapi/v1/fundingInfo"
 
 # Config file for Telegram settings
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "basis_config.json")
@@ -45,17 +55,21 @@ def save_config(cfg):
 
 
 async def fetch_trading_symbols(session, url):
-    """Fetch only TRADING status symbols from exchangeInfo"""
+    """Fetch only TRADING status symbols from exchangeInfo, with quantity precision"""
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             data = await resp.json()
-            return {
-                s["symbol"] for s in data.get("symbols", [])
-                if s.get("status") == "TRADING" and s["symbol"].endswith("USDT")
-            }
+            symbols = set()
+            precisions = {}
+            for s in data.get("symbols", []):
+                sym = s.get("symbol", "")
+                if s.get("status") == "TRADING" and sym.endswith("USDT"):
+                    symbols.add(sym)
+                    precisions[sym] = s.get("quantityPrecision", 0)
+            return symbols, precisions
     except Exception as e:
         print(f"Error fetching exchangeInfo {url}: {e}")
-        return set()
+        return set(), {}
 
 
 async def fetch_all_mark_prices(session, url, trading_only=None):
@@ -106,22 +120,46 @@ async def fetch_24h_tickers(session):
         return {}
 
 
+async def fetch_funding_intervals(session, url):
+    """Fetch fundingIntervalHours for each symbol"""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            data = await resp.json()
+            result = {}
+            for item in data:
+                sym = item.get("symbol", "")
+                if sym.endswith("USDT"):
+                    result[sym] = item.get("fundingIntervalHours", 8)
+            return result
+    except Exception as e:
+        print(f"Error fetching fundingInfo {url}: {e}")
+        return {}
+
+
 async def fetch_all_data():
-    """Fetch prices + 24h tickers, filtered to TRADING pairs only"""
+    """Fetch prices + 24h tickers + funding intervals, filtered to TRADING pairs only"""
     async with aiohttp.ClientSession() as session:
-        # Fetch exchange info first to get TRADING symbols
-        bn_trading, as_trading = await asyncio.gather(
+        # Fetch exchange info first to get TRADING symbols + precision
+        (bn_trading, bn_precisions), (as_trading, as_precisions) = await asyncio.gather(
             fetch_trading_symbols(session, BINANCE_EXCHANGE_INFO_URL),
             fetch_trading_symbols(session, ASTER_EXCHANGE_INFO_URL),
         )
 
-        # Then fetch prices filtered by trading status
-        binance_data, aster_data, tickers = await asyncio.gather(
+        # Then fetch prices + funding intervals filtered by trading status
+        binance_data, aster_data, tickers, bn_intervals, as_intervals = await asyncio.gather(
             fetch_all_mark_prices(session, BINANCE_PREMIUM_URL, bn_trading),
             fetch_all_mark_prices(session, ASTER_PREMIUM_URL, as_trading),
             fetch_24h_tickers(session),
+            fetch_funding_intervals(session, BINANCE_FUNDING_INFO_URL),
+            fetch_funding_intervals(session, ASTER_FUNDING_INFO_URL),
         )
-    return binance_data, aster_data, tickers
+    # Merge precisions (use min of both exchanges for safety)
+    qty_precisions = {}
+    for sym in set(bn_precisions) | set(as_precisions):
+        bn_p = bn_precisions.get(sym, 0)
+        as_p = as_precisions.get(sym, 0)
+        qty_precisions[sym] = min(bn_p, as_p) if bn_p and as_p else bn_p or as_p
+    return binance_data, aster_data, tickers, bn_intervals, as_intervals, qty_precisions
 
 
 def _price_fmt(price):
@@ -201,6 +239,9 @@ class BasisCheckerApp:
         self.binance_data = {}
         self.aster_data = {}
         self.tickers_24h = {}
+        self.bn_intervals = {}  # symbol -> fundingIntervalHours
+        self.as_intervals = {}
+        self.qty_precisions = {}  # symbol -> quantityPrecision
         self.common_symbols = []
         self.loop = None
         self.running = True
@@ -215,6 +256,21 @@ class BasisCheckerApp:
         self.alert_threshold = cfg.get("alert_threshold", DEFAULT_ALERT_THRESHOLD)
         self.alerted_symbols = {}  # symbol -> last_alert_time (cooldown 5min)
         self.alert_hit_count = {}  # symbol -> consecutive hit count (alert on 2nd hit)
+
+        # Auto trade state
+        self.bn_api_key = cfg.get("bn_api_key", "")
+        self.bn_secret = cfg.get("bn_secret", "")
+        self.as_api_key = cfg.get("as_api_key", "")
+        self.as_secret = cfg.get("as_secret", "")
+        self.max_trade_volume = cfg.get("max_trade_volume", 100)
+        self.per_trade_usdt = cfg.get("per_trade_usdt", 10)
+        self.trade_leverage = cfg.get("trade_leverage", 3)
+        self.min_basis = cfg.get("min_basis", 1.0)
+        self.auto_trade_enabled = False
+        self.auto_trade_exposure = 0.0  # Current open notional exposure
+        self.auto_trade_positions = {}  # symbol -> {entry_basis, rec_long, rec_short, total_notional, layers, entry_time}
+        self.bn_client = None
+        self.as_client = None
 
         self._build_ui()
         self._start_async_loop()
@@ -275,9 +331,9 @@ class BasisCheckerApp:
             "binance_price": ("Binance Price", 120),
             "aster_price": ("Aster Price", 120),
             "diff_pct": ("Diff %", 80),
-            "bn_funding": ("BN FR", 90),
-            "as_funding": ("AS FR", 90),
-            "funding_diff": ("FR Diff", 90),
+            "bn_funding": ("BN FR/4h", 90),
+            "as_funding": ("AS FR/4h", 90),
+            "funding_diff": ("FR Diff/4h", 90),
         }
         for col, (title, width) in headers.items():
             self.basis_tree.heading(col, text=title, command=lambda c=col: self._sort_by(c))
@@ -321,6 +377,58 @@ class BasisCheckerApp:
         self.tg_status = ttk.Label(row2, text="", foreground="gray")
         self.tg_status.pack(side="left", padx=5)
 
+        # Auto Trade config frame
+        trade_frame = ttk.LabelFrame(right_frame, text="Auto Trade (Hedged)")
+        trade_frame.pack(fill="x", padx=0, pady=(5, 0))
+
+        tr1 = ttk.Frame(trade_frame)
+        tr1.pack(fill="x", padx=5, pady=2)
+        ttk.Label(tr1, text="BN Key:").pack(side="left")
+        self.bn_key_var = tk.StringVar(value=self.bn_api_key)
+        ttk.Entry(tr1, textvariable=self.bn_key_var, width=20, show="*").pack(side="left", padx=2)
+        ttk.Label(tr1, text="Secret:").pack(side="left")
+        self.bn_secret_var = tk.StringVar(value=self.bn_secret)
+        ttk.Entry(tr1, textvariable=self.bn_secret_var, width=20, show="*").pack(side="left", padx=2)
+        ttk.Label(tr1, text="  |  AS Key:").pack(side="left")
+        self.as_key_var = tk.StringVar(value=self.as_api_key)
+        ttk.Entry(tr1, textvariable=self.as_key_var, width=20, show="*").pack(side="left", padx=2)
+        ttk.Label(tr1, text="Secret:").pack(side="left")
+        self.as_secret_var = tk.StringVar(value=self.as_secret)
+        ttk.Entry(tr1, textvariable=self.as_secret_var, width=20, show="*").pack(side="left", padx=2)
+
+        tr2 = ttk.Frame(trade_frame)
+        tr2.pack(fill="x", padx=5, pady=2)
+        ttk.Label(tr2, text="Max Volume:").pack(side="left")
+        self.max_vol_var = tk.StringVar(value=str(self.max_trade_volume))
+        ttk.Entry(tr2, textvariable=self.max_vol_var, width=8).pack(side="left", padx=2)
+        ttk.Label(tr2, text="USDT").pack(side="left")
+        ttk.Label(tr2, text="  Per Trade:").pack(side="left", padx=(10, 0))
+        self.per_trade_var = tk.StringVar(value=str(self.per_trade_usdt))
+        ttk.Entry(tr2, textvariable=self.per_trade_var, width=6).pack(side="left", padx=2)
+        ttk.Label(tr2, text="USDT/side").pack(side="left")
+        ttk.Label(tr2, text="  Lev:").pack(side="left", padx=(5, 0))
+        self.leverage_var = tk.StringVar(value=str(self.trade_leverage))
+        ttk.Entry(tr2, textvariable=self.leverage_var, width=4).pack(side="left", padx=2)
+        ttk.Label(tr2, text="x").pack(side="left")
+        ttk.Label(tr2, text="  Min Basis:").pack(side="left", padx=(5, 0))
+        self.min_basis_var = tk.StringVar(value=str(self.min_basis))
+        ttk.Entry(tr2, textvariable=self.min_basis_var, width=5).pack(side="left", padx=2)
+        ttk.Label(tr2, text="%").pack(side="left")
+        ttk.Button(tr2, text="Save", command=self._save_trade_config).pack(side="left", padx=5)
+        self.auto_trade_btn = ttk.Button(tr2, text="Enable Auto Trade", command=self._toggle_auto_trade)
+        self.auto_trade_btn.pack(side="left", padx=5)
+
+        tr3 = ttk.Frame(trade_frame)
+        tr3.pack(fill="x", padx=5, pady=2)
+        self.trade_status_label = ttk.Label(tr3, text="Status: OFF | Traded: 0 USDT | Positions: 0",
+                                             foreground="gray")
+        self.trade_status_label.pack(side="left")
+
+        # Trade log
+        self.trade_log_text = tk.Text(trade_frame, height=3, font=("Consolas", 9),
+                                       wrap="word", state="disabled", bg="#fafafa")
+        self.trade_log_text.pack(fill="x", padx=5, pady=(0, 5))
+
     # ── Async loop ──────────────────────────────────────────
     def _start_async_loop(self):
         def run_loop():
@@ -346,7 +454,7 @@ class BasisCheckerApp:
             return
 
         try:
-            self.binance_data, self.aster_data, self.tickers_24h = future.result()
+            self.binance_data, self.aster_data, self.tickers_24h, self.bn_intervals, self.as_intervals, self.qty_precisions = future.result()
             binance_set = set(self.binance_data.keys())
             aster_set = set(self.aster_data.keys())
             self.common_symbols = sorted(binance_set & aster_set)
@@ -354,6 +462,7 @@ class BasisCheckerApp:
             self._populate_pairs_list()
             self._update_basis_table()
             self._check_alerts()
+            self._check_auto_trade()
 
             now = time.strftime("%H:%M:%S")
             self.status_label.config(
@@ -398,6 +507,18 @@ class BasisCheckerApp:
         self._update_basis_table()
 
     # ── Basis table ─────────────────────────────────────────
+    def _get_normalized_fr(self, sym):
+        """Get funding rates normalized to 4h equivalent (in %)"""
+        bn = self.binance_data.get(sym)
+        ast = self.aster_data.get(sym)
+        if not bn or not ast:
+            return 0, 0, 0
+        bn_interval = self.bn_intervals.get(sym, 8)
+        as_interval = self.as_intervals.get(sym, 8)
+        bn_fr = bn["last_funding"] * 100 * (4 / bn_interval)
+        as_fr = ast["last_funding"] * 100 * (4 / as_interval)
+        return bn_fr, as_fr, as_fr - bn_fr
+
     def _update_basis_table(self):
         for item in self.basis_tree.get_children():
             self.basis_tree.delete(item)
@@ -420,9 +541,8 @@ class BasisCheckerApp:
             # Skip outliers (basis > 10% likely means different contract/delisted)
             if abs(diff_pct) > 10:
                 continue
-            bn_fr = bn["last_funding"] * 100
-            as_fr = ast["last_funding"] * 100
-            fr_diff = as_fr - bn_fr
+
+            bn_fr, as_fr, fr_diff = self._get_normalized_fr(sym)
 
             ticker = self.tickers_24h.get(sym)
             change_24h = ticker["price_change_pct"] if ticker else 0.0
@@ -581,6 +701,304 @@ class BasisCheckerApp:
             msg = header + "\n\n".join(alerts)
             self._run_async(send_telegram_message(self.tg_token, self.tg_chat_id, msg))
 
+    # ── Auto Trade ─────────────────────────────────────────────
+    def _save_trade_config(self):
+        self.bn_api_key = self.bn_key_var.get().strip()
+        self.bn_secret = self.bn_secret_var.get().strip()
+        self.as_api_key = self.as_key_var.get().strip()
+        self.as_secret = self.as_secret_var.get().strip()
+        try:
+            self.max_trade_volume = float(self.max_vol_var.get())
+        except ValueError:
+            self.max_trade_volume = 100
+        try:
+            self.per_trade_usdt = float(self.per_trade_var.get())
+        except ValueError:
+            self.per_trade_usdt = 10
+        try:
+            self.trade_leverage = int(self.leverage_var.get())
+        except ValueError:
+            self.trade_leverage = 3
+        try:
+            self.min_basis = float(self.min_basis_var.get())
+        except ValueError:
+            self.min_basis = 1.0
+
+        cfg = load_config()
+        cfg.update({
+            "bn_api_key": self.bn_api_key,
+            "bn_secret": self.bn_secret,
+            "as_api_key": self.as_api_key,
+            "as_secret": self.as_secret,
+            "max_trade_volume": self.max_trade_volume,
+            "per_trade_usdt": self.per_trade_usdt,
+            "trade_leverage": self.trade_leverage,
+            "min_basis": self.min_basis,
+        })
+        save_config(cfg)
+        self._trade_log("Config saved")
+
+    def _toggle_auto_trade(self):
+        if self.auto_trade_enabled:
+            # Disable
+            self.auto_trade_enabled = False
+            self.auto_trade_btn.config(text="Enable Auto Trade")
+            self._trade_log("Auto trade DISABLED")
+            self._update_trade_status()
+            # Disconnect clients
+            if self.bn_client or self.as_client:
+                self._run_async(self._disconnect_clients())
+        else:
+            # Validate keys
+            bn_key = self.bn_key_var.get().strip()
+            bn_sec = self.bn_secret_var.get().strip()
+            as_key = self.as_key_var.get().strip()
+            as_sec = self.as_secret_var.get().strip()
+            if not bn_key or not bn_sec or not as_key or not as_sec:
+                messagebox.showerror("Error", "Fill all API keys before enabling auto trade")
+                return
+            try:
+                self.max_trade_volume = float(self.max_vol_var.get())
+            except ValueError:
+                self.max_trade_volume = 100
+            try:
+                self.per_trade_usdt = float(self.per_trade_var.get())
+            except ValueError:
+                self.per_trade_usdt = 10
+            try:
+                self.trade_leverage = int(self.leverage_var.get())
+            except ValueError:
+                self.trade_leverage = 3
+            try:
+                self.min_basis = float(self.min_basis_var.get())
+            except ValueError:
+                self.min_basis = 1.0
+
+            self.bn_api_key = bn_key
+            self.bn_secret = bn_sec
+            self.as_api_key = as_key
+            self.as_secret = as_sec
+
+            self._trade_log("Connecting to exchanges...")
+            self.auto_trade_btn.config(state=tk.DISABLED)
+            future = self._run_async(self._connect_clients())
+            if future:
+                self.root.after(200, lambda: self._check_connect_result(future))
+
+    async def _connect_clients(self):
+        bn_config = BinanceConfig(api_key=self.bn_api_key, secret_key=self.bn_secret, testnet=False)
+        as_config = AsterdexConfig(api_key=self.as_api_key, secret_key=self.as_secret)
+        self.bn_client = BinanceClient(bn_config)
+        self.as_client = AsterClient(as_config)
+
+        # Create sessions and test connectivity (skip WS)
+        self.bn_client._session = aiohttp.ClientSession()
+        self.as_client._session = aiohttp.ClientSession()
+        bn_bal = await self.bn_client.get_balance()
+        as_bal = await self.as_client.get_balance()
+        return bn_bal, as_bal
+
+    async def _disconnect_clients(self):
+        if self.bn_client and self.bn_client._session:
+            await self.bn_client._session.close()
+            self.bn_client = None
+        if self.as_client and self.as_client._session:
+            await self.as_client._session.close()
+            self.as_client = None
+
+    def _check_connect_result(self, future):
+        if not future.done():
+            self.root.after(200, lambda: self._check_connect_result(future))
+            return
+        self.auto_trade_btn.config(state=tk.NORMAL)
+        try:
+            bn_bal, as_bal = future.result()
+            self.auto_trade_enabled = True
+            self.auto_trade_btn.config(text="Disable Auto Trade")
+            self._trade_log(f"Connected! BN: {bn_bal.available:.2f} USDT | AS: {as_bal.available:.2f} USDT")
+            self._update_trade_status()
+        except Exception as e:
+            self._trade_log(f"Connection FAILED: {e}")
+            self._run_async(self._disconnect_clients())
+
+    def _update_trade_status(self):
+        status = "ON" if self.auto_trade_enabled else "OFF"
+        color = "#00aa00" if self.auto_trade_enabled else "gray"
+        total_layers = sum(p["layers"] for p in self.auto_trade_positions.values())
+        self.trade_status_label.config(
+            text=f"Status: {status} | Exposure: {self.auto_trade_exposure:.0f}/{self.max_trade_volume:.0f} USDT | Pairs: {len(self.auto_trade_positions)} | Layers: {total_layers}",
+            foreground=color
+        )
+
+    def _trade_log(self, msg):
+        def update():
+            self.trade_log_text.config(state="normal")
+            self.trade_log_text.insert("end", f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+            self.trade_log_text.see("end")
+            self.trade_log_text.config(state="disabled")
+        if threading.current_thread() is threading.main_thread():
+            update()
+        else:
+            self.root.after(0, update)
+
+    def _check_auto_trade(self):
+        """Check and execute auto trades if conditions are met"""
+        if not self.auto_trade_enabled:
+            return
+        if self.auto_trade_exposure >= self.max_trade_volume:
+            return
+
+        # Find candidates: mark basis > 0.8% AND funding alignment
+        candidates = []
+        for sym in self.common_symbols:
+            bn = self.binance_data.get(sym)
+            ast = self.aster_data.get(sym)
+            if not bn or not ast:
+                continue
+
+            bn_price = bn["mark_price"]
+            as_price = ast["mark_price"]
+            if bn_price <= 0 or as_price <= 0:
+                continue
+
+            mark_basis = ((as_price - bn_price) / bn_price) * 100
+            if abs(mark_basis) > 10:
+                continue
+
+            # Funding alignment check (normalized to 4h)
+            _, _, fr_diff = self._get_normalized_fr(sym)
+            if mark_basis * fr_diff <= 0:
+                continue
+
+            if abs(mark_basis) < self.min_basis * 0.8:
+                continue
+
+            # If already have position in this symbol, only add if basis is still strong (> 1.2%)
+            if sym in self.auto_trade_positions:
+                existing = self.auto_trade_positions[sym]
+                # Don't add if direction changed
+                if (mark_basis >= 0 and existing["rec_long"] != "binance") or \
+                   (mark_basis < 0 and existing["rec_long"] != "aster"):
+                    continue
+                # Only DCA if basis is still strong
+                if abs(mark_basis) < self.min_basis * 1:
+                    continue
+
+            candidates.append((sym, mark_basis, fr_diff))
+
+        if not candidates:
+            return
+
+        # Sort by mark basis (strongest first)
+        candidates.sort(key=lambda x: abs(x[1]), reverse=True)
+        future = self._run_async(self._process_auto_trade_candidates(candidates))
+        if future:
+            future.add_done_callback(lambda f: self.root.after(0, self._update_trade_status))
+
+    async def _process_auto_trade_candidates(self, candidates):
+        """Fetch order books and trade if executable basis > 1%"""
+        for sym, mark_basis, fr_diff in candidates:
+            if self.auto_trade_exposure >= self.max_trade_volume:
+                break
+
+            try:
+                bn_book, as_book = await fetch_order_books(sym)
+
+                bn_ask = bn_book["asks"][0][0] if bn_book["asks"] else 0
+                as_bid = as_book["bids"][0][0] if as_book["bids"] else 0
+                bn_bid = bn_book["bids"][0][0] if bn_book["bids"] else 0
+                as_ask = as_book["asks"][0][0] if as_book["asks"] else 0
+
+                if mark_basis >= 0:
+                    exec_basis = ((as_bid - bn_ask) / bn_ask * 100) if bn_ask > 0 else 0
+                    rec_long, rec_short = "binance", "aster"
+                    ref_price = (bn_ask + as_bid) / 2
+                else:
+                    exec_basis = ((bn_bid - as_ask) / as_ask * 100) if as_ask > 0 else 0
+                    rec_long, rec_short = "aster", "binance"
+                    ref_price = (as_ask + bn_bid) / 2
+
+                if exec_basis < self.min_basis:
+                    continue
+
+                self._trade_log(f"Signal: {sym} exec_basis={exec_basis:+.4f}% fr_diff={fr_diff*100:+.4f}%")
+                await self._execute_auto_trade(sym, rec_long, rec_short, ref_price, exec_basis)
+
+            except Exception as e:
+                self._trade_log(f"Error checking {sym}: {e}")
+
+    async def _execute_auto_trade(self, symbol, rec_long, rec_short, price, exec_basis):
+        """Execute hedged auto trade"""
+        per_side = self.per_trade_usdt
+        leverage = self.trade_leverage
+        quantity = per_side / price
+
+        # Round quantity using exchange precision
+        precision = self.qty_precisions.get(symbol, 0)
+        quantity = round(quantity, precision)
+        if precision == 0:
+            quantity = int(quantity)
+
+        if quantity <= 0:
+            self._trade_log(f"Skip {symbol}: quantity too small")
+            return
+
+        long_client = self.bn_client if rec_long == "binance" else self.as_client
+        short_client = self.bn_client if rec_short == "binance" else self.as_client
+
+        is_add = symbol in self.auto_trade_positions
+        action = "ADD" if is_add else "OPEN"
+        self._trade_log(f"{action} {symbol}: LONG {rec_long.upper()} / SHORT {rec_short.upper()} | qty={quantity} | ~{per_side} USDT/side")
+
+        try:
+            # Set leverage
+            await asyncio.gather(
+                long_client.set_leverage(symbol, leverage),
+                short_client.set_leverage(symbol, leverage)
+            )
+
+            # Place orders concurrently
+            long_order, short_order = await asyncio.gather(
+                long_client.place_market_order(symbol, Side.LONG, quantity),
+                short_client.place_market_order(symbol, Side.SHORT, quantity)
+            )
+
+            added_notional = per_side * 2  # 10 x 2 sides = 20 USDT
+
+            if is_add:
+                # DCA: update existing position
+                info = self.auto_trade_positions[symbol]
+                old_notional = info["total_notional"]
+                info["entry_basis"] = (info["entry_basis"] * old_notional + exec_basis * added_notional) / (old_notional + added_notional)
+                info["total_notional"] += added_notional
+                info["layers"] += 1
+            else:
+                # New position
+                self.auto_trade_positions[symbol] = {
+                    "entry_basis": exec_basis,
+                    "rec_long": rec_long,
+                    "rec_short": rec_short,
+                    "total_notional": added_notional,
+                    "layers": 1,
+                    "entry_time": time.time(),
+                }
+
+            self.auto_trade_exposure += added_notional
+            layers = self.auto_trade_positions[symbol]["layers"]
+            self._trade_log(f"OK {symbol} [L{layers}] | Long: {long_order.filled_size} @ {long_order.avg_price} | Short: {short_order.filled_size} @ {short_order.avg_price}")
+
+            # Telegram notification
+            if self.tg_enabled and self.tg_token and self.tg_chat_id:
+                msg = (f"<b>Auto Trade {action}</b>\n"
+                       f"{symbol} [Layer {layers}]: LONG {rec_long.upper()} / SHORT {rec_short.upper()}\n"
+                       f"Qty: {quantity} | ~{per_side} USDT/side | Lev: x{leverage}\n"
+                       f"Basis: {exec_basis:+.4f}%")
+                await send_telegram_message(self.tg_token, self.tg_chat_id, msg)
+
+        except Exception as e:
+            self._trade_log(f"FAILED {symbol}: {e}")
+
+    # ── Auto Close ─────────────────────────────────────────────
     # ── Order Book Detail ─────────────────────────────────────
     def _on_basis_double_click(self, event):
         sel = self.basis_tree.selection()
@@ -737,10 +1155,8 @@ class BasisCheckerApp:
         as_mark = as_data.get("mark_price", 0)
         mark_basis = ((as_mark - bn_mark) / bn_mark * 100) if bn_mark > 0 else 0
 
-        # Funding
-        bn_fr = bn_data.get("last_funding", 0) * 100
-        as_fr = as_data.get("last_funding", 0) * 100
-        fr_diff = as_fr - bn_fr
+        # Funding (normalized to 4h)
+        bn_fr, as_fr, fr_diff = self._get_normalized_fr(symbol)
 
         # Individual spreads
         bn_spread = ((bn_ask - bn_bid) / bn_bid * 100) if bn_bid > 0 else 0
@@ -785,11 +1201,11 @@ class BasisCheckerApp:
         else:
             t.insert("end", f"  X  Executable basis negative ({exec_basis:+.4f}%) - spread eats profit\n", "red")
 
-        # Funding alignment
+        # Funding alignment (4h normalized)
         if mark_basis * fr_diff > 0:
-            t.insert("end", f"  OK  Funding ({fr_diff:+.4f}%) supports basis - ALIGNED", "green")
+            t.insert("end", f"  OK  Funding/4h ({fr_diff:+.4f}%) supports basis - ALIGNED", "green")
         elif mark_basis * fr_diff < 0:
-            t.insert("end", f"  X  Funding ({fr_diff:+.4f}%) opposes basis", "red")
+            t.insert("end", f"  X  Funding/4h ({fr_diff:+.4f}%) opposes basis", "red")
         else:
             t.insert("end", f"  ~  Funding diff is zero or basis is zero")
 
@@ -802,6 +1218,9 @@ class BasisCheckerApp:
 
     def _on_close(self):
         self.running = False
+        self.auto_trade_enabled = False
+        if self.bn_client or self.as_client:
+            self._run_async(self._disconnect_clients())
         if self.loop:
             self.loop.call_soon_threadsafe(self.loop.stop)
         self.root.destroy()
