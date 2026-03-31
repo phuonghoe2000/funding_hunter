@@ -3,6 +3,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+
+# Build artifacts
+*.exe
+*.spec
+*.zip
+build/
+dist/
 .Python
 venv/
 ENV/
