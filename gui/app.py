@@ -20,18 +20,15 @@ from core.gui_service import GUIWorkflowService
 
 try:
     from gui.close_controller import (
+        calculate_and_show_final_pnl as controller_calculate_and_show_final_pnl,
         cancel_close_process as controller_cancel_close_process,
         close_position as controller_close_position,
         execute_close_workflow as controller_execute_close_workflow,
         on_close_complete as controller_on_close_complete,
         reset_close_button as controller_reset_close_button,
     )
-    from gui.display_formatters import (
-        build_final_pnl_report_lines,
-        build_funding_table_rows,
-        build_pair_snapshot_display,
-    )
-    from gui.exchange_display import from_display_name, parse_recommendation_display_names
+    from gui.display_formatters import build_funding_table_rows
+    from gui.exchange_display import parse_recommendation_display_names
     from gui.layout import create_widgets as build_widgets
     from gui.monitor_controller import (
         check_funding_reversal as controller_check_funding_reversal,
@@ -52,25 +49,31 @@ try:
         service_check_and_open as controller_service_check_and_open,
         start_analyze_for_open as controller_start_analyze_for_open,
     )
+    from gui.pair_info_controller import (
+        do_update_usdt_volume as controller_do_update_usdt_volume,
+        fetch_pair_prices_for_display as controller_fetch_pair_prices_for_display,
+        update_pair_info as controller_update_pair_info,
+        update_pair_price_info as controller_update_pair_price_info,
+        update_price_display as controller_update_price_display,
+        update_usdt_volume as controller_update_usdt_volume,
+    )
     from gui.position_loader import (
         find_hedged_pairs as build_hedged_pairs,
         load_hedged_position as load_existing_hedged_position,
+        scan_existing_positions as controller_scan_existing_positions,
         show_position_selector as show_existing_position_selector,
     )
 except ImportError:
     from close_controller import (
+        calculate_and_show_final_pnl as controller_calculate_and_show_final_pnl,
         cancel_close_process as controller_cancel_close_process,
         close_position as controller_close_position,
         execute_close_workflow as controller_execute_close_workflow,
         on_close_complete as controller_on_close_complete,
         reset_close_button as controller_reset_close_button,
     )
-    from display_formatters import (
-        build_final_pnl_report_lines,
-        build_funding_table_rows,
-        build_pair_snapshot_display,
-    )
-    from exchange_display import from_display_name, parse_recommendation_display_names
+    from display_formatters import build_funding_table_rows
+    from exchange_display import parse_recommendation_display_names
     from layout import create_widgets as build_widgets
     from monitor_controller import (
         check_funding_reversal as controller_check_funding_reversal,
@@ -91,9 +94,18 @@ except ImportError:
         service_check_and_open as controller_service_check_and_open,
         start_analyze_for_open as controller_start_analyze_for_open,
     )
+    from pair_info_controller import (
+        do_update_usdt_volume as controller_do_update_usdt_volume,
+        fetch_pair_prices_for_display as controller_fetch_pair_prices_for_display,
+        update_pair_info as controller_update_pair_info,
+        update_pair_price_info as controller_update_pair_price_info,
+        update_price_display as controller_update_price_display,
+        update_usdt_volume as controller_update_usdt_volume,
+    )
     from position_loader import (
         find_hedged_pairs as build_hedged_pairs,
         load_hedged_position as load_existing_hedged_position,
+        scan_existing_positions as controller_scan_existing_positions,
         show_position_selector as show_existing_position_selector,
     )
 
@@ -153,7 +165,7 @@ def sync_windows_time() -> tuple[bool, str]:
     except Exception as e:
         return False, f"❌ Lỗi sync time: {e}"
 
-from config.constants import Exchange, get_exchange_symbol
+from config.constants import Exchange
 logger = logging.getLogger(__name__)
 
 # Config file path
@@ -789,71 +801,9 @@ class FundingHunterGUI:
         return controller_execute_close_workflow(self)
 
     def _load_existing_positions(self):
-        """Load existing positions from exchanges and allow monitoring/closing them"""
-        if not self.connected:
-            messagebox.showerror("Error", "Not connected to exchanges")
-            return
-        
-        self._log("🔍 Scanning for existing positions on all exchanges...")
-        self.load_pos_btn.config(state=tk.DISABLED)
-        
-        async def scan_positions():
-            all_positions = await self.manager.scan_all_positions()
-            return all_positions
-        
-        def on_scan_complete(future):
-            def update_ui():
-                self.load_pos_btn.config(state=tk.NORMAL)
-                try:
-                    all_positions = future.result(timeout=0.5)
-                    
-                    # Collect all positions
-                    positions_found = []
-                    for exchange, positions in all_positions.items():
-                        for pos in positions:
-                            positions_found.append({
-                                "exchange": exchange,
-                                "symbol": pos.symbol,
-                                "side": pos.side,
-                                "size": pos.size,
-                                "entry_price": pos.entry_price,
-                                "unrealized_pnl": pos.unrealized_pnl,
-                                "leverage": pos.leverage
-                            })
-                    
-                    if not positions_found:
-                        self._log("📭 No existing positions found on any exchange")
-                        messagebox.showinfo("Load Positions", "No existing positions found")
-                        return
-                    
-                    # Log found positions
-                    self._log(f"📦 Found {len(positions_found)} position(s):")
-                    for p in positions_found:
-                        self._log(f"   • {p['exchange'].value}: {p['symbol']} {p['side'].value.upper()} "
-                                  f"Size: {p['size']} PnL: ${p['unrealized_pnl']:.2f}")
-                    
-                    # Try to match hedged pairs (same symbol on different exchanges with opposite sides)
-                    hedged_pairs = self._find_hedged_pairs(positions_found)
-                    
-                    if hedged_pairs:
-                        self._log(f"🔗 Found {len(hedged_pairs)} potential hedged pair(s)")
-                        # Let user select which pair to load
-                        self._show_position_selector(hedged_pairs, positions_found)
-                    else:
-                        self._log("⚠️ No matching hedged pairs found. Positions may be one-sided.")
-                        # Still show positions for manual selection
-                        self._show_position_selector([], positions_found)
-                        
-                except Exception as e:
-                    self._log(f"❌ Error scanning positions: {e}")
-                    logger.error(f"Error in scan_positions: {e}")
-            
-            self.root.after(0, update_ui)
-        
-        future = self._run_async(scan_positions())
-        if future:
-            future.add_done_callback(on_scan_complete)
-    
+        """Load existing positions from exchanges and allow monitoring/closing them."""
+        return controller_scan_existing_positions(self)
+
     def _find_hedged_pairs(self, positions):
         """Find matching hedged pairs from position list."""
         return build_hedged_pairs(positions)
@@ -871,77 +821,9 @@ class FundingHunterGUI:
         return controller_on_close_complete(self, future)
 
     def _calculate_and_show_final_pnl(self, closed_position: Dict[str, Any]):
-        """Calculate and display final PnL after closing position via API history"""
-        long_ex = closed_position.get('long_exchange')
-        short_ex = closed_position.get('short_exchange')
-        pair = closed_position.get('pair', 'Unknown')
-        open_time = closed_position.get('open_time')
-        
-        async def calculate_pnl():
-            # Calculate 'since' timestamp in milliseconds, subtracting 1 minute for safety padding
-            since = None
-            if open_time:
-                since = int(open_time.timestamp() * 1000) - 60000
-                
-            long_client = self.manager.clients.get(long_ex)
-            short_client = self.manager.clients.get(short_ex)
-            
-            long_pnl_data = {"realized_pnl": 0, "commission": 0, "funding_fee": 0, "net_pnl": 0}
-            short_pnl_data = {"realized_pnl": 0, "commission": 0, "funding_fee": 0, "net_pnl": 0}
-            
-            if long_client:
-                # Need to use specific symbol mapping for the exchange if necessary
-                # Fortunately get_closed_pnl handles this internally using the base symbol
-                try:
-                    long_pnl_data = await long_client.get_closed_pnl(pair, since)
-                except Exception as e:
-                    logger.error(f"Error getting long PnL from {long_ex.value}: {e}")
-                    
-            if short_client:
-                try:
-                    short_pnl_data = await short_client.get_closed_pnl(pair, since)
-                except Exception as e:
-                    logger.error(f"Error getting short PnL from {short_ex.value}: {e}")
-            
-            total_realized_pnl = long_pnl_data["realized_pnl"] + short_pnl_data["realized_pnl"]
-            total_commission = long_pnl_data["commission"] + short_pnl_data["commission"]
-            total_funding = long_pnl_data["funding_fee"] + short_pnl_data["funding_fee"]
-            total_net_pnl = long_pnl_data["net_pnl"] + short_pnl_data["net_pnl"]
-            
-            return {
-                "pair": pair,
-                "long_ex": long_ex,
-                "short_ex": short_ex,
-                "long": long_pnl_data,
-                "short": short_pnl_data,
-                "total": {
-                    "realized_pnl": total_realized_pnl,
-                    "commission": total_commission,
-                    "funding_fee": total_funding,
-                    "net_pnl": total_net_pnl
-                }
-            }
-        
-        def on_pnl_calculated(future):
-            def show_result():
-                try:
-                    result = future.result(timeout=15)
-                    if result:
-                        for line in build_final_pnl_report_lines(result):
-                            self._log(line)
-                        self.balance_before_open = {}
-                    else:
-                        self._log("Could not calculate final PnL")
-                except Exception as e:
-                    self._log(f"Error calculating PnL: {e}")
-            
-            self.root.after(0, show_result)
-        
-        # Run async calculation
-        future = self._run_async(calculate_pnl())
-        if future:
-            future.add_done_callback(on_pnl_calculated)
-    
+        """Calculate and display final PnL after closing position via API history."""
+        return controller_calculate_and_show_final_pnl(self, closed_position)
+
     def _start_monitoring(self):
         """Start position monitoring."""
         return controller_start_monitoring(self)
@@ -1074,177 +956,29 @@ class FundingHunterGUI:
         self._update_usdt_volume()
     
     def _update_usdt_volume(self, event=None):
-        """Update USDT volume display based on size and current price"""
-        # Cancel any pending update to prevent spam
-        if hasattr(self, '_usdt_update_pending') and self._usdt_update_pending:
-            self.root.after_cancel(self._usdt_update_pending)
-            self._usdt_update_pending = None
-        
-        # Debounce - wait 500ms before actually fetching
-        self._usdt_update_pending = self.root.after(500, self._do_update_usdt_volume)
-    
+        """Update USDT volume display based on size and current price."""
+        return controller_update_usdt_volume(self, event)
+
     def _do_update_usdt_volume(self):
-        """Actually update USDT volume (debounced)"""
-        self._usdt_update_pending = None
-        
-        try:
-            size = float(self.size_entry.get())
-        except (ValueError, AttributeError):
-            self.usdt_vol_label.config(text="≈ $0.00 USDT")
-            return
-        
-        # Get cached price from any connected exchange
-        pair = self.pair_combo.get()
-        if not pair or not self.connected:
-            self.usdt_vol_label.config(text="≈ $?.?? USDT")
-            return
-        
-        # Fetch price async
-        async def get_price():
-            for exchange, client in self.manager.clients.items():
-                try:
-                    symbol = get_exchange_symbol(pair, exchange)
-                    price = await client.get_mark_price(symbol)
-                    return price
-                except:
-                    continue
-            return None
-        
-        def on_price(future):
-            try:
-                price = future.result()
-                if price:
-                    usdt_value = size * price
-                    self.root.after(0, lambda: self.usdt_vol_label.config(
-                        text=f"≈ ${usdt_value:,.2f} USDT",
-                        foreground="green" if usdt_value >= 10 else "orange"
-                    ))
-                else:
-                    self.root.after(0, lambda: self.usdt_vol_label.config(text="≈ $?.?? USDT"))
-            except:
-                pass
-        
-        future = self._run_async(get_price())
-        if future:
-            future.add_done_callback(on_price)
-    
+        """Actually update USDT volume (debounced)."""
+        return controller_do_update_usdt_volume(self)
+
     def _update_pair_info(self):
-        """Update pair information display with real-time prices and timing"""
-        pair = self.pair_combo.get()
-        if not pair or not self.connected:
-            return
-        
-        # Get current exchanges selection
-        long_display = self.long_exchange.get()
-        short_display = self.short_exchange.get()
-        
-        if not long_display or not short_display:
-            self.selected_pair_info.config(text="Please select both LONG and SHORT exchanges", foreground="gray")
-            return
-        
-        long_ex = from_display_name(long_display)
-        short_ex = from_display_name(short_display)
-        
-        if not long_ex or not short_ex:
-            return
-        
-        # Fetch real-time prices from the two selected exchanges
-        self._fetch_pair_prices_for_display(pair, long_ex, short_ex, long_display, short_display)
-    
-    def _fetch_pair_prices_for_display(self, pair: str, long_ex: Exchange, short_ex: Exchange, 
-                                        long_display: str, short_display: str):
-        """Fetch real-time prices for the two selected exchanges and update display"""
-        async def async_get_snapshot():
-            return await self.service.get_pair_snapshot(pair, long_ex, short_ex)
+        """Update pair information display with real-time prices and timing."""
+        return controller_update_pair_info(self)
 
-        def on_snapshot_complete(future):
-            try:
-                snapshot = future.result(timeout=0.1)
-                result_data = snapshot.get("result_data", {})
-
-                if len(result_data) < 2:
-                    self.root.after(0, lambda: self.selected_pair_info.config(
-                        text="Could not fetch prices from selected exchanges",
-                        foreground="red",
-                    ))
-                    return
-                info_text, entry_color = build_pair_snapshot_display(
-                    pair=pair,
-                    snapshot=snapshot,
-                    long_ex=long_ex,
-                    short_ex=short_ex,
-                    long_display=long_display,
-                    short_display=short_display,
-                )
-                self.root.after(0, lambda: self.selected_pair_info.config(
-                    text=info_text,
-                    foreground=entry_color,
-                    font=('Courier', 9),
-                ))
-
-                if not self.active_position:
-                    self._pair_info_update_task = self.root.after(2000, self._update_pair_info)
-
-            except asyncio.TimeoutError:
-                logger.warning("Timeout in on_complete getting future result")
-            except Exception as e:
-                logger.error(f"Error updating pair info: {e}")
-
-        future = self._run_async(async_get_snapshot())
-        if future:
-            future.add_done_callback(on_snapshot_complete)
+    def _fetch_pair_prices_for_display(self, pair: str, long_ex: Exchange, short_ex: Exchange, long_display: str, short_display: str):
+        """Fetch real-time prices for the two selected exchanges and update display."""
+        return controller_fetch_pair_prices_for_display(self, pair, long_ex, short_ex, long_display, short_display)
 
     def _update_pair_price_info(self, pair: str, recommendation: str = ""):
-        """Fetch and display current price information for the selected pair"""
-        if not self.connected:
-            return
-        
-        async def async_get_price():
-            prices = {}
-            
-            # Get price from each connected exchange
-            for exchange, client in self.manager.clients.items():
-                try:
-                    symbol = get_exchange_symbol(pair, exchange)
-                    mark_price = await client.get_mark_price(symbol)
-                    prices[exchange] = mark_price
-                except Exception as e:
-                    logger.debug(f"Could not get price from {exchange.value}: {e}")
-            
-            return prices
-        
-        def on_complete(future):
-            try:
-                prices = future.result()
-                if prices:
-                    # Display average price or price from available exchanges
-                    price_list = list(prices.values())
-                    avg_price = sum(price_list) / len(price_list)
-                    
-                    # Build price info string
-                    price_info = f"💲 ${avg_price:,.6f}"
-                    
-                    # Show individual exchange prices
-                    price_details = " | ".join([f"{ex.value}: ${p:,.6f}" for ex, p in prices.items()])
-                    
-                    self.root.after(0, self._update_price_display, price_info, price_details)
-                else:
-                    self.root.after(0, self._update_price_display, "", "")
-            except Exception as e:
-                logger.error(f"Error getting prices: {e}")
-                self.root.after(0, self._update_price_display, "", "")
-        
-        future = self._run_async(async_get_price())
-        if future:
-            future.add_done_callback(on_complete)
-    
-    def _update_price_display(self, price_info: str, price_details: str):
-        """Update the price display labels"""
-        self.current_price_label.config(text=price_info)
-        if price_details:
-            self._log(f"📊 Current prices: {price_details}")
+        """Fetch and display current price information for the selected pair."""
+        return controller_update_pair_price_info(self, pair, recommendation)
 
-    
+    def _update_price_display(self, price_info: str, price_details: str):
+        """Update the price display labels."""
+        return controller_update_price_display(self, price_info, price_details)
+
     def _log(self, message: str):
         """Log message"""
         logger.info(message)

@@ -3,6 +3,7 @@ Helpers for loading existing positions into the GUI.
 """
 
 from datetime import datetime, timedelta, timezone
+import logging
 from typing import Any, Optional
 
 import tkinter as tk
@@ -14,6 +15,74 @@ try:
     from gui.exchange_display import to_display_name
 except ImportError:
     from exchange_display import to_display_name
+
+
+logger = logging.getLogger(__name__)
+
+
+def scan_existing_positions(app: Any) -> None:
+    """Scan connected exchanges for open positions and show a load dialog."""
+    if not app.connected:
+        messagebox.showerror("Error", "Not connected to exchanges")
+        return
+
+    app._log("Scanning for existing positions on all exchanges...")
+    app.load_pos_btn.config(state=tk.DISABLED)
+
+    async def scan_positions():
+        return await app.manager.scan_all_positions()
+
+    def on_scan_complete(future: Any) -> None:
+        def update_ui() -> None:
+            app.load_pos_btn.config(state=tk.NORMAL)
+            try:
+                all_positions = future.result(timeout=0.5)
+
+                positions_found: list[dict[str, Any]] = []
+                for exchange, positions in all_positions.items():
+                    for position in positions:
+                        positions_found.append(
+                            {
+                                "exchange": exchange,
+                                "symbol": position.symbol,
+                                "side": position.side,
+                                "size": position.size,
+                                "entry_price": position.entry_price,
+                                "unrealized_pnl": position.unrealized_pnl,
+                                "leverage": position.leverage,
+                            }
+                        )
+
+                if not positions_found:
+                    app._log("No existing positions found on any exchange")
+                    messagebox.showinfo("Load Positions", "No existing positions found")
+                    return
+
+                app._log(f"Found {len(positions_found)} position(s):")
+                for position in positions_found:
+                    app._log(
+                        f"   - {position['exchange'].value}: {position['symbol']} "
+                        f"{position['side'].value.upper()} Size: {position['size']} "
+                        f"PnL: ${position['unrealized_pnl']:.2f}"
+                    )
+
+                hedged_pairs = app._find_hedged_pairs(positions_found)
+                if hedged_pairs:
+                    app._log(f"Found {len(hedged_pairs)} potential hedged pair(s)")
+                    app._show_position_selector(hedged_pairs, positions_found)
+                    return
+
+                app._log("No matching hedged pairs found. Positions may be one-sided.")
+                app._show_position_selector([], positions_found)
+            except Exception as exc:
+                app._log(f"Error scanning positions: {exc}")
+                logger.error("Error scanning existing positions: %s", exc)
+
+        app.root.after(0, update_ui)
+
+    future = app._run_async(scan_positions())
+    if future:
+        future.add_done_callback(on_scan_complete)
 
 
 def find_hedged_pairs(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -2,11 +2,17 @@
 Close workflow helpers for the GUI.
 """
 
+import asyncio
 import logging
 import threading
 import tkinter as tk
 from tkinter import messagebox
 from typing import Any
+
+try:
+    from gui.display_formatters import build_final_pnl_report_lines
+except ImportError:
+    from display_formatters import build_final_pnl_report_lines
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +175,7 @@ def on_close_complete(app: Any, future: Any) -> None:
                 app._clear_position_display()
 
                 if closed_position:
-                    app._calculate_and_show_final_pnl(closed_position)
+                    calculate_and_show_final_pnl(app, closed_position)
 
                 if getattr(app, "auto_trading_active", False):
                     app._log("Auto Trading: resuming signal scan...")
@@ -180,3 +186,70 @@ def on_close_complete(app: Any, future: Any) -> None:
             app._log(f"Error: {exc}")
 
     app.root.after(0, update_ui)
+
+
+def calculate_and_show_final_pnl(app: Any, closed_position: dict[str, Any]) -> None:
+    """Calculate and display final PnL after a position is closed."""
+    long_exchange = closed_position.get("long_exchange")
+    short_exchange = closed_position.get("short_exchange")
+    pair = closed_position.get("pair", "Unknown")
+    open_time = closed_position.get("open_time")
+
+    async def calculate_pnl():
+        since = None
+        if open_time:
+            since = int(open_time.timestamp() * 1000) - 60000
+
+        long_client = app.manager.clients.get(long_exchange)
+        short_client = app.manager.clients.get(short_exchange)
+
+        long_pnl_data = {"realized_pnl": 0, "commission": 0, "funding_fee": 0, "net_pnl": 0}
+        short_pnl_data = {"realized_pnl": 0, "commission": 0, "funding_fee": 0, "net_pnl": 0}
+
+        if long_client:
+            try:
+                long_pnl_data = await long_client.get_closed_pnl(pair, since)
+            except Exception as exc:
+                logger.error("Error getting long PnL from %s: %s", long_exchange.value, exc)
+
+        if short_client:
+            try:
+                short_pnl_data = await short_client.get_closed_pnl(pair, since)
+            except Exception as exc:
+                logger.error("Error getting short PnL from %s: %s", short_exchange.value, exc)
+
+        return {
+            "pair": pair,
+            "long_ex": long_exchange,
+            "short_ex": short_exchange,
+            "long": long_pnl_data,
+            "short": short_pnl_data,
+            "total": {
+                "realized_pnl": long_pnl_data["realized_pnl"] + short_pnl_data["realized_pnl"],
+                "commission": long_pnl_data["commission"] + short_pnl_data["commission"],
+                "funding_fee": long_pnl_data["funding_fee"] + short_pnl_data["funding_fee"],
+                "net_pnl": long_pnl_data["net_pnl"] + short_pnl_data["net_pnl"],
+            },
+        }
+
+    def on_pnl_calculated(future: Any) -> None:
+        def show_result() -> None:
+            try:
+                result = future.result(timeout=15)
+                if result:
+                    for line in build_final_pnl_report_lines(result):
+                        app._log(line)
+                    app.balance_before_open = {}
+                    return
+
+                app._log("Could not calculate final PnL")
+            except asyncio.TimeoutError:
+                app._log("Timed out while calculating final PnL")
+            except Exception as exc:
+                app._log(f"Error calculating PnL: {exc}")
+
+        app.root.after(0, show_result)
+
+    future = app._run_async(calculate_pnl())
+    if future:
+        future.add_done_callback(on_pnl_calculated)
