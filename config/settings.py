@@ -181,34 +181,55 @@ class Settings:
         # Gate.io
         self.gate.api_key = os.getenv("GATE_API_KEY", "")
         self.gate.secret_key = os.getenv("GATE_SECRET_KEY", "")
+        self.gate.testnet = os.getenv("GATE_TESTNET", "false").lower() == "true"
         
         # Asterdex
         self.asterdex.api_key = os.getenv("ASTERDEX_API_KEY", "")
         self.asterdex.secret_key = os.getenv("ASTERDEX_SECRET_KEY", "")
+        self.asterdex.testnet = os.getenv("ASTERDEX_TESTNET", "false").lower() == "true"
+
+        # Bybit
+        self.bybit.api_key = os.getenv("BYBIT_API_KEY", "")
+        self.bybit.secret_key = os.getenv("BYBIT_SECRET_KEY", "")
+        self.bybit.testnet = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
         
         # Trading
         self.trading.default_leverage = int(os.getenv("DEFAULT_LEVERAGE", "10"))
         self.trading.auto_close_on_liquidation = os.getenv("AUTO_CLOSE_ON_LIQUIDATION", "true").lower() == "true"
     
-    def validate(self) -> tuple[bool, str]:
-        """Validate settings"""
+    def validate(self, min_configured_exchanges: int = 1) -> tuple[bool, str]:
+        """Validate configured exchanges and their required credentials."""
         errors = []
-        
-        if not self.okx.api_key:
-            errors.append("OKX API Key is required")
-        if not self.okx.secret_key:
-            errors.append("OKX Secret Key is required")
-        if not self.okx.passphrase:
-            errors.append("OKX Passphrase is required")
-            
-        if not self.binance.api_key:
-            errors.append("Binance API Key is required")
-        if not self.binance.secret_key:
-            errors.append("Binance Secret Key is required")
-        
+        configured = []
+
+        exchange_fields = [
+            ("OKX", self.okx, [("api_key", "API Key"), ("secret_key", "Secret Key"), ("passphrase", "Passphrase")]),
+            ("Binance", self.binance, [("api_key", "API Key"), ("secret_key", "Secret Key")]),
+            ("BingX", self.bingx, [("api_key", "API Key"), ("secret_key", "Secret Key")]),
+            ("Gate", self.gate, [("api_key", "API Key"), ("secret_key", "Secret Key")]),
+            ("Asterdex", self.asterdex, [("api_key", "API Key"), ("secret_key", "Secret Key")]),
+            ("Bybit", self.bybit, [("api_key", "API Key"), ("secret_key", "Secret Key")]),
+        ]
+
+        for exchange_name, config_obj, required_fields in exchange_fields:
+            if not any(getattr(config_obj, field_name, "") for field_name, _ in required_fields):
+                continue
+
+            missing = [
+                label for field_name, label in required_fields
+                if not getattr(config_obj, field_name, "")
+            ]
+            if missing:
+                errors.append(f"{exchange_name}: missing {', '.join(missing)}")
+            else:
+                configured.append(exchange_name)
+
+        if len(configured) < min_configured_exchanges:
+            errors.append(f"Configure at least {min_configured_exchanges} exchange(s) with full credentials")
+
         if errors:
             return False, "\n".join(errors)
-        return True, "Settings valid"
+        return True, f"Settings valid ({', '.join(configured)})"
 
 
 # Global settings instance

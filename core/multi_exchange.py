@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 import threading
+import statistics
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timezone
 from config.constants import Exchange, get_exchange_symbol, Side
@@ -818,6 +819,10 @@ class MultiExchangeManager:
             "best_spread": None,
             "spreads": [],
             "samples": 0,
+            "avg_spread": None,
+            "median_spread": None,
+            "min_spread": None,
+            "max_spread": None,
             "error": None
         }
         
@@ -898,17 +903,24 @@ class MultiExchangeManager:
         # Sort descending để lấy giá trị cao nhất
         sorted_spreads = sorted(spreads, reverse=True)
         best_spread = sorted_spreads[0]
-        second_best_spread = sorted_spreads[2]
-        
+        second_best_spread = sorted_spreads[1]
+
         result["success"] = True
         result["spreads"] = spreads
         result["samples"] = len(spreads)
         result["best_spread"] = best_spread
         result["second_best_spread"] = second_best_spread
-        
+        result["avg_spread"] = statistics.fmean(spreads)
+        result["median_spread"] = statistics.median(spreads)
+        result["min_spread"] = min(spreads)
+        result["max_spread"] = max(spreads)
+
         log_msg(f"✅ Analyze hoàn thành: {len(spreads)} samples")
         log_msg(f"   Best: {best_spread:.4f}% | Second best: {second_best_spread:.4f}%")
-        log_msg(f"   Min: {min(spreads):.4f}% | Max: {max(spreads):.4f}% | Avg: {sum(spreads)/len(spreads):.4f}%")
+        log_msg(
+            f"   Min: {result['min_spread']:.4f}% | Max: {result['max_spread']:.4f}% | "
+            f"Avg: {result['avg_spread']:.4f}% | Median: {result['median_spread']:.4f}%"
+        )
         
         return result
     

@@ -16,6 +16,7 @@ import subprocess
 import aiohttp
 
 from config.settings import settings
+from core.opportunity import build_best_opportunity, normalize_funding_rate_obj
 
 
 def sync_windows_time() -> tuple[bool, str]:
@@ -685,7 +686,7 @@ class FundingHunterGUI:
             "Asterdex": Exchange.ASTERDEX,
             "Bybit": Exchange.BYBIT,
         }
-        columns = ("Pair", "OKX", "Binance", "BingX", "Gate", "Asterdex", "Bybit", "Best Spread", "Recommendation")
+        columns = ("Pair", "OKX", "Binance", "BingX", "Gate", "Asterdex", "Bybit", "Gross 4H", "Cost", "Net Edge", "Recommendation")
         self.funding_tree = ttk.Treeview(frame, columns=columns, show="headings", height=10)
 
         self.funding_tree.heading("Pair", text="Pair")
@@ -695,7 +696,9 @@ class FundingHunterGUI:
         self.funding_tree.heading("Gate", text="Gate Rate")
         self.funding_tree.heading("Asterdex", text="Aster Rate")
         self.funding_tree.heading("Bybit", text="Bybit Rate")
-        self.funding_tree.heading("Best Spread", text="Best Spread")
+        self.funding_tree.heading("Gross 4H", text="Gross 4H")
+        self.funding_tree.heading("Cost", text="Cost")
+        self.funding_tree.heading("Net Edge", text="Net Edge")
         self.funding_tree.heading("Recommendation", text="Recommendation")
 
         self.funding_tree.column("Pair", width=80)
@@ -705,7 +708,9 @@ class FundingHunterGUI:
         self.funding_tree.column("Gate", width=85)
         self.funding_tree.column("Asterdex", width=85)
         self.funding_tree.column("Bybit", width=85)
-        self.funding_tree.column("Best Spread", width=85)
+        self.funding_tree.column("Gross 4H", width=85)
+        self.funding_tree.column("Cost", width=75)
+        self.funding_tree.column("Net Edge", width=85)
         self.funding_tree.column("Recommendation", width=140)
         
         self.funding_tree.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -3022,11 +3027,8 @@ class FundingHunterGUI:
     def _update_funding_table(self, all_rates):
         """Update funding table - sorted by Best Spread (highest to lowest)
         
-        All rates are normalized to 4h equivalent for fair comparison:
-        - 1h interval: rate * 4
-        - 2h interval: rate * 2  
-        - 4h interval: rate * 1 (baseline)
-        - 8h interval: rate * 0.5
+        All rates are normalized to 4h equivalent for fair comparison.
+        Rows are ranked by fee-adjusted net edge rather than raw funding spread.
         """
         for item in self.funding_tree.get_children():
             self.funding_tree.delete(item)
@@ -3042,34 +3044,20 @@ class FundingHunterGUI:
             """Normalize a funding rate to 4h equivalent"""
             if not rate_obj:
                 return None
-            interval = getattr(rate_obj, 'funding_interval_hours', 8) or 8
-            multiplier = 4.0 / interval
-            return rate_obj.funding_rate * multiplier
-        
-        # Calculate spreads for sorting
+            return normalize_funding_rate_obj(rate_obj)
+
+        # Calculate fee-adjusted opportunities for sorting
         pairs_with_spreads = []
         for pair, rates in all_rates.items():
-            # Collect normalized rate values
-            rate_values = {}
-            for ex_enum in [Exchange.OKX, Exchange.BINANCE, Exchange.BINGX, Exchange.GATE, Exchange.ASTERDEX, Exchange.BYBIT]:
-                if ex_enum in rates:
-                    norm = normalize_to_4h(rates[ex_enum])
-                    if norm is not None:
-                        rate_values[ex_enum] = norm
-
-            # Calculate spread
-            spread_value = 0.0
-            if len(rate_values) >= 2:
-                sorted_rates = sorted(rate_values.values())
-                spread_value = (sorted_rates[-1] - sorted_rates[0]) * 100  # Convert to percentage
-
-            pairs_with_spreads.append((pair, rates, spread_value))
+            metrics = build_best_opportunity(pair, rates)
+            net_edge = metrics.net_edge_pct if metrics else float("-inf")
+            pairs_with_spreads.append((pair, rates, metrics, net_edge))
         
-        # Sort by spread (highest to lowest), show top 10
-        sorted_pairs = sorted(pairs_with_spreads, key=lambda x: x[2], reverse=True)
+        # Sort by net edge (highest to lowest), show top 10
+        sorted_pairs = sorted(pairs_with_spreads, key=lambda x: x[3], reverse=True)
         top_pairs = sorted_pairs[:10]
 
-        for pair, rates, spread_value in top_pairs:
+        for pair, rates, metrics, _ in top_pairs:
             # Normalize each rate for display
             def fmt_rate(ex_enum):
                 rate_obj = rates.get(ex_enum)
@@ -3087,31 +3075,22 @@ class FundingHunterGUI:
             gate_val = fmt_rate(Exchange.GATE)
             aster_val = fmt_rate(Exchange.ASTERDEX)
             bybit_val = fmt_rate(Exchange.BYBIT)
-
-            # Find best spread using normalized rates
-            rate_values = {}
-            for ex_enum in [Exchange.OKX, Exchange.BINANCE, Exchange.BINGX, Exchange.GATE, Exchange.ASTERDEX, Exchange.BYBIT]:
-                if ex_enum in rates:
-                    norm = normalize_to_4h(rates[ex_enum])
-                    if norm is not None:
-                        rate_values[ex_enum] = norm
-            
-            best_spread = "-"
+            gross_edge = "-"
+            cost = "-"
+            net_edge = "-"
             recommendation = "-"
             
-            if len(rate_values) >= 2:
-                sorted_rates = sorted(rate_values.items(), key=lambda x: x[1])
-                lowest = sorted_rates[0]
-                highest = sorted_rates[-1]
-                spread = (highest[1] - lowest[1]) * 100
-                best_spread = f"{spread:.6f}%"
-                recommendation = f"Long {lowest[0].value}, Short {highest[0].value}"
+            if metrics:
+                gross_edge = f"{metrics.gross_spread_pct:.6f}%"
+                cost = f"{metrics.round_trip_cost_pct:.6f}%"
+                net_edge = f"{metrics.net_edge_pct:.6f}%"
+                recommendation = f"Long {metrics.long_exchange.value}, Short {metrics.short_exchange.value}"
             
             self.funding_tree.insert("", tk.END, values=(
-                pair, okx_val, binance_val, bingx_val, gate_val, aster_val, bybit_val, best_spread, recommendation
+                pair, okx_val, binance_val, bingx_val, gate_val, aster_val, bybit_val, gross_edge, cost, net_edge, recommendation
             ))
         
-        self._log(f"Loaded top 10 from {len(sorted_pairs)} pairs sorted by Best Spread (normalized to 4h)")
+        self._log(f"Loaded top 10 from {len(sorted_pairs)} pairs sorted by net edge after estimated costs")
     
     def _on_funding_select(self, event):
         """Handle funding row double-click - auto select pair and exchanges in Trading Panel"""

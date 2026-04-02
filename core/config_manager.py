@@ -3,6 +3,11 @@ import json
 import logging
 from config.settings import Settings, OKXConfig, BinanceConfig, BingXConfig, GateConfig, AsterdexConfig, BybitConfig
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    load_dotenv = None
+
 logger = logging.getLogger(__name__)
 
 class ConfigManager:
@@ -20,10 +25,26 @@ class ConfigManager:
     def get_settings(self) -> Settings:
         """Loads user_config.json and builds a complete Settings object."""
         settings = Settings()
+        if load_dotenv:
+            load_dotenv()
         
         try:
             if not os.path.exists(self.config_path):
-                logger.warning(f"Config file {self.config_path} not found. Using empty settings.")
+                settings.load_from_env()
+                configured = [
+                    cfg.api_key for cfg in [
+                        settings.okx,
+                        settings.binance,
+                        settings.bingx,
+                        settings.gate,
+                        settings.asterdex,
+                        settings.bybit,
+                    ]
+                ]
+                if any(configured):
+                    logger.info(f"Config file {self.config_path} not found. Loaded settings from environment variables.")
+                else:
+                    logger.warning(f"Config file {self.config_path} not found. Using empty settings.")
                 return settings
             
             with open(self.config_path, 'r', encoding='utf-8') as f:
@@ -79,5 +100,6 @@ class ConfigManager:
                 
         except Exception as e:
             logger.error(f"Failed to load config from {self.config_path}: {e}")
+            settings.load_from_env()
             
         return settings

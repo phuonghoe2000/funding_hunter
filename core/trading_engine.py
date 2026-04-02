@@ -5,6 +5,12 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone, timedelta
 
 from core.multi_exchange import MultiExchangeManager
+from core.opportunity import (
+    DEFAULT_SLIPPAGE_PCT,
+    DEFAULT_TARGET_HOURS,
+    build_best_opportunity,
+    build_directional_opportunity,
+)
 from config.constants import Exchange, get_exchange_symbol, Side
 from config.settings import Settings
 from exchanges.okx_client import OKXClient
@@ -65,39 +71,53 @@ class TradingEngine:
     # ------------------------------------------------------------------
     # 1. Scan funding rates
     # ------------------------------------------------------------------
-    async def scan_opportunities(self, min_spread: float = 0.0, top_n: int = 50) -> List[Dict]:
+    async def scan_opportunities(
+        self,
+        min_spread: float = 0.0,
+        top_n: int = 50,
+        slippage_pct: float = DEFAULT_SLIPPAGE_PCT,
+        profitable_only: bool = False,
+    ) -> List[Dict]:
         logger.info("Scanning for funding rate opportunities...")
         rates = await self.exchange_manager.get_all_funding_rates(top_n=top_n)
         if not rates:
             return []
         opportunities = []
         for symbol, ex_rates in rates.items():
-            if len(ex_rates) < 2:
+            metrics = build_best_opportunity(
+                pair=symbol,
+                exchange_rates=ex_rates,
+                target_hours=DEFAULT_TARGET_HOURS,
+                slippage_pct=slippage_pct,
+            )
+            if not metrics:
                 continue
-            normalized = []
-            for ex_enum, rate in ex_rates.items():
-                norm = rate.funding_rate * (4.0 / max(1, rate.funding_interval_hours))
-                normalized.append({
-                    "exchange": ex_enum.value, "rate": rate.funding_rate,
-                    "interval": rate.funding_interval_hours, "normalized_rate": norm,
-                    "next_funding_time": rate.next_funding_time,
-                })
-            normalized.sort(key=lambda x: x["normalized_rate"], reverse=True)
-            spread = normalized[0]["normalized_rate"] - normalized[-1]["normalized_rate"]
-            if spread >= min_spread:
-                opportunities.append({
-                    "symbol": symbol,
-                    "short_exchange": normalized[0]["exchange"],
-                    "short_rate": normalized[0]["rate"],
-                    "short_interval": normalized[0]["interval"],
-                    "short_norm": normalized[0]["normalized_rate"],
-                    "long_exchange": normalized[-1]["exchange"],
-                    "long_rate": normalized[-1]["rate"],
-                    "long_interval": normalized[-1]["interval"],
-                    "long_norm": normalized[-1]["normalized_rate"],
-                    "spread": spread,
-                })
-        opportunities.sort(key=lambda x: x["spread"], reverse=True)
+            spread = metrics.gross_spread_pct / 100
+            if spread < min_spread:
+                continue
+            if profitable_only and not metrics.profitable_after_costs:
+                continue
+
+            opportunities.append({
+                "symbol": symbol,
+                "short_exchange": metrics.short_exchange.value,
+                "short_rate": metrics.short_rate,
+                "short_interval": metrics.short_interval_hours,
+                "short_norm": metrics.short_norm_rate,
+                "long_exchange": metrics.long_exchange.value,
+                "long_rate": metrics.long_rate,
+                "long_interval": metrics.long_interval_hours,
+                "long_norm": metrics.long_norm_rate,
+                "spread": spread,
+                "gross_spread_pct": metrics.gross_spread_pct,
+                "round_trip_cost_pct": metrics.round_trip_cost_pct,
+                "net_edge_pct": metrics.net_edge_pct,
+                "hours_to_break_even": metrics.hours_to_break_even,
+                "profitable_after_costs": metrics.profitable_after_costs,
+                "next_funding_time_long": metrics.next_funding_time_long,
+                "next_funding_time_short": metrics.next_funding_time_short,
+            })
+        opportunities.sort(key=lambda x: (x["net_edge_pct"], x["spread"]), reverse=True)
         return opportunities
 
     # ------------------------------------------------------------------
@@ -105,17 +125,29 @@ class TradingEngine:
     # ------------------------------------------------------------------
     async def get_status(self) -> Dict[str, dict]:
         status = {}
+        total_balance = 0.0
+        total_available = 0.0
+        total_active_positions = 0
         for ex_enum, client in self.exchange_manager.clients.items():
             name = ex_enum.value
             try:
                 balance = await client.get_balance()
                 positions = await client.get_all_positions()
                 active = [p for p in positions if float(p.size) != 0]
+                total_balance += getattr(balance, "total", 0.0) or 0.0
+                total_available += getattr(balance, "available", 0.0) or 0.0
+                total_active_positions += len(active)
                 status[name] = {"connected": True, "balance": balance,
                                 "active_positions": len(active), "positions": active}
             except Exception as e:
                 logger.error(f"Error getting status for {name}: {e}")
                 status[name] = {"connected": False, "error": str(e)}
+        status["summary"] = {
+            "connected_exchanges": len(self.exchange_manager.clients),
+            "total_balance": total_balance,
+            "total_available": total_available,
+            "total_active_positions": total_active_positions,
+        }
         return status
 
     # ------------------------------------------------------------------
@@ -129,6 +161,36 @@ class TradingEngine:
                             skip_spread_check: bool = False) -> Dict:
         long_ex = _resolve_exchange(long_ex_name)
         short_ex = _resolve_exchange(short_ex_name)
+        economics = None
+
+        try:
+            long_client = self.exchange_manager.clients.get(long_ex)
+            short_client = self.exchange_manager.clients.get(short_ex)
+            if long_client and short_client:
+                long_symbol = get_exchange_symbol(pair, long_ex)
+                short_symbol = get_exchange_symbol(pair, short_ex)
+                long_rate_obj, short_rate_obj = await asyncio.gather(
+                    long_client.get_funding_rate(long_symbol),
+                    short_client.get_funding_rate(short_symbol),
+                )
+                economics = build_directional_opportunity(
+                    pair=pair,
+                    long_exchange=long_ex,
+                    short_exchange=short_ex,
+                    long_rate_obj=long_rate_obj,
+                    short_rate_obj=short_rate_obj,
+                )
+                logger.info(
+                    f"Funding edge ({DEFAULT_TARGET_HOURS:.0f}H): gross {economics.gross_spread_pct:.4f}% | "
+                    f"cost {economics.round_trip_cost_pct:.4f}% | net {economics.net_edge_pct:.4f}%"
+                )
+                if not economics.profitable_after_costs:
+                    logger.warning(
+                        "Selected direction is not profitable after estimated round-trip costs. "
+                        "Continuing because no hard block is enforced."
+                    )
+        except Exception as e:
+            logger.warning(f"Could not evaluate funding economics before opening: {e}")
 
         # Step 1: Analyze spread to determine threshold (unless skipping check)
         if price_spread_min is None and not skip_spread_check:
@@ -163,6 +225,12 @@ class TradingEngine:
             skip_leverage_set=skip_leverage,
             skip_spread_check=skip_spread_check
         )
+        if economics:
+            open_result["economics"] = economics.to_dict()
+            if not economics.profitable_after_costs:
+                open_result.setdefault("warnings", []).append(
+                    "Funding edge is below estimated round-trip cost."
+                )
         return open_result
 
     # ------------------------------------------------------------------
@@ -270,6 +338,7 @@ class TradingEngine:
         # Get initial funding rates for reversal detection
         initial_net_funding = 0.0
         initial_rates = {}
+        initial_rate_objects: Dict[Exchange, FundingRate] = {}
         if auto_close_reversal:
             for ex in [long_ex, short_ex]:
                 client = self.exchange_manager.clients.get(ex)
@@ -277,12 +346,24 @@ class TradingEngine:
                     try:
                         sym = get_exchange_symbol(pair, ex)
                         fr = await client.get_funding_rate(sym)
+                        initial_rate_objects[ex] = fr
                         initial_rates[ex] = fr.funding_rate
                     except:
                         pass
             if long_ex in initial_rates and short_ex in initial_rates:
                 initial_net_funding = initial_rates[short_ex] - initial_rates[long_ex]
                 logger.info(f"📊 Initial net funding: {initial_net_funding*100:.6f}%")
+                economics = build_directional_opportunity(
+                    pair=pair,
+                    long_exchange=long_ex,
+                    short_exchange=short_ex,
+                    long_rate_obj=initial_rate_objects[long_ex],
+                    short_rate_obj=initial_rate_objects[short_ex],
+                )
+                logger.info(
+                    f"   Gross edge ({DEFAULT_TARGET_HOURS:.0f}H): {economics.gross_spread_pct:.4f}% | "
+                    f"Cost: {economics.round_trip_cost_pct:.4f}% | Net: {economics.net_edge_pct:.4f}%"
+                )
 
         logger.info(f"👁 Monitoring {pair} | LONG: {long_ex_name} | SHORT: {short_ex_name}")
         logger.info(f"   Auto-close risk: {auto_close_risk}% | Reversal: {auto_close_reversal}")
@@ -392,7 +473,10 @@ class TradingEngine:
                     "realized_pnl": result.get("realized_pnl", 0),
                     "commission": result.get("commission", 0),
                     "funding_fee": result.get("funding_fee", 0),
-                    "net_pnl": result.get("realized_pnl", 0) + result.get("commission", 0) + result.get("funding_fee", 0),
+                    "net_pnl": result.get(
+                        "net_pnl",
+                        result.get("realized_pnl", 0) - result.get("commission", 0) + result.get("funding_fee", 0),
+                    ),
                 }
             except Exception as e:
                 pnl_data[label] = {"exchange": ex.value, "error": str(e)}
@@ -401,9 +485,10 @@ class TradingEngine:
         total_rpnl = sum(d.get("realized_pnl", 0) for d in pnl_data.values() if "error" not in d)
         total_comm = sum(d.get("commission", 0) for d in pnl_data.values() if "error" not in d)
         total_fund = sum(d.get("funding_fee", 0) for d in pnl_data.values() if "error" not in d)
+        total_net = sum(d.get("net_pnl", 0) for d in pnl_data.values() if "error" not in d)
         pnl_data["total"] = {
             "realized_pnl": total_rpnl, "commission": total_comm,
-            "funding_fee": total_fund, "net_pnl": total_rpnl + total_comm + total_fund,
+            "funding_fee": total_fund, "net_pnl": total_net,
         }
         return pnl_data
 
@@ -427,6 +512,7 @@ class TradingEngine:
         long_ex = _resolve_exchange(long_ex_name)
         short_ex = _resolve_exchange(short_ex_name)
         info = {}
+        funding_objs: Dict[Exchange, FundingRate] = {}
         for label, ex in [("long", long_ex), ("short", short_ex)]:
             client = self.exchange_manager.clients.get(ex)
             if not client:
@@ -437,6 +523,7 @@ class TradingEngine:
                 book = await client.get_order_book(symbol, limit=5)
                 funding = await client.get_funding_rate(symbol)
                 mark = await client.get_mark_price(symbol)
+                funding_objs[ex] = funding
                 info[label] = {
                     "exchange": ex.value,
                     "symbol": symbol,
@@ -464,4 +551,20 @@ class TradingEngine:
                 info["close_spread_pct"] = ((lb2 - sa2) / avg2) * 100
         except:
             pass
+
+        if long_ex in funding_objs and short_ex in funding_objs:
+            selected_trade = build_directional_opportunity(
+                pair=pair,
+                long_exchange=long_ex,
+                short_exchange=short_ex,
+                long_rate_obj=funding_objs[long_ex],
+                short_rate_obj=funding_objs[short_ex],
+            )
+            recommended_trade = build_best_opportunity(
+                pair=pair,
+                exchange_rates=funding_objs,
+            )
+            info["selected_trade"] = selected_trade.to_dict()
+            if recommended_trade:
+                info["recommended_trade"] = recommended_trade.to_dict()
         return info

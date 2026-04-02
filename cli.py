@@ -72,6 +72,8 @@ Examples:
     p = sub.add_parser("scan", help="Scan funding rate opportunities across all exchanges")
     p.add_argument("--min-spread", type=float, default=0.0, help="Min normalized 4H spread %% (default: 0)")
     p.add_argument("--top", type=int, default=30, help="Show top N results (default: 30)")
+    p.add_argument("--slippage-pct", type=float, default=0.02, help="Estimated slippage per trade side in %% (default: 0.02)")
+    p.add_argument("--profitable-only", action="store_true", help="Only show opportunities that stay positive after estimated costs")
 
     # ── status ──
     sub.add_parser("status", help="Show balances and active positions on all exchanges")
@@ -138,22 +140,37 @@ Examples:
 
 # ── Command Handlers ───────────────────────────────────────────────
 async def cmd_scan(engine, args):
-    opps = await engine.scan_opportunities(min_spread=args.min_spread, top_n=args.top)
+    opps = await engine.scan_opportunities(
+        min_spread=args.min_spread,
+        top_n=args.top,
+        slippage_pct=args.slippage_pct,
+        profitable_only=args.profitable_only,
+    )
     if not opps:
         logger.info("No opportunities found.")
         return
     table = []
     for opp in opps[:args.top]:
+        break_even = opp["hours_to_break_even"]
+        break_even_text = f"{break_even:.1f}h" if break_even != float("inf") else "inf"
         table.append([
             opp['symbol'],
-            f"{opp['spread']*100:.4f}%",
+            f"{opp['gross_spread_pct']:.4f}%",
+            f"{opp['round_trip_cost_pct']:.4f}%",
+            f"{opp['net_edge_pct']:.4f}%",
             f"{opp['short_exchange'].upper()} (-)",
             f"{opp['short_rate']*100:.4f}% ({opp['short_interval']}h)",
             f"{opp['long_exchange'].upper()} (+)",
             f"{opp['long_rate']*100:.4f}% ({opp['long_interval']}h)",
+            break_even_text,
+            "YES" if opp["profitable_after_costs"] else "NO",
         ])
     print(tabulate(table,
-                   headers=["Symbol", "Spread (4H)", "Short EX", "Short Rate (interval)", "Long EX", "Long Rate (interval)"],
+                   headers=[
+                       "Symbol", "Gross 4H", "Cost", "Net Edge", "Short EX",
+                       "Short Rate (interval)", "Long EX", "Long Rate (interval)",
+                       "Break-even", "Profitable",
+                   ],
                    tablefmt="grid"))
     logger.info(f"\n✅ Found {len(opps)} opportunities (showing top {min(args.top, len(opps))})")
 
@@ -205,6 +222,20 @@ async def cmd_info(engine, args):
         logger.info(f"\n  Open Spread:  {info['open_spread_pct']:.4f}%")
     if "close_spread_pct" in info:
         logger.info(f"  Close Spread: {info['close_spread_pct']:.4f}%")
+    selected_trade = info.get("selected_trade")
+    if selected_trade:
+        logger.info("\n  Selected Direction Economics:")
+        logger.info(f"    Gross Funding Edge (4H): {selected_trade['gross_spread_pct']:.4f}%")
+        logger.info(f"    Round-trip Cost:         {selected_trade['round_trip_cost_pct']:.4f}%")
+        logger.info(f"    Net Edge:                {selected_trade['net_edge_pct']:.4f}%")
+        logger.info(f"    Break-even Time:         {selected_trade['hours_to_break_even']:.2f}h")
+        logger.info(f"    Profitable After Cost:   {'YES' if selected_trade['profitable_after_costs'] else 'NO'}")
+    recommended_trade = info.get("recommended_trade")
+    if recommended_trade:
+        logger.info(
+            f"\n  Recommended Direction: LONG {recommended_trade['long_exchange']} / "
+            f"SHORT {recommended_trade['short_exchange']}"
+        )
 
 
 async def cmd_open(engine, args):

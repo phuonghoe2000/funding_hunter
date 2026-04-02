@@ -135,6 +135,11 @@ class BaseExchangeClient(ABC):
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
         """Get ticker data"""
         pass
+
+    @abstractmethod
+    async def get_order_book(self, symbol: str, limit: int = 20) -> Dict[str, Any]:
+        """Get current order book snapshot"""
+        pass
     
     @abstractmethod
     def get_exchange_name(self) -> str:
