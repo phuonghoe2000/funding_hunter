@@ -22,11 +22,30 @@ def create_widgets(app: Any) -> None:
 
     create_exchange_frame(app, main_frame)
 
-    middle_frame = ttk.Frame(main_frame)
-    middle_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+    middle_pane = ttk.Panedwindow(main_frame, orient=tk.HORIZONTAL)
+    middle_pane.pack(fill=tk.BOTH, expand=True, pady=10)
 
-    create_trading_frame(app, middle_frame)
-    create_funding_frame(app, middle_frame)
+    trading_container = ttk.Frame(middle_pane, width=540)
+    funding_container = ttk.Frame(middle_pane, width=820)
+    middle_pane.add(trading_container, weight=2)
+    middle_pane.add(funding_container, weight=3)
+
+    create_trading_frame(app, trading_container)
+    create_funding_frame(app, funding_container)
+
+    def _set_initial_split() -> None:
+        try:
+            total_width = middle_pane.winfo_width()
+            if total_width <= 1:
+                app.root.after(50, _set_initial_split)
+                return
+
+            target_width = max(500, min(620, int(total_width * 0.38)))
+            middle_pane.sashpos(0, target_width)
+        except tk.TclError:
+            return
+
+    app.root.after(50, _set_initial_split)
 
     bottom_frame = ttk.Frame(main_frame)
     bottom_frame.pack(fill=tk.BOTH, expand=True)
@@ -145,7 +164,7 @@ def create_exchange_frame(app: Any, parent: tk.Widget) -> None:
 def create_trading_frame(app: Any, parent: tk.Widget) -> None:
     """Create the trading panel."""
     outer_frame = ttk.LabelFrame(parent, text="📊 Trading Panel", padding="5")
-    outer_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+    outer_frame.pack(fill=tk.BOTH, expand=True)
 
     canvas = tk.Canvas(outer_frame, highlightthickness=0)
     scrollbar = ttk.Scrollbar(outer_frame, orient="vertical", command=canvas.yview)
@@ -153,8 +172,9 @@ def create_trading_frame(app: Any, parent: tk.Widget) -> None:
     frame = ttk.Frame(canvas)
     frame.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
 
-    canvas.create_window((0, 0), window=frame, anchor="nw")
+    content_window = canvas.create_window((0, 0), window=frame, anchor="nw")
     canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.bind("<Configure>", lambda event: canvas.itemconfigure(content_window, width=event.width))
 
     canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -239,7 +259,7 @@ def create_trading_frame(app: Any, parent: tk.Widget) -> None:
         funding_info_frame,
         text="Double-click a pair in Funding Rates panel to see details",
         foreground="gray",
-        wraplength=400,
+        wraplength=460,
         justify=tk.LEFT,
     )
     app.selected_pair_info.pack(fill=tk.X)
@@ -336,7 +356,7 @@ def create_trading_frame(app: Any, parent: tk.Widget) -> None:
 def create_funding_frame(app: Any, parent: tk.Widget) -> None:
     """Create the funding comparison panel."""
     frame = ttk.LabelFrame(parent, text="💰 Funding Rates Comparison", padding="10")
-    frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+    frame.pack(fill=tk.BOTH, expand=True)
 
     btn_frame = ttk.Frame(frame)
     btn_frame.pack(fill=tk.X, pady=5)
@@ -388,21 +408,34 @@ def create_funding_frame(app: Any, parent: tk.Widget) -> None:
         app.funding_tree.heading(name, text=text)
 
     for name, width in (
-        ("Pair", 80),
-        ("OKX", 85),
-        ("Binance", 85),
-        ("BingX", 85),
-        ("Gate", 85),
-        ("Asterdex", 85),
-        ("Bybit", 85),
-        ("Gross 4H", 85),
-        ("Cost", 75),
-        ("Net Edge", 85),
-        ("Recommendation", 140),
+        ("Pair", 88),
+        ("OKX", 80),
+        ("Binance", 80),
+        ("BingX", 80),
+        ("Gate", 80),
+        ("Asterdex", 80),
+        ("Bybit", 80),
+        ("Gross 4H", 86),
+        ("Cost", 74),
+        ("Net Edge", 86),
+        ("Recommendation", 170),
     ):
-        app.funding_tree.column(name, width=width)
+        app.funding_tree.column(name, width=width, stretch=False)
 
-    app.funding_tree.pack(fill=tk.BOTH, expand=True, pady=5)
+    table_frame = ttk.Frame(frame)
+    table_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+    y_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=app.funding_tree.yview)
+    x_scrollbar = ttk.Scrollbar(table_frame, orient="horizontal", command=app.funding_tree.xview)
+    app.funding_tree.configure(yscrollcommand=y_scrollbar.set, xscrollcommand=x_scrollbar.set)
+
+    app.funding_tree.grid(row=0, column=0, sticky="nsew")
+    y_scrollbar.grid(row=0, column=1, sticky="ns")
+    x_scrollbar.grid(row=1, column=0, sticky="ew")
+
+    table_frame.grid_rowconfigure(0, weight=1)
+    table_frame.grid_columnconfigure(0, weight=1)
+
     app.funding_tree.bind("<Double-1>", app._on_funding_select)
 
 
