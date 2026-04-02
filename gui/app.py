@@ -20,6 +20,7 @@ from core.gui_service import GUIWorkflowService
 from core.opportunity import build_best_opportunity, normalize_funding_rate_obj
 
 try:
+    from gui.exchange_display import from_display_name, parse_recommendation_display_names
     from gui.layout import create_widgets as build_widgets
     from gui.position_loader import (
         find_hedged_pairs as build_hedged_pairs,
@@ -27,6 +28,7 @@ try:
         show_position_selector as show_existing_position_selector,
     )
 except ImportError:
+    from exchange_display import from_display_name, parse_recommendation_display_names
     from layout import create_widgets as build_widgets
     from position_loader import (
         find_hedged_pairs as build_hedged_pairs,
@@ -1780,121 +1782,6 @@ class FundingHunterGUI:
             logger.error(f"Error checking funding reversal: {e}")
             return False, ""
     
-    async def _get_funding_fees(self, position: Dict[str, Any]) -> float:
-        """Get total funding fees for the position from both exchanges"""
-        total_funding = 0.0
-        open_time = position.get('open_time')
-        if not open_time:
-            logger.debug("No open_time in position, cannot calculate funding fees")
-            return 0.0
-        
-        # Convert to timestamp in milliseconds
-        start_time = int(open_time.timestamp() * 1000)
-        pair = position.get('pair', 'Unknown')
-        
-        # Get funding fees from long exchange
-        long_client = self.manager.clients.get(position['long_exchange'])
-        long_funding = 0.0
-        if long_client:
-            try:
-                symbol = get_exchange_symbol(position['pair'], position['long_exchange'])
-                
-                # Call get_income_history based on exchange type
-                from exchanges.binance_client import BinanceClient
-                from exchanges.okx_client import OKXClient
-                from exchanges.bingx_client import BingXClient
-                from exchanges.gate_client import GateClient
-                
-                if isinstance(long_client, BinanceClient):
-                    # Binance format: BTCUSDT
-                    binance_symbol = symbol.replace('/', '')
-                    income = await long_client.get_income_history("FUNDING_FEE", limit=100, symbol=binance_symbol)
-                    for item in income:
-                        item_time = item.get('time', 0)
-                        if item_time >= start_time:
-                            long_funding += float(item.get('income', 0))
-                
-                elif isinstance(long_client, OKXClient):
-                    # OKX format: BTC-USDT-SWAP
-                    income = await long_client.get_income_history(symbol, limit=100)
-                    for item in income:
-                        item_time = item.get('time', 0)
-                        if item_time >= start_time:
-                            long_funding += float(item.get('income', 0))
-                
-                elif isinstance(long_client, BingXClient):
-                    # BingX format: BTC-USDT
-                    income = await long_client.get_income_history(symbol, limit=100)
-                    for item in income:
-                        item_time = item.get('time', 0)
-                        if item_time >= start_time:
-                            long_funding += float(item.get('income', 0))
-                
-                elif isinstance(long_client, GateClient):
-                    # Gate.io format: BTC_USDT
-                    income = await long_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
-                    for item in income:
-                        item_time = item.get('time', 0)
-                        if item_time >= start_time:
-                            long_funding += float(item.get('income', 0))
-                
-                logger.debug(f"LONG {position['long_exchange'].value} funding: ${long_funding:.6f}")
-                            
-            except Exception as e:
-                logger.debug(f"Error getting funding from {position['long_exchange'].value}: {e}")
-        
-        # Get funding fees from short exchange
-        short_client = self.manager.clients.get(position['short_exchange'])
-        short_funding = 0.0
-        if short_client:
-            try:
-                symbol = get_exchange_symbol(position['pair'], position['short_exchange'])
-                
-                from exchanges.binance_client import BinanceClient
-                from exchanges.okx_client import OKXClient
-                from exchanges.bingx_client import BingXClient
-                from exchanges.gate_client import GateClient
-                
-                if isinstance(short_client, BinanceClient):
-                    binance_symbol = symbol.replace('/', '')
-                    income = await short_client.get_income_history("FUNDING_FEE", limit=100, symbol=binance_symbol)
-                    for item in income:
-                        item_time = item.get('time', 0)
-                        if item_time >= start_time:
-                            short_funding += float(item.get('income', 0))
-                
-                elif isinstance(short_client, OKXClient):
-                    income = await short_client.get_income_history(symbol, limit=100)
-                    for item in income:
-                        item_time = item.get('time', 0)
-                        if item_time >= start_time:
-                            short_funding += float(item.get('income', 0))
-                
-                elif isinstance(short_client, BingXClient):
-                    income = await short_client.get_income_history(symbol, limit=100)
-                    for item in income:
-                        item_time = item.get('time', 0)
-                        if item_time >= start_time:
-                            short_funding += float(item.get('income', 0))
-                
-                elif isinstance(short_client, GateClient):
-                    # Gate.io format: BTC_USDT
-                    income = await short_client.get_income_history(symbol, limit=100, income_type="FUNDING_FEE")
-                    for item in income:
-                        item_time = item.get('time', 0)
-                        if item_time >= start_time:
-                            short_funding += float(item.get('income', 0))
-                
-                logger.debug(f"SHORT {position['short_exchange'].value} funding: ${short_funding:.6f}")
-                            
-            except Exception as e:
-                logger.debug(f"Error getting funding from {position['short_exchange'].value}: {e}")
-        
-        total_funding = long_funding + short_funding
-        logger.debug(f"Total funding for {pair}: ${total_funding:.6f} (LONG: ${long_funding:.6f}, SHORT: ${short_funding:.6f})")
-        
-        return total_funding
-    
     def _update_position_display(self):
         """Update position display"""
         if self.active_position:
@@ -2034,15 +1921,9 @@ class FundingHunterGUI:
         # Parse and set exchanges from recommendation
         if recommendation != "-":
             # Parse recommendation like "Long okx, Short binance"
-            parts = recommendation.split(", ")
-            if len(parts) == 2:
-                long_ex = parts[0].replace("Long ", "").strip().lower()
-                short_ex = parts[1].replace("Short ", "").strip().lower()
-                
-                # Map to display names (case-insensitive)
-                name_map = {"okx": "OKX", "binance": "Binance", "bingx": "BingX", "gate": "Gate.io", "asterdex": "Asterdex", "bybit": "Bybit"}
-                long_display = name_map.get(long_ex, long_ex.upper())
-                short_display = name_map.get(short_ex, short_ex.upper())
+            parts = parse_recommendation_display_names(recommendation)
+            if parts:
+                long_display, short_display = parts
                 
                 self.long_exchange.set(long_display)
                 self.short_exchange.set(short_display)
@@ -2131,10 +2012,8 @@ class FundingHunterGUI:
             self.selected_pair_info.config(text="Please select both LONG and SHORT exchanges", foreground="gray")
             return
         
-        # Map display names to Exchange enum
-        exchange_map = {"OKX": Exchange.OKX, "Binance": Exchange.BINANCE, "BingX": Exchange.BINGX, "Gate.io": Exchange.GATE, "Asterdex": Exchange.ASTERDEX, "Bybit": Exchange.BYBIT}
-        long_ex = exchange_map.get(long_display)
-        short_ex = exchange_map.get(short_display)
+        long_ex = from_display_name(long_display)
+        short_ex = from_display_name(short_display)
         
         if not long_ex or not short_ex:
             return

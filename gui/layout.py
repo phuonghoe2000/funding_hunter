@@ -9,8 +9,10 @@ from tkinter import scrolledtext, ttk
 
 from config.constants import POPULAR_PAIRS, Exchange
 
-
-TRADING_EXCHANGE_OPTIONS = ["OKX", "Binance", "BingX", "Gate.io", "Asterdex", "Bybit"]
+try:
+    from gui.exchange_display import TRADING_EXCHANGE_OPTIONS
+except ImportError:
+    from exchange_display import TRADING_EXCHANGE_OPTIONS
 
 
 def create_widgets(app: Any) -> None:

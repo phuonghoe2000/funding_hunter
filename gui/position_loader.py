@@ -8,17 +8,12 @@ from typing import Any, Optional
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from config.constants import Exchange, Side, get_unified_pair
+from config.constants import Side, get_unified_pair
 
-
-EXCHANGE_DISPLAY_NAMES = {
-    Exchange.OKX: "OKX",
-    Exchange.BINANCE: "Binance",
-    Exchange.BINGX: "BingX",
-    Exchange.GATE: "Gate.io",
-    Exchange.ASTERDEX: "Asterdex",
-    Exchange.BYBIT: "Bybit",
-}
+try:
+    from gui.exchange_display import to_display_name
+except ImportError:
+    from exchange_display import to_display_name
 
 
 def find_hedged_pairs(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -226,8 +221,8 @@ def load_hedged_position(app: Any, hedged_pair: dict[str, Any], open_time: Optio
 
     app._update_position_display()
 
-    app.long_exchange.set(EXCHANGE_DISPLAY_NAMES.get(long_exchange, ""))
-    app.short_exchange.set(EXCHANGE_DISPLAY_NAMES.get(short_exchange, ""))
+    app.long_exchange.set(to_display_name(long_exchange))
+    app.short_exchange.set(to_display_name(short_exchange))
 
     current_values = list(app.pair_combo["values"])
     if pair not in current_values:
