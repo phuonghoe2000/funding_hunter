@@ -1,0 +1,483 @@
+"""
+GUI layout builders for Funding Hunter.
+"""
+
+from typing import Any
+
+import tkinter as tk
+from tkinter import scrolledtext, ttk
+
+from config.constants import POPULAR_PAIRS, Exchange
+
+
+TRADING_EXCHANGE_OPTIONS = ["OKX", "Binance", "BingX", "Gate.io", "Asterdex", "Bybit"]
+
+
+def create_widgets(app: Any) -> None:
+    """Create the top-level GUI layout."""
+    main_frame = ttk.Frame(app.root, padding="10")
+    main_frame.pack(fill=tk.BOTH, expand=True)
+
+    create_exchange_frame(app, main_frame)
+
+    middle_frame = ttk.Frame(main_frame)
+    middle_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+
+    create_trading_frame(app, middle_frame)
+    create_funding_frame(app, middle_frame)
+
+    bottom_frame = ttk.Frame(main_frame)
+    bottom_frame.pack(fill=tk.BOTH, expand=True)
+
+    create_position_frame(app, bottom_frame)
+    create_log_frame(app, bottom_frame)
+
+
+def create_exchange_frame(app: Any, parent: tk.Widget) -> None:
+    """Create the exchange credentials area."""
+    frame = ttk.LabelFrame(parent, text="🔌 Exchange Credentials", padding="10")
+    frame.pack(fill=tk.X, pady=(0, 10))
+
+    notebook = ttk.Notebook(frame)
+    notebook.pack(fill=tk.X, pady=5)
+
+    _create_exchange_tab(
+        app,
+        notebook,
+        title="OKX",
+        prefix="okx",
+        fields=[("API Key", "api_key", 40), ("Secret", "secret", 40), ("Passphrase", "passphrase", 20)],
+        testnet_default=True,
+        enabled_default=True,
+    )
+    _create_exchange_tab(
+        app,
+        notebook,
+        title="Binance",
+        prefix="binance",
+        fields=[("API Key", "api_key", 40), ("Secret", "secret", 40)],
+        testnet_default=True,
+        enabled_default=True,
+    )
+    _create_exchange_tab(
+        app,
+        notebook,
+        title="BingX",
+        prefix="bingx",
+        fields=[("API Key", "api_key", 40), ("Secret", "secret", 40)],
+        testnet_default=None,
+        enabled_default=False,
+    )
+    _create_exchange_tab(
+        app,
+        notebook,
+        title="Gate.io",
+        prefix="gate",
+        fields=[("API Key", "api_key", 40), ("Secret", "secret", 40)],
+        testnet_default=False,
+        show_testnet=False,
+        enabled_default=False,
+    )
+    _create_exchange_tab(
+        app,
+        notebook,
+        title="Asterdex",
+        prefix="asterdex",
+        fields=[("API Key", "api_key", 40), ("Secret", "secret", 40)],
+        testnet_default=False,
+        enabled_default=False,
+    )
+    _create_exchange_tab(
+        app,
+        notebook,
+        title="Bybit",
+        prefix="bybit",
+        fields=[("API Key", "api_key", 40), ("Secret", "secret", 40)],
+        testnet_default=False,
+        enabled_default=False,
+    )
+
+    btn_frame = ttk.Frame(frame)
+    btn_frame.pack(fill=tk.X, pady=10)
+
+    app.connect_btn = ttk.Button(btn_frame, text="🔗 Connect All", command=app._connect)
+    app.connect_btn.pack(side=tk.LEFT, padx=5)
+
+    app.disconnect_btn = ttk.Button(
+        btn_frame,
+        text="🔌 Disconnect",
+        command=app._disconnect,
+        state=tk.DISABLED,
+    )
+    app.disconnect_btn.pack(side=tk.LEFT, padx=5)
+
+    app.debug_mode = tk.BooleanVar(value=False)
+    app.debug_checkbox = ttk.Checkbutton(
+        btn_frame,
+        text="🔍 Debug Mode",
+        variable=app.debug_mode,
+        command=app._on_debug_mode_changed,
+    )
+    app.debug_checkbox.pack(side=tk.LEFT, padx=10)
+
+    app.status_label = ttk.Label(btn_frame, text="⚪ Disconnected")
+    app.status_label.pack(side=tk.LEFT, padx=20)
+
+    app.balance_frame = ttk.Frame(btn_frame)
+    app.balance_frame.pack(side=tk.RIGHT, padx=10)
+
+    for label_text, attr_name in (
+        ("OKX", "okx_balance_label"),
+        ("Binance", "binance_balance_label"),
+        ("BingX", "bingx_balance_label"),
+        ("Gate", "gate_balance_label"),
+        ("Aster", "asterdex_balance_label"),
+        ("Bybit", "bybit_balance_label"),
+    ):
+        ttk.Label(app.balance_frame, text=f"{label_text}:").pack(side=tk.LEFT, padx=2)
+        value_label = ttk.Label(app.balance_frame, text="$0.00")
+        value_label.pack(side=tk.LEFT, padx=5)
+        setattr(app, attr_name, value_label)
+
+
+def create_trading_frame(app: Any, parent: tk.Widget) -> None:
+    """Create the trading panel."""
+    outer_frame = ttk.LabelFrame(parent, text="📊 Trading Panel", padding="5")
+    outer_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+
+    canvas = tk.Canvas(outer_frame, highlightthickness=0)
+    scrollbar = ttk.Scrollbar(outer_frame, orient="vertical", command=canvas.yview)
+
+    frame = ttk.Frame(canvas)
+    frame.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+
+    canvas.create_window((0, 0), window=frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _on_mousewheel(event: tk.Event) -> None:
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _bind_mousewheel(_: tk.Event) -> None:
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+    def _unbind_mousewheel(_: tk.Event) -> None:
+        canvas.unbind_all("<MouseWheel>")
+
+    canvas.bind("<Enter>", _bind_mousewheel)
+    canvas.bind("<Leave>", _unbind_mousewheel)
+
+    pair_frame = ttk.Frame(frame)
+    pair_frame.pack(fill=tk.X, pady=5)
+
+    ttk.Label(pair_frame, text="Pair:").pack(side=tk.LEFT, padx=5)
+    app.pair_combo = ttk.Combobox(pair_frame, values=POPULAR_PAIRS, width=15)
+    app.pair_combo.set("BTC/USDT")
+    app.pair_combo.pack(side=tk.LEFT, padx=5)
+    app.pair_combo.bind("<<ComboboxSelected>>", app._on_pair_changed)
+
+    app.current_price_label = ttk.Label(pair_frame, text="", foreground="blue")
+    app.current_price_label.pack(side=tk.LEFT, padx=10)
+
+    app.load_pairs_btn = ttk.Button(
+        pair_frame,
+        text="📋 Load All Binance Pairs",
+        command=app._load_binance_pairs,
+        state=tk.DISABLED,
+    )
+    app.load_pairs_btn.pack(side=tk.LEFT, padx=5)
+
+    settings_frame = ttk.Frame(frame)
+    settings_frame.pack(fill=tk.X, pady=5)
+
+    ttk.Label(settings_frame, text="Leverage:").pack(side=tk.LEFT, padx=5)
+    app.leverage_var = tk.StringVar(value="3")
+    app.leverage_spin = ttk.Spinbox(settings_frame, from_=1, to=100, width=5, textvariable=app.leverage_var)
+    app.leverage_spin.pack(side=tk.LEFT, padx=5)
+
+    ttk.Label(settings_frame, text="Size:").pack(side=tk.LEFT, padx=10)
+    app.size_entry = ttk.Entry(settings_frame, width=12)
+    app.size_entry.insert(0, "0.01")
+    app.size_entry.pack(side=tk.LEFT, padx=5)
+
+    app.usdt_vol_label = ttk.Label(settings_frame, text="≈ $0.00 USDT", foreground="blue")
+    app.usdt_vol_label.pack(side=tk.LEFT, padx=5)
+    app.size_entry.bind("<KeyRelease>", app._update_usdt_volume)
+
+    ttk.Label(settings_frame, text="Splits:").pack(side=tk.LEFT, padx=10)
+    app.split_count_var = tk.StringVar(value="1")
+    app.split_count_entry = ttk.Entry(settings_frame, textvariable=app.split_count_var, width=5)
+    app.split_count_entry.pack(side=tk.LEFT, padx=5)
+
+    ex_frame = ttk.LabelFrame(frame, text="Select Exchanges for Arbitrage", padding="10")
+    ex_frame.pack(fill=tk.X, pady=10)
+
+    ttk.Label(ex_frame, text="LONG Exchange:", style="Header.TLabel").grid(
+        row=0, column=0, padx=5, pady=5, sticky="e"
+    )
+    app.long_exchange = ttk.Combobox(ex_frame, values=TRADING_EXCHANGE_OPTIONS, width=12, state="readonly")
+    app.long_exchange.set("OKX")
+    app.long_exchange.grid(row=0, column=1, padx=5, pady=5)
+    app.long_exchange.bind("<<ComboboxSelected>>", app._on_exchange_changed)
+
+    ttk.Label(ex_frame, text="SHORT Exchange:", style="Header.TLabel").grid(
+        row=0, column=2, padx=15, pady=5, sticky="e"
+    )
+    app.short_exchange = ttk.Combobox(ex_frame, values=TRADING_EXCHANGE_OPTIONS, width=12, state="readonly")
+    app.short_exchange.set("Binance")
+    app.short_exchange.grid(row=0, column=3, padx=5, pady=5)
+    app.short_exchange.bind("<<ComboboxSelected>>", app._on_exchange_changed)
+
+    funding_info_frame = ttk.LabelFrame(frame, text="📊 Selected Pair Info", padding="10")
+    funding_info_frame.pack(fill=tk.X, pady=10)
+
+    app.selected_pair_info = ttk.Label(
+        funding_info_frame,
+        text="Double-click a pair in Funding Rates panel to see details",
+        foreground="gray",
+        wraplength=400,
+        justify=tk.LEFT,
+    )
+    app.selected_pair_info.pack(fill=tk.X)
+
+    btn_frame = ttk.Frame(frame)
+    btn_frame.pack(fill=tk.X, pady=15)
+
+    app.open_btn = ttk.Button(
+        btn_frame,
+        text="🚀 Open Hedged Position",
+        command=app._open_position,
+        state=tk.DISABLED,
+    )
+    app.open_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+
+    app.close_btn = ttk.Button(
+        btn_frame,
+        text="🛑 Close Position",
+        command=app._close_position,
+        state=tk.DISABLED,
+    )
+    app.close_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+
+    partial_frame = ttk.Frame(btn_frame)
+    partial_frame.pack(side=tk.LEFT, padx=2)
+    ttk.Label(partial_frame, text="Size:", font=("Segoe UI", 8)).pack(side=tk.LEFT)
+    app.close_size_var = tk.StringVar(value="")
+    ttk.Entry(partial_frame, textvariable=app.close_size_var, width=10).pack(side=tk.LEFT, padx=2)
+    ttk.Label(partial_frame, text="(empty=all)", font=("Segoe UI", 7), foreground="gray").pack(side=tk.LEFT)
+
+    app.load_pos_btn = ttk.Button(
+        btn_frame,
+        text="📥 Load Positions",
+        command=app._load_existing_positions,
+        state=tk.DISABLED,
+    )
+    app.load_pos_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+
+    app.monitor_btn = ttk.Button(
+        btn_frame,
+        text="👁 Start Monitor",
+        command=app._toggle_monitoring,
+        state=tk.DISABLED,
+    )
+    app.monitor_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+
+    option_frame = ttk.Frame(frame)
+    option_frame.pack(fill=tk.X, pady=5)
+
+    risk_frame = ttk.Frame(option_frame)
+    risk_frame.pack(anchor=tk.W)
+
+    app.auto_close_risk_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(risk_frame, text="Auto-close when Risk >=", variable=app.auto_close_risk_var).pack(side=tk.LEFT)
+    app.risk_threshold_var = tk.StringVar(value="10")
+    ttk.Entry(risk_frame, textvariable=app.risk_threshold_var, width=5).pack(side=tk.LEFT, padx=2)
+    ttk.Label(risk_frame, text="%").pack(side=tk.LEFT)
+
+    app.auto_close_reversal_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(
+        option_frame,
+        text="Auto-close on funding reversal",
+        variable=app.auto_close_reversal_var,
+    ).pack(anchor=tk.W, pady=2)
+
+    app.skip_leverage_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(option_frame, text="Skip leverage set (faster entry)", variable=app.skip_leverage_var).pack(
+        anchor=tk.W
+    )
+
+    app.skip_spread_check_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(
+        option_frame,
+        text="Skip spread check (execute splits immediately)",
+        variable=app.skip_spread_check_var,
+    ).pack(anchor=tk.W, pady=2)
+
+    threshold_frame = ttk.Frame(option_frame)
+    threshold_frame.pack(fill=tk.X, pady=5)
+
+    ttk.Label(threshold_frame, text="Price Spread Min:").pack(side=tk.LEFT)
+    app.price_spread_threshold = ttk.Entry(threshold_frame, width=8)
+    app.price_spread_threshold.insert(0, "0.05")
+    app.price_spread_threshold.pack(side=tk.LEFT, padx=3)
+    ttk.Label(threshold_frame, text="%").pack(side=tk.LEFT, padx=(0, 10))
+
+    ttk.Label(threshold_frame, text="Funding Spread Min:").pack(side=tk.LEFT, padx=(10, 0))
+    app.min_spread_threshold = ttk.Entry(threshold_frame, width=8)
+    app.min_spread_threshold.insert(0, "0.01")
+    app.min_spread_threshold.pack(side=tk.LEFT, padx=3)
+    ttk.Label(threshold_frame, text="%").pack(side=tk.LEFT)
+
+
+def create_funding_frame(app: Any, parent: tk.Widget) -> None:
+    """Create the funding comparison panel."""
+    frame = ttk.LabelFrame(parent, text="💰 Funding Rates Comparison", padding="10")
+    frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+
+    btn_frame = ttk.Frame(frame)
+    btn_frame.pack(fill=tk.X, pady=5)
+
+    app.refresh_funding_btn = ttk.Button(
+        btn_frame,
+        text="🔄 Refresh Rates",
+        command=app._refresh_funding,
+        state=tk.DISABLED,
+    )
+    app.refresh_funding_btn.pack(side=tk.LEFT, padx=5)
+
+    app._exchange_columns = {
+        "OKX": Exchange.OKX,
+        "Binance": Exchange.BINANCE,
+        "BingX": Exchange.BINGX,
+        "Gate": Exchange.GATE,
+        "Asterdex": Exchange.ASTERDEX,
+        "Bybit": Exchange.BYBIT,
+    }
+    columns = (
+        "Pair",
+        "OKX",
+        "Binance",
+        "BingX",
+        "Gate",
+        "Asterdex",
+        "Bybit",
+        "Gross 4H",
+        "Cost",
+        "Net Edge",
+        "Recommendation",
+    )
+    app.funding_tree = ttk.Treeview(frame, columns=columns, show="headings", height=10)
+
+    for name, text in (
+        ("Pair", "Pair"),
+        ("OKX", "OKX Rate"),
+        ("Binance", "Binance Rate"),
+        ("BingX", "BingX Rate"),
+        ("Gate", "Gate Rate"),
+        ("Asterdex", "Aster Rate"),
+        ("Bybit", "Bybit Rate"),
+        ("Gross 4H", "Gross 4H"),
+        ("Cost", "Cost"),
+        ("Net Edge", "Net Edge"),
+        ("Recommendation", "Recommendation"),
+    ):
+        app.funding_tree.heading(name, text=text)
+
+    for name, width in (
+        ("Pair", 80),
+        ("OKX", 85),
+        ("Binance", 85),
+        ("BingX", 85),
+        ("Gate", 85),
+        ("Asterdex", 85),
+        ("Bybit", 85),
+        ("Gross 4H", 85),
+        ("Cost", 75),
+        ("Net Edge", 85),
+        ("Recommendation", 140),
+    ):
+        app.funding_tree.column(name, width=width)
+
+    app.funding_tree.pack(fill=tk.BOTH, expand=True, pady=5)
+    app.funding_tree.bind("<Double-1>", app._on_funding_select)
+
+
+def create_position_frame(app: Any, parent: tk.Widget) -> None:
+    """Create the active position summary."""
+    frame = ttk.LabelFrame(parent, text="📈 Active Position", padding="10")
+    frame.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
+
+    app.position_info = ttk.Frame(frame)
+    app.position_info.pack(fill=tk.X, pady=5)
+
+    app.pos_pair_label = ttk.Label(app.position_info, text="Pair: -")
+    app.pos_pair_label.pack(side=tk.LEFT, padx=10)
+
+    app.pos_long_label = ttk.Label(app.position_info, text="Long: -")
+    app.pos_long_label.pack(side=tk.LEFT, padx=10)
+
+    app.pos_short_label = ttk.Label(app.position_info, text="Short: -")
+    app.pos_short_label.pack(side=tk.LEFT, padx=10)
+
+    app.pos_size_label = ttk.Label(app.position_info, text="Size: -")
+    app.pos_size_label.pack(side=tk.LEFT, padx=10)
+
+    app.pos_pnl_label = ttk.Label(app.position_info, text="Risk: 0% | Long: $0 | Short: $0")
+    app.pos_pnl_label.pack(side=tk.LEFT, padx=10)
+
+    app.pos_status_label = ttk.Label(app.position_info, text="Status: No Position")
+    app.pos_status_label.pack(side=tk.RIGHT, padx=10)
+
+
+def create_log_frame(app: Any, parent: tk.Widget) -> None:
+    """Create the log output area."""
+    frame = ttk.LabelFrame(parent, text="📝 Logs", padding="10")
+    frame.pack(fill=tk.BOTH, expand=True)
+
+    app.log_text = scrolledtext.ScrolledText(frame, height=8, state=tk.DISABLED)
+    app.log_text.pack(fill=tk.BOTH, expand=True)
+
+    ttk.Button(frame, text="Clear", command=app._clear_logs).pack(side=tk.RIGHT, pady=5)
+
+
+def _create_exchange_tab(
+    app: Any,
+    notebook: ttk.Notebook,
+    *,
+    title: str,
+    prefix: str,
+    fields: list[tuple[str, str, int]],
+    testnet_default: bool | None,
+    enabled_default: bool,
+    show_testnet: bool = True,
+) -> None:
+    """Create a single exchange credentials tab."""
+    frame = ttk.Frame(notebook, padding="10")
+    notebook.add(frame, text=title)
+
+    column = 0
+    for label_text, attr_suffix, width in fields:
+        ttk.Label(frame, text=f"{label_text}:").grid(row=0, column=column, padx=5, pady=2, sticky="e")
+        entry = ttk.Entry(frame, width=width, show="*")
+        entry.grid(row=0, column=column + 1, padx=5, pady=2)
+        setattr(app, f"{prefix}_{attr_suffix}", entry)
+        column += 2
+
+    if testnet_default is None:
+        ttk.Label(frame, text="(No Testnet)", foreground="gray").grid(row=0, column=column, padx=10)
+        column += 1
+    else:
+        testnet_var = tk.BooleanVar(value=testnet_default)
+        setattr(app, f"{prefix}_testnet", testnet_var)
+        if show_testnet:
+            ttk.Checkbutton(frame, text="Testnet", variable=testnet_var).grid(row=0, column=column, padx=10)
+        column += 1
+
+    if testnet_default is not None and not hasattr(app, f"{prefix}_testnet"):
+        setattr(app, f"{prefix}_testnet", tk.BooleanVar(value=testnet_default))
+
+    enabled_var = tk.BooleanVar(value=enabled_default)
+    setattr(app, f"{prefix}_enabled", enabled_var)
+    ttk.Checkbutton(frame, text="Enable", variable=enabled_var).grid(row=0, column=column, padx=5)

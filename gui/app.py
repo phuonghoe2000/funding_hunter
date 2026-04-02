@@ -19,6 +19,11 @@ from config.settings import settings
 from core.gui_service import GUIWorkflowService
 from core.opportunity import build_best_opportunity, normalize_funding_rate_obj
 
+try:
+    from gui.layout import create_widgets as build_widgets
+except ImportError:
+    from layout import create_widgets as build_widgets
+
 
 def sync_windows_time() -> tuple[bool, str]:
     """
@@ -296,25 +301,7 @@ class FundingHunterGUI:
     
     def _create_widgets(self):
         """Create main widgets"""
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Exchange credentials
-        self._create_exchange_frame(main_frame)
-        
-        # Trading panel
-        middle_frame = ttk.Frame(main_frame)
-        middle_frame.pack(fill=tk.BOTH, expand=True, pady=10)
-        
-        self._create_trading_frame(middle_frame)
-        self._create_funding_frame(middle_frame)
-        
-        # Position and logs
-        bottom_frame = ttk.Frame(main_frame)
-        bottom_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self._create_position_frame(bottom_frame)
-        self._create_log_frame(bottom_frame)
+        build_widgets(self)
     
     def _create_exchange_frame(self, parent):
         """Create exchange credentials frame"""
@@ -2056,7 +2043,14 @@ class FundingHunterGUI:
         self._update_position_display()
         
         # Update exchange selectors
-        exchange_name_map = {Exchange.OKX: "OKX", Exchange.BINANCE: "Binance", Exchange.BINGX: "BingX", Exchange.GATE: "Gate.io", Exchange.ASTERDEX: "Asterdex"}
+        exchange_name_map = {
+            Exchange.OKX: "OKX",
+            Exchange.BINANCE: "Binance",
+            Exchange.BINGX: "BingX",
+            Exchange.GATE: "Gate.io",
+            Exchange.ASTERDEX: "Asterdex",
+            Exchange.BYBIT: "Bybit",
+        }
         self.long_exchange.set(exchange_name_map.get(long_ex, ""))
         self.short_exchange.set(exchange_name_map.get(short_ex, ""))
         
