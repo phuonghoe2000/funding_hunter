@@ -197,22 +197,20 @@ class MultiExchangeManager:
         leverage: int
     ) -> Dict[str, Any]:
         """
-        Open hedged position between two exchanges with atomic-like behavior.
-        If one exchange fails, automatically rollback the other.
+        Open hedged position between two exchanges.
+        If one exchange fails, does NOT rollback the other - fails immediately.
         """
         results = {"success": False, "long_order": None, "short_order": None, "error": None}
         
         if long_exchange not in self.clients or short_exchange not in self.clients:
             results["error"] = "One or both exchanges not connected"
             return results
-        
+
         long_client = self.clients[long_exchange]
         short_client = self.clients[short_exchange]
         
         long_symbol = get_exchange_symbol(pair, long_exchange)
         short_symbol = get_exchange_symbol(pair, short_exchange)
-        
-        # Track what we've done for rollback
         long_order = None
         short_order = None
         leverage_set = False
@@ -276,17 +274,7 @@ class MultiExchangeManager:
                 )
                 logger.info(f"✓ SHORT order placed: {short_order.order_id}")
             except Exception as e:
-                # SHORT failed after 3 retries but LONG succeeded - CRITICAL: Must rollback LONG!
-                logger.error(f"✗ SHORT order failed after 3 retries! Attempting to rollback LONG position...")
-                
-                rollback_success = await self._rollback_long_position(
-                    long_client, long_symbol, long_order, long_exchange
-                )
-                
-                if rollback_success:
-                    raise Exception(f"SHORT order failed on {short_exchange.value} after 3 retries, LONG position rolled back successfully: {e}")
-                else:
-                    raise Exception(f"CRITICAL: SHORT order failed AND rollback failed! You have an unhedged LONG position on {long_exchange.value}. Please close manually! Error: {e}")
+                raise Exception(f"SHORT order failed on {short_exchange.value} after 3 retries: {e}")
             
             # Both orders successful
             results["success"] = True
@@ -670,20 +658,8 @@ class MultiExchangeManager:
                                 await asyncio.sleep(0.5 * (2 ** attempt))
                     
                     if not short_closed:
-                        # SHORT failed but LONG succeeded - try to reopen LONG to maintain hedge
-                        log_msg(f"❌ SHORT close failed after 3 retries. Attempting to reopen LONG to maintain hedge...")
-                        
-                        try:
-                            # Reopen LONG position with same size
-                            await self._place_order_with_retry(
-                                long_client, long_symbol, Side.LONG, long_size_to_close, long_exchange, max_retries=3
-                            )
-                            log_msg(f"✓ LONG reopened to maintain hedge. Please retry closing later.")
-                            results["error"] = "SHORT close failed, LONG reopened to maintain hedge"
-                        except Exception as reopen_error:
-                            log_msg(f"❌ CRITICAL: SHORT close failed AND LONG reopen failed! Volume mismatch exists. Error: {reopen_error}")
-                            results["error"] = f"CRITICAL: Volume mismatch! SHORT close failed, LONG reopen failed: {reopen_error}"
-                        
+                        log_msg(f"❌ SHORT close failed after 3 retries. Stopping.")
+                        results["error"] = "SHORT close failed after 3 retries"
                         return results
                 
                 results["closed_splits"] = split_num
@@ -1224,95 +1200,15 @@ class MultiExchangeManager:
                         await asyncio.sleep(delay_between_splits)
                 
                 except asyncio.TimeoutError:
-                    log_important(f"⚠️ Split {split_num} timeout - retrying once...")
-                    
-                    # Wait if we're in the restricted time window before retry
-                    while True:
-                        now = datetime.now(timezone.utc)
-                        minute = now.minute
-                        if minute >= 59 or minute <= 1:
-                            log_msg(f"⏳ Split {split_num}: Chờ qua phút {minute} (funding settlement)...", force=True)
-                            await asyncio.sleep(5)
-                        else:
-                            break
-                    
-                    # Retry once on timeout
-                    try:
-                        long_order, short_order = await asyncio.wait_for(
-                            asyncio.gather(
-                                long_client.place_market_order(long_symbol, Side.LONG, size_per_split),
-                                short_client.place_market_order(short_symbol, Side.SHORT, size_per_split)
-                            ),
-                            timeout=30.0
-                        )
-                        results["splits_completed"] += 1
-                        results["total_long_size"] += size_per_split
-                        results["total_short_size"] += size_per_split
-                        results["split_results"].append({
-                            "split": split_num,
-                            "success": True,
-                            "long_order": long_order.order_id if long_order else None,
-                            "short_order": short_order.order_id if short_order else None
-                        })
-                        log_msg(f"✓ Split {split_num}/{split_count} completed (retry)", force=should_log_this_split)
-                        
-                        if split_num == 1 and on_first_split_complete:
-                            try:
-                                on_first_split_complete(size_per_split)
-                            except Exception as e:
-                                logger.error(f"Error in on_first_split_complete callback: {e}")
-                        
-                        if i < split_count - 1:
-                            await asyncio.sleep(delay_between_splits)
-                    except Exception as retry_e:
-                        logger.error(f"✗ Split {split_num} failed on retry: {retry_e}")
-                        results["split_results"].append({
-                            "split": split_num,
-                            "success": False,
-                            "error": str(retry_e)
-                        })
-                        
-                        # === REROLL ON FAILURE ===
-                        long_pos = await long_client.get_position(long_symbol, force_rest=True)
-                        short_pos = await short_client.get_position(short_symbol, force_rest=True)
-                        
-                        long_actual = long_pos.size if long_pos else 0
-                        short_actual = short_pos.size if short_pos else 0
-                        size_diff = abs(long_actual - short_actual)
-                        
-                        if size_diff > 0.0001:
-                            reroll_success = False
-                            for reroll_attempt in range(1, 4):
-                                diff = long_actual - short_actual
-                                log_important(f"⚠️ Mismatch: Long={long_actual:.6f}, Short={short_actual:.6f}. Reroll #{reroll_attempt}")
-                                
-                                try:
-                                    if diff > 0:
-                                        await short_client.place_market_order(short_symbol, Side.SHORT, abs(diff))
-                                    else:
-                                        await long_client.place_market_order(long_symbol, Side.LONG, abs(diff))
-                                    
-                                    await asyncio.sleep(1)
-                                    
-                                    long_pos = await long_client.get_position(long_symbol, force_rest=True)
-                                    short_pos = await short_client.get_position(short_symbol, force_rest=True)
-                                    long_actual = long_pos.size if long_pos else 0
-                                    short_actual = short_pos.size if short_pos else 0
-                                    size_diff = abs(long_actual - short_actual)
-                                    
-                                    if size_diff <= 0.0001:
-                                        log_msg(f"✓ Reroll thành công sau {reroll_attempt} lần", force=True)
-                                        reroll_success = True
-                                        break
-                                except Exception as reroll_e:
-                                    logger.error(f"Reroll #{reroll_attempt} failed: {reroll_e}")
-                            
-                            if not reroll_success:
-                                log_important(f"❌ Reroll failed 3 lần. STOP. Long={long_actual:.6f}, Short={short_actual:.6f}")
-                                results["error"] = "Reroll failed after 3 attempts"
-                                results["success"] = results["splits_completed"] > 0
-                                break
-                        # === END REROLL ===
+                    log_important(f"⚠️ Split {split_num} timeout - dừng ngay")
+                    results["split_results"].append({
+                        "split": split_num,
+                        "success": False,
+                        "error": "Timeout"
+                    })
+                    results["error"] = f"Split {split_num} timeout"
+                    results["success"] = results["splits_completed"] > 0
+                    return results
                         
                 except Exception as e:
                     logger.error(f"✗ Split {split_num} failed: {e}")
@@ -1322,48 +1218,9 @@ class MultiExchangeManager:
                         "success": False,
                         "error": str(e)
                     })
-                    
-                    # === REROLL ON FAILURE ===
-                    long_pos = await long_client.get_position(long_symbol, force_rest=True)
-                    short_pos = await short_client.get_position(short_symbol, force_rest=True)
-                    
-                    long_actual = long_pos.size if long_pos else 0
-                    short_actual = short_pos.size if short_pos else 0
-                    size_diff = abs(long_actual - short_actual)
-                    
-                    if size_diff > 0.0001:
-                        reroll_success = False
-                        for reroll_attempt in range(1, 4):
-                            diff = long_actual - short_actual
-                            log_important(f"⚠️ Mismatch: Long={long_actual:.6f}, Short={short_actual:.6f}. Reroll #{reroll_attempt}")
-                            
-                            try:
-                                if diff > 0:
-                                    await short_client.place_market_order(short_symbol, Side.SHORT, abs(diff))
-                                else:
-                                    await long_client.place_market_order(long_symbol, Side.LONG, abs(diff))
-                                
-                                await asyncio.sleep(1)
-                                
-                                long_pos = await long_client.get_position(long_symbol, force_rest=True)
-                                short_pos = await short_client.get_position(short_symbol, force_rest=True)
-                                long_actual = long_pos.size if long_pos else 0
-                                short_actual = short_pos.size if short_pos else 0
-                                size_diff = abs(long_actual - short_actual)
-                                
-                                if size_diff <= 0.0001:
-                                    log_msg(f"✓ Reroll thành công sau {reroll_attempt} lần", force=True)
-                                    reroll_success = True
-                                    break
-                            except Exception as reroll_e:
-                                logger.error(f"Reroll #{reroll_attempt} failed: {reroll_e}")
-                        
-                        if not reroll_success:
-                            log_important(f"❌ Reroll failed 3 lần. STOP. Long={long_actual:.6f}, Short={short_actual:.6f}")
-                            results["error"] = "Reroll failed after 3 attempts"
-                            results["success"] = results["splits_completed"] > 0
-                            break
-                    # === END REROLL ===
+                    results["error"] = f"Split {split_num} failed: {e}"
+                    results["success"] = results["splits_completed"] > 0
+                    return results
             
             # Consider success if at least one split completed
             if results["splits_completed"] > 0:

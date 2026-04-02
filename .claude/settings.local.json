@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''basis_checker.py'', doraise=True\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''basis_checker.py'', doraise=True\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''exchanges/bingx_client.py'', doraise=True\\); py_compile.compile\\(''gui/app.py'', doraise=True\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''core/multi_exchange.py'', doraise=True\\); py_compile.compile\\(''core/trading_engine.py'', doraise=True\\); py_compile.compile\\(''cli.py'', doraise=True\\); py_compile.compile\\(''gui/app.py'', doraise=True\\); print\\(''OK''\\)\")",
+      "Bash(pyinstaller --onefile --noconsole --name Funding_hunter_v_0_3 gui/app.py)",
+      "WebFetch(domain:bybit-exchange.github.io)",
+      "Bash(python -m py_compile config/settings.py)",
+      "Bash(python -m py_compile config/constants.py)",
+      "Bash(python -m py_compile exchanges/bybit_client.py)",
+      "Bash(python -m py_compile core/config_manager.py)",
+      "Bash(python -m py_compile core/trading_engine.py)",
+      "Bash(python -m py_compile gui/app.py)"
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+    def _update_usdt_volume(self, event=None):
+        """Update USDT volume display based on size and current price"""
+        # Cancel any pending update to prevent spam
+        if hasattr(self, '_usdt_update_pending') and self._usdt_update_pending:
+            self.root.after_cancel(self._usdt_update_pending)
+            self._usdt_update_pending = None
+        
+        # Debounce - wait 500ms before actually fetching
+        self._usdt_update_pending = self.root.after(500, self._do_update_usdt_volume)

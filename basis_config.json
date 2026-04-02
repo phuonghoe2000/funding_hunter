@@ -1,0 +1,14 @@
+{
+  "telegram_bot_token": "5101987897:AAErA_B0GZcXDrrDUYa6K2XWaAr1150j5a8",
+  "telegram_chat_id": "-5153425085",
+  "telegram_enabled": true,
+  "alert_threshold": 2.0,
+  "bn_api_key": "8HA4QALxYHpz90Lcos7OB7LngaA0kCIGvlsmXJfZFgYy7UMVPDHpEyjUuc3uDpoG",
+  "bn_secret": "lLTpJrIhBhRwzTbeQ8PvKyWvJdZt07QU51nrwh90lTMv7jjOFMifpOk0BYxGD0sx",
+  "as_api_key": "f11c2ff024e052382a66f56b36f6f06c4e7c137c43d8480207b2d7e25c133655",
+  "as_secret": "e4ee3c3c97c7407c99a053070943f45c8b47e96aa12c1568b0728cfa938cf722",
+  "max_trade_volume": 1000.0,
+  "per_trade_usdt": 10.0,
+  "trade_leverage": 1,
+  "min_basis": 2.0
+}

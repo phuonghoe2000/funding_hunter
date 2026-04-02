@@ -1,0 +1,55 @@
+    def _start_analyze_for_close(self):
+        """Run analyze spread and then start closing"""
+        params = self.close_params
+        if not params:
+            return
+        
+        def safe_log(msg):
+            self.root.after(0, lambda m=msg: self._log(m))
+        
+        async def do_analyze():
+            result = await self.manager.analyze_spread(
+                params["pair"],
+                params["long_exchange"],
+                params["short_exchange"],
+                duration_seconds=120.0,  # 2 phút
+                check_interval=2.0,      # 2 giây
+                log_callback=safe_log,
+                cancel_event=self.close_cancel_event,
+                mode="close"  # Mode đóng: LONG_BID - SHORT_ASK
+            )
+            return result
+        
+        future = self._run_async(do_analyze())
+        if future:
+            future.add_done_callback(lambda f: self._on_analyze_for_close_complete(f))
+
+
+    def _execute_close_with_splits(self):
+        """Execute the actual close with splits after analyze"""
+        params = self.close_params
+        if not params:
+            return
+        
+        # Create cancel event for splits
+        self.split_cancel_event = threading.Event()
+        
+        def progress_callback(split_num, total_splits, message):
+            self.root.after(0, lambda: self._log(f"   {message}"))
+        
+        async def async_close():
+            return await self.manager.close_hedged_position_split(
+                params['pair'], 
+                params['long_exchange'], 
+                params['short_exchange'],
+                splits=params['splits'],
+                interval_seconds=2.0,
+                price_spread_min=params['price_spread_min'],
+                spread_check_interval=2.0,
+                progress_callback=progress_callback,
+                cancel_event=self.split_cancel_event
+            )
+        
+        future = self._run_async(async_close())
+        if future:
+            future.add_done_callback(self._on_close_complete)

@@ -79,6 +79,7 @@ from exchanges.binance_client import BinanceClient
 from exchanges.bingx_client import BingXClient
 from exchanges.gate_client import GateClient
 from exchanges.aster_client import AsterClient
+from exchanges.bybit_client import BybitClient
 from exchanges.base import BaseExchangeClient, FundingRate
 from core.multi_exchange import MultiExchangeManager
 
@@ -196,6 +197,12 @@ class FundingHunterGUI:
                     "testnet": self.asterdex_testnet.get(),
                     "enabled": self.asterdex_enabled.get()
                 },
+                "bybit": {
+                    "api_key": self.bybit_api_key.get(),
+                    "secret": self.bybit_secret.get(),
+                    "testnet": self.bybit_testnet.get(),
+                    "enabled": self.bybit_enabled.get()
+                },
                 "trading": {
                     "leverage": self.leverage_var.get(),
                     "size": self.size_entry.get(),
@@ -266,7 +273,16 @@ class FundingHunterGUI:
                 self.asterdex_secret.insert(0, config["asterdex"].get("secret", ""))
                 self.asterdex_testnet.set(config["asterdex"].get("testnet", False))
                 self.asterdex_enabled.set(config["asterdex"].get("enabled", False))
-            
+
+            # Bybit
+            if "bybit" in config:
+                self.bybit_api_key.delete(0, tk.END)
+                self.bybit_api_key.insert(0, config["bybit"].get("api_key", ""))
+                self.bybit_secret.delete(0, tk.END)
+                self.bybit_secret.insert(0, config["bybit"].get("secret", ""))
+                self.bybit_testnet.set(config["bybit"].get("testnet", False))
+                self.bybit_enabled.set(config["bybit"].get("enabled", False))
+
             # Trading settings
             if "trading" in config:
                 self.leverage_var.set(config["trading"].get("leverage", "3"))
@@ -400,7 +416,25 @@ class FundingHunterGUI:
         
         self.asterdex_enabled = tk.BooleanVar(value=False)
         ttk.Checkbutton(asterdex_frame, text="Enable", variable=self.asterdex_enabled).grid(row=0, column=5, padx=5)
-        
+
+        # Bybit Tab
+        bybit_frame = ttk.Frame(notebook, padding="10")
+        notebook.add(bybit_frame, text="Bybit")
+
+        ttk.Label(bybit_frame, text="API Key:").grid(row=0, column=0, padx=5, pady=2, sticky='e')
+        self.bybit_api_key = ttk.Entry(bybit_frame, width=40, show="*")
+        self.bybit_api_key.grid(row=0, column=1, padx=5, pady=2)
+
+        ttk.Label(bybit_frame, text="Secret:").grid(row=0, column=2, padx=5, pady=2, sticky='e')
+        self.bybit_secret = ttk.Entry(bybit_frame, width=40, show="*")
+        self.bybit_secret.grid(row=0, column=3, padx=5, pady=2)
+
+        self.bybit_testnet = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bybit_frame, text="Testnet", variable=self.bybit_testnet).grid(row=0, column=4, padx=10)
+
+        self.bybit_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bybit_frame, text="Enable", variable=self.bybit_enabled).grid(row=0, column=5, padx=5)
+
         # Connection buttons
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=tk.X, pady=10)
@@ -443,6 +477,10 @@ class FundingHunterGUI:
         ttk.Label(self.balance_frame, text="Aster:").pack(side=tk.LEFT, padx=2)
         self.asterdex_balance_label = ttk.Label(self.balance_frame, text="$0.00")
         self.asterdex_balance_label.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(self.balance_frame, text="Bybit:").pack(side=tk.LEFT, padx=2)
+        self.bybit_balance_label = ttk.Label(self.balance_frame, text="$0.00")
+        self.bybit_balance_label.pack(side=tk.LEFT, padx=5)
     
     def _create_trading_frame(self, parent):
         """Create trading panel with scrollbar"""
@@ -638,24 +676,35 @@ class FundingHunterGUI:
         self.refresh_funding_btn.pack(side=tk.LEFT, padx=5)
         
         # Funding table
-        columns = ("Pair", "OKX", "Binance", "BingX", "Gate", "Asterdex", "Best Spread", "Recommendation")
+        # Exchange columns that can be shown/hidden based on connection
+        self._exchange_columns = {
+            "OKX": Exchange.OKX,
+            "Binance": Exchange.BINANCE,
+            "BingX": Exchange.BINGX,
+            "Gate": Exchange.GATE,
+            "Asterdex": Exchange.ASTERDEX,
+            "Bybit": Exchange.BYBIT,
+        }
+        columns = ("Pair", "OKX", "Binance", "BingX", "Gate", "Asterdex", "Bybit", "Best Spread", "Recommendation")
         self.funding_tree = ttk.Treeview(frame, columns=columns, show="headings", height=10)
-        
+
         self.funding_tree.heading("Pair", text="Pair")
         self.funding_tree.heading("OKX", text="OKX Rate")
         self.funding_tree.heading("Binance", text="Binance Rate")
         self.funding_tree.heading("BingX", text="BingX Rate")
         self.funding_tree.heading("Gate", text="Gate Rate")
         self.funding_tree.heading("Asterdex", text="Aster Rate")
+        self.funding_tree.heading("Bybit", text="Bybit Rate")
         self.funding_tree.heading("Best Spread", text="Best Spread")
         self.funding_tree.heading("Recommendation", text="Recommendation")
-        
+
         self.funding_tree.column("Pair", width=80)
         self.funding_tree.column("OKX", width=85)
         self.funding_tree.column("Binance", width=85)
         self.funding_tree.column("BingX", width=85)
         self.funding_tree.column("Gate", width=85)
         self.funding_tree.column("Asterdex", width=85)
+        self.funding_tree.column("Bybit", width=85)
         self.funding_tree.column("Best Spread", width=85)
         self.funding_tree.column("Recommendation", width=140)
         
@@ -804,7 +853,8 @@ class FundingHunterGUI:
             "Binance": Exchange.BINANCE,
             "BingX": Exchange.BINGX,
             "Gate.io": Exchange.GATE,
-            "Asterdex": Exchange.ASTERDEX
+            "Asterdex": Exchange.ASTERDEX,
+            "Bybit": Exchange.BYBIT
         }
         return mapping.get(name, Exchange.OKX)
     
@@ -894,6 +944,20 @@ class FundingHunterGUI:
                 client = AsterClient(settings.asterdex, debug=self.debug_mode.get())
                 if await self.manager.connect_exchange(Exchange.ASTERDEX, client):
                     connected.append("Asterdex")
+
+        # Bybit
+        if self.bybit_enabled.get():
+            bybit_key = self.bybit_api_key.get().strip()
+            bybit_secret = self.bybit_secret.get().strip()
+
+            if bybit_key and bybit_secret:
+                settings.bybit.api_key = bybit_key
+                settings.bybit.secret_key = bybit_secret
+                settings.bybit.testnet = self.bybit_testnet.get()
+
+                client = BybitClient(settings.bybit, debug=self.debug_mode.get())
+                if await self.manager.connect_exchange(Exchange.BYBIT, client):
+                    connected.append("Bybit")
         
         # Get balances
         balances = await self.manager.get_all_balances()
@@ -943,7 +1007,17 @@ class FundingHunterGUI:
             self.gate_balance_label.config(text=f"${balances[Exchange.GATE].available:.6f}")
         if Exchange.ASTERDEX in balances:
             self.asterdex_balance_label.config(text=f"${balances[Exchange.ASTERDEX].available:.6f}")
-        
+        if Exchange.BYBIT in balances:
+            self.bybit_balance_label.config(text=f"${balances[Exchange.BYBIT].available:.6f}")
+
+        # Show/hide funding table columns based on connected exchanges
+        connected_exchanges = set(self.manager.clients.keys())
+        for col_name, ex_enum in self._exchange_columns.items():
+            if ex_enum in connected_exchanges:
+                self.funding_tree.column(col_name, width=85, stretch=True)
+            else:
+                self.funding_tree.column(col_name, width=0, minwidth=0, stretch=False)
+
         # Update exchange dropdowns
         available = connected  # Use exchange names directly from connected list
         self.long_exchange['values'] = available
@@ -2840,6 +2914,10 @@ class FundingHunterGUI:
             if bingx_client:
                 bulk_tasks[Exchange.BINGX] = bingx_client.get_all_funding_rates()
 
+            bybit_client = self.manager.clients.get(Exchange.BYBIT)
+            if bybit_client:
+                bulk_tasks[Exchange.BYBIT] = bybit_client.get_all_funding_rates()
+
             if not bulk_tasks:
                 logger.error("No exchange connected for bulk funding rate fetch")
                 return {}
@@ -2973,18 +3051,18 @@ class FundingHunterGUI:
         for pair, rates in all_rates.items():
             # Collect normalized rate values
             rate_values = {}
-            for ex_enum in [Exchange.OKX, Exchange.BINANCE, Exchange.BINGX, Exchange.GATE, Exchange.ASTERDEX]:
+            for ex_enum in [Exchange.OKX, Exchange.BINANCE, Exchange.BINGX, Exchange.GATE, Exchange.ASTERDEX, Exchange.BYBIT]:
                 if ex_enum in rates:
                     norm = normalize_to_4h(rates[ex_enum])
                     if norm is not None:
                         rate_values[ex_enum] = norm
-            
+
             # Calculate spread
             spread_value = 0.0
             if len(rate_values) >= 2:
                 sorted_rates = sorted(rate_values.values())
                 spread_value = (sorted_rates[-1] - sorted_rates[0]) * 100  # Convert to percentage
-            
+
             pairs_with_spreads.append((pair, rates, spread_value))
         
         # Sort by spread (highest to lowest), show top 10
@@ -3008,10 +3086,11 @@ class FundingHunterGUI:
             bingx_val = fmt_rate(Exchange.BINGX)
             gate_val = fmt_rate(Exchange.GATE)
             aster_val = fmt_rate(Exchange.ASTERDEX)
-            
+            bybit_val = fmt_rate(Exchange.BYBIT)
+
             # Find best spread using normalized rates
             rate_values = {}
-            for ex_enum in [Exchange.OKX, Exchange.BINANCE, Exchange.BINGX, Exchange.GATE, Exchange.ASTERDEX]:
+            for ex_enum in [Exchange.OKX, Exchange.BINANCE, Exchange.BINGX, Exchange.GATE, Exchange.ASTERDEX, Exchange.BYBIT]:
                 if ex_enum in rates:
                     norm = normalize_to_4h(rates[ex_enum])
                     if norm is not None:
@@ -3029,7 +3108,7 @@ class FundingHunterGUI:
                 recommendation = f"Long {lowest[0].value}, Short {highest[0].value}"
             
             self.funding_tree.insert("", tk.END, values=(
-                pair, okx_val, binance_val, bingx_val, gate_val, aster_val, best_spread, recommendation
+                pair, okx_val, binance_val, bingx_val, gate_val, aster_val, bybit_val, best_spread, recommendation
             ))
         
         self._log(f"Loaded top 10 from {len(sorted_pairs)} pairs sorted by Best Spread (normalized to 4h)")
@@ -3058,7 +3137,7 @@ class FundingHunterGUI:
                 short_ex = parts[1].replace("Short ", "").strip().lower()
                 
                 # Map to display names (case-insensitive)
-                name_map = {"okx": "OKX", "binance": "Binance", "bingx": "BingX", "gate": "Gate.io", "asterdex": "Asterdex"}
+                name_map = {"okx": "OKX", "binance": "Binance", "bingx": "BingX", "gate": "Gate.io", "asterdex": "Asterdex", "bybit": "Bybit"}
                 long_display = name_map.get(long_ex, long_ex.upper())
                 short_display = name_map.get(short_ex, short_ex.upper())
                 
@@ -3150,7 +3229,7 @@ class FundingHunterGUI:
             return
         
         # Map display names to Exchange enum
-        exchange_map = {"OKX": Exchange.OKX, "Binance": Exchange.BINANCE, "BingX": Exchange.BINGX, "Gate.io": Exchange.GATE, "Asterdex": Exchange.ASTERDEX}
+        exchange_map = {"OKX": Exchange.OKX, "Binance": Exchange.BINANCE, "BingX": Exchange.BINGX, "Gate.io": Exchange.GATE, "Asterdex": Exchange.ASTERDEX, "Bybit": Exchange.BYBIT}
         long_ex = exchange_map.get(long_display)
         short_ex = exchange_map.get(short_display)
         

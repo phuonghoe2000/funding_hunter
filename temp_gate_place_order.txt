@@ -1,0 +1,40 @@
+    async def place_market_order(
+        self,
+        symbol: str,
+        side: Side,
+        size: float,
+        reduce_only: bool = False
+    ) -> Order:
+        """Place a market order
+        
+        Gate.io uses contract size, not USDT value.
+        Positive size = long, negative size = short
+        """
+        gate_symbol = symbol if "_" in symbol else get_exchange_symbol(symbol, Exchange.GATE)
+        
+        # Gate.io: positive size for long, negative for short
+        order_size = int(size) if side == Side.LONG else -int(size)
+        
+        body = {
+            "contract": gate_symbol,
+            "size": order_size,
+            "price": "0",  # Market order uses price=0
+            "tif": "ioc",  # Immediate or cancel for market order
+            "reduce_only": reduce_only
+        }
+        
+        result = await self._request("POST", "/api/v4/futures/usdt/orders", body=body)
+        
+        return Order(
+            order_id=str(result.get("id", "")),
+            symbol=gate_symbol,
+            side=side,
+            order_type=OrderType.MARKET,
+            size=abs(float(result.get("size", size))),
+            price=None,
+            filled_size=abs(float(result.get("size", 0)) - float(result.get("left", 0))),
+            avg_price=float(result.get("fill_price", 0)) if result.get("fill_price") else 0,
+            status=result.get("status", "open"),
+            timestamp=datetime.now(timezone.utc),
+            raw_data=result
+        )

@@ -1,0 +1,10 @@
+    async def get_mark_price(self, symbol: str) -> float:
+        bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
+        
+        result = await self._request("GET", "/openApi/swap/v2/quote/premiumIndex",
+                                     {"symbol": bingx_symbol}, signed=False)
+        
+        if result.get("code") == 0 and result.get("data"):
+            return float(result["data"].get("markPrice", 0))
+        
+        raise Exception(f"No mark price data for {bingx_symbol}")

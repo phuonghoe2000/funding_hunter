@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from config.settings import Settings, OKXConfig, BinanceConfig, BingXConfig, GateConfig, AsterdexConfig
+from config.settings import Settings, OKXConfig, BinanceConfig, BingXConfig, GateConfig, AsterdexConfig, BybitConfig
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,14 @@ class ConfigManager:
                 settings.asterdex = AsterdexConfig(
                     api_key=config_data["asterdex"].get("api_key", ""),
                     secret_key=config_data["asterdex"].get("secret", "")
+                )
+
+            # Bybit
+            if "bybit" in config_data and config_data["bybit"].get("enabled", False):
+                settings.bybit = BybitConfig(
+                    api_key=config_data["bybit"].get("api_key", ""),
+                    secret_key=config_data["bybit"].get("secret", ""),
+                    testnet=config_data["bybit"].get("testnet", False)
                 )
                 
             logger.info(f"Successfully loaded configuration from {self.config_path}")

@@ -1,0 +1,5 @@
+    def _run_async(self, coro):
+        """Run coroutine"""
+        if self.loop:
+            return asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return None

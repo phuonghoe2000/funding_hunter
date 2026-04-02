@@ -94,14 +94,34 @@ class AsterdexConfig:
     secret_key: str = ""
     # Testnet not explicitly documented, wait for user
     testnet: bool = False
-    
+
     @property
     def base_url(self) -> str:
         return "https://fapi.asterdex.com"
-    
+
     @property
     def ws_url(self) -> str:
         return "wss://fstream.asterdex.com"
+
+
+@dataclass
+class BybitConfig:
+    """Bybit API Configuration"""
+    api_key: str = ""
+    secret_key: str = ""
+    testnet: bool = False
+
+    @property
+    def base_url(self) -> str:
+        if self.testnet:
+            return "https://api-testnet.bybit.com"
+        return "https://api.bybit.com"
+
+    @property
+    def ws_url(self) -> str:
+        if self.testnet:
+            return "wss://stream-testnet.bybit.com"
+        return "wss://stream.bybit.com"
 
 
 @dataclass
@@ -131,13 +151,14 @@ class TradingConfig:
 
 class Settings:
     """Main settings class"""
-    
+
     def __init__(self):
         self.okx = OKXConfig()
         self.binance = BinanceConfig()
         self.bingx = BingXConfig()
         self.gate = GateConfig()
         self.asterdex = AsterdexConfig()
+        self.bybit = BybitConfig()
         self.trading = TradingConfig()
     
     def load_from_env(self):

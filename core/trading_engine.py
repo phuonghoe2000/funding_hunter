@@ -12,6 +12,7 @@ from exchanges.binance_client import BinanceClient
 from exchanges.bingx_client import BingXClient
 from exchanges.gate_client import GateClient
 from exchanges.aster_client import AsterClient
+from exchanges.bybit_client import BybitClient
 from exchanges.base import FundingRate
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,8 @@ class TradingEngine:
         if aster_cfg and aster_cfg.api_key:
             ex_enum = Exchange.ASTERDEX if hasattr(Exchange, 'ASTERDEX') else getattr(Exchange, 'ASTER')
             tasks.append(self.exchange_manager.connect_exchange(ex_enum, AsterClient(aster_cfg)))
+        if self.settings.bybit and self.settings.bybit.api_key:
+            tasks.append(self.exchange_manager.connect_exchange(Exchange.BYBIT, BybitClient(self.settings.bybit)))
         if not tasks:
             logger.warning("No exchanges enabled in settings.")
             return False

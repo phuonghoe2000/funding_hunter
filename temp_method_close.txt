@@ -1,0 +1,49 @@
+    def _close_position(self):
+        """Close position - analyze spread first, then close in splits"""
+        if not self.active_position:
+            messagebox.showinfo("Info", "No active position")
+            return
+        
+        # If already analyzing or waiting, this is a CANCEL action
+        if getattr(self, 'analyzing_close', False) or getattr(self, 'waiting_for_close', False):
+            self._cancel_close_process()
+            return
+
+        try:
+            splits = int(self.split_count_var.get())
+            if splits < 1: splits = 1
+        except:
+            splits = 1
+        
+        confirm_msg = f"Close position in {splits} split(s)?\nWill analyze spread 5 minutes first."
+        if not messagebox.askyesno("Confirm", confirm_msg):
+            return
+        
+        pos = self.active_position
+        self._log(f"📤 Bắt đầu quá trình đóng position {pos['pair']}...")
+        
+        # STOP ALL BACKGROUND TASKS
+        self._stop_all_background_tasks()
+        
+        # Update UI state
+        self.analyzing_close = True
+        self.close_cancel_event = threading.Event()
+        self.close_btn.configure(text="📊 Analyzing... (Cancel)", state=tk.NORMAL)
+        self.open_btn.configure(state=tk.DISABLED)
+        
+        # Store close params
+        self.close_params = {
+            "pair": pos["pair"],
+            "long_exchange": pos["long_exchange"],
+            "short_exchange": pos["short_exchange"],
+            "splits": splits,
+            "price_spread_min": None  # Will be set after analyze
+        }
+        
+        # Subscribe to WS Market Data
+        self._run_async(self.manager.subscribe_market_data(pos['pair'], pos['long_exchange'], pos['short_exchange']))
+        
+        self._log(f"📊 Bắt đầu analyze spread 5 phút cho CLOSE...")
+        
+        # Start analyze for close
+        self._start_analyze_for_close()

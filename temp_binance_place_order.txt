@@ -1,0 +1,52 @@
+    async def place_market_order(
+        self,
+        symbol: str,
+        side: Side,
+        size: float,
+        reduce_only: bool = False
+    ) -> Order:
+        """Place a market order"""
+        binance_symbol = symbol if "USDT" in symbol and "-" not in symbol else get_exchange_symbol(symbol, Exchange.BINANCE)
+        
+        # Get current price to convert USDT size to asset size
+        current_price = await self.get_mark_price(binance_symbol)
+        asset_size = size / current_price if current_price else size
+        
+        # Format size based on symbol to avoid precision errors
+        if "BTC" in binance_symbol:
+            asset_size = round(asset_size, 3)
+        elif "ETH" in binance_symbol:
+            asset_size = round(asset_size, 2)
+        elif asset_size < 1:
+            asset_size = round(asset_size, 4)
+        else:
+            asset_size = self._round_quantity(binance_symbol, asset_size)
+            
+        params = {
+            "symbol": binance_symbol,
+            "side": "BUY" if side == Side.LONG else "SELL",
+            "type": "MARKET",
+            "quantity": asset_size,
+        }
+        
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        elif self.hedge_mode:
+            # Set position side for hedge mode
+            params["positionSide"] = "LONG" if side == Side.LONG else "SHORT"
+        
+        result = await self._request("POST", "/fapi/v1/order", params)
+        
+        return Order(
+            order_id=str(result["orderId"]),
+            symbol=binance_symbol,
+            side=side,
+            order_type=OrderType.MARKET,
+            size=float(result.get("origQty", size)),
+            price=None,
+            filled_size=float(result.get("executedQty", 0)),
+            avg_price=float(result.get("avgPrice", 0)),
+            status=result.get("status", "NEW"),
+            timestamp=datetime.fromtimestamp(result.get("updateTime", time.time() * 1000) / 1000, tz=timezone.utc),
+            raw_data=result
+        )

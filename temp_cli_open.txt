@@ -1,0 +1,9 @@
+async def cmd_open(engine, args):
+    result = await engine.open_position(
+        pair=args.pair, long_ex_name=args.long, short_ex_name=args.short,
+        size=args.size, leverage=args.leverage, splits=args.splits,
+        price_spread_min=args.price_spread_min, skip_leverage=args.skip_leverage,
+        analyze_duration=args.analyze_duration,
+        skip_spread_check=args.skip_spread_check
+    )
+    _json(result)

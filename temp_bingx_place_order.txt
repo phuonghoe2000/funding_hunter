@@ -1,0 +1,57 @@
+    async def place_market_order(
+        self,
+        symbol: str,
+        side: Side,
+        size: float,
+        reduce_only: bool = False
+    ) -> Order:
+        """Place a market order"""
+        bingx_symbol = symbol if "-" in symbol else get_exchange_symbol(symbol, Exchange.BINGX)
+        
+        # Get current price to convert USDT size to asset size
+        current_price = await self.get_mark_price(bingx_symbol)
+        asset_size = size / current_price if current_price else size
+        
+        # Format size based on symbol to avoid precision errors
+        if "BTC" in bingx_symbol:
+            asset_size = round(asset_size, 3)
+        elif "ETH" in bingx_symbol:
+            asset_size = round(asset_size, 2)
+        elif asset_size < 1:
+            asset_size = round(asset_size, 4)
+        else:
+            asset_size = round(asset_size, 1)
+            
+        # BingX expects quantity as a string to avoid floating point precision issues
+        params = {
+            "symbol": bingx_symbol,
+            "side": "BUY" if side == Side.LONG else "SELL",
+            "type": "MARKET",
+            "quantity": str(asset_size),
+            "positionSide": "LONG" if side == Side.LONG else "SHORT"
+        }
+        
+        if reduce_only:
+            # For closing, reverse the side
+            params["positionSide"] = "SHORT" if side == Side.LONG else "LONG"
+        
+        result = await self._request("POST", "/openApi/swap/v2/trade/order", params)
+        
+        if result.get("code") != 0:
+            raise Exception(f"Order failed: {result.get('msg')}")
+        
+        order_data = result.get("data", {}).get("order", {})
+        
+        return Order(
+            order_id=str(order_data.get("orderId", "")),
+            symbol=bingx_symbol,
+            side=side,
+            order_type=OrderType.MARKET,
+            size=float(order_data.get("origQty", size)),
+            price=None,
+            filled_size=float(order_data.get("executedQty", 0)),
+            avg_price=float(order_data.get("avgPrice", 0)),
+            status=order_data.get("status", "NEW"),
+            timestamp=datetime.now(timezone.utc),
+            raw_data=order_data
+        )

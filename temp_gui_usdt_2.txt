@@ -1,0 +1,44 @@
+    def _do_update_usdt_volume(self):
+        """Actually update USDT volume (debounced)"""
+        self._usdt_update_pending = None
+        
+        try:
+            size = float(self.size_entry.get())
+        except (ValueError, AttributeError):
+            self.usdt_vol_label.config(text="≈ $0.00 USDT")
+            return
+        
+        # Get cached price from any connected exchange
+        pair = self.pair_combo.get()
+        if not pair or not self.connected:
+            self.usdt_vol_label.config(text="≈ $?.?? USDT")
+            return
+        
+        # Fetch price async
+        async def get_price():
+            for exchange, client in self.manager.clients.items():
+                try:
+                    symbol = get_exchange_symbol(pair, exchange)
+                    price = await client.get_mark_price(symbol)
+                    return price
+                except:
+                    continue
+            return None
+        
+        def on_price(future):
+            try:
+                price = future.result()
+                if price:
+                    usdt_value = size * price
+                    self.root.after(0, lambda: self.usdt_vol_label.config(
+                        text=f"≈ ${usdt_value:,.2f} USDT",
+                        foreground="green" if usdt_value >= 10 else "orange"
+                    ))
+                else:
+                    self.root.after(0, lambda: self.usdt_vol_label.config(text="≈ $?.?? USDT"))
+            except:
+                pass
+        
+        future = self._run_async(get_price())
+        if future:
+            future.add_done_callback(on_price)
