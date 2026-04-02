@@ -19,6 +19,13 @@ from config.settings import settings
 from core.gui_service import GUIWorkflowService
 
 try:
+    from gui.close_controller import (
+        cancel_close_process as controller_cancel_close_process,
+        close_position as controller_close_position,
+        execute_close_workflow as controller_execute_close_workflow,
+        on_close_complete as controller_on_close_complete,
+        reset_close_button as controller_reset_close_button,
+    )
     from gui.display_formatters import (
         build_final_pnl_report_lines,
         build_funding_table_rows,
@@ -51,6 +58,13 @@ try:
         show_position_selector as show_existing_position_selector,
     )
 except ImportError:
+    from close_controller import (
+        cancel_close_process as controller_cancel_close_process,
+        close_position as controller_close_position,
+        execute_close_workflow as controller_execute_close_workflow,
+        on_close_complete as controller_on_close_complete,
+        reset_close_button as controller_reset_close_button,
+    )
     from display_formatters import (
         build_final_pnl_report_lines,
         build_funding_table_rows,
@@ -759,144 +773,20 @@ class FundingHunterGUI:
             future.add_done_callback(on_state_ready)
 
     def _close_position(self):
-        """Close position - analyze spread first, then close in splits. Supports partial close."""
-        if not self.active_position:
-            messagebox.showinfo("Info", "No active position")
-            return
+        """Close the active position."""
+        return controller_close_position(self)
 
-        # If already analyzing or waiting, this is a CANCEL action
-        if getattr(self, 'analyzing_close', False) or getattr(self, 'waiting_for_close', False):
-            self._cancel_close_process()
-            return
-
-        try:
-            splits = int(self.split_count_var.get())
-            if splits < 1: splits = 1
-        except:
-            splits = 1
-
-        skip_spread = self.skip_spread_check_var.get()
-
-        # Parse partial close size
-        close_size_str = self.close_size_var.get().strip()
-        close_size = None  # None = close all
-        if close_size_str:
-            try:
-                close_size = float(close_size_str)
-                if close_size <= 0:
-                    messagebox.showerror("Error", "Close size must be > 0")
-                    return
-            except ValueError:
-                messagebox.showerror("Error", "Invalid close size. Enter a number or leave empty for full close.")
-                return
-
-        pos = self.active_position
-
-        # Build confirm message with % info
-        if close_size is not None:
-            total_size = pos.get('size', 0) or pos.get('long_size', 0) or pos.get('short_size', 0)
-            if total_size > 0:
-                pct = (close_size / total_size) * 100
-                pct_str = f"{pct:.1f}%"
-            else:
-                pct_str = "?%"
-            size_info = f"Partial close: {close_size} tokens ({pct_str} of position)"
-        else:
-            size_info = "Full close: 100% of position"
-
-        if skip_spread:
-            confirm_msg = f"{size_info}\nSplits: {splits}\nSkip spread check, close immediately."
-        else:
-            confirm_msg = f"{size_info}\nSplits: {splits}\nAnalyze spread 2 minutes first."
-
-        if not messagebox.askyesno("Confirm Close", confirm_msg):
-            return
-        self._log(f"📤 Bắt đầu quá trình đóng position {pos['pair']}...")
-        
-        # STOP ALL BACKGROUND TASKS
-        self._stop_all_background_tasks()
-        
-        # Update UI state
-        self.analyzing_close = not skip_spread
-        self.close_cancel_event = threading.Event()
-        if skip_spread:
-            self.close_btn.configure(text="🛑 Closing... (Cancel)", state=tk.NORMAL)
-        else:
-            self.close_btn.configure(text="📊 Analyzing... (Cancel)", state=tk.NORMAL)
-        self.open_btn.configure(state=tk.DISABLED)
-        
-        # Store close params
-        self.close_params = {
-            "pair": pos["pair"],
-            "long_exchange": pos["long_exchange"],
-            "short_exchange": pos["short_exchange"],
-            "splits": splits,
-            "skip_spread_check": skip_spread,
-            "close_size": close_size,  # None = full close, float = partial close (token amount)
-        }
-        
-        # Subscribe to WS Market Data
-        self._run_async(self.manager.subscribe_market_data(pos['pair'], pos['long_exchange'], pos['short_exchange']))
-        
-        if skip_spread:
-            self._log(f"⚡ Bỏ qua analyze spread, tiến hành đóng lệnh ngay cho {pos['pair']}...")
-            self._execute_close_workflow()
-        else:
-            self._log(f"📊 Bắt đầu analyze spread 2 phút cho CLOSE...")
-            # Start analyze for close
-            self._execute_close_workflow()
-    
     def _reset_close_button(self):
-        """Reset close button to default state"""
-        self.analyzing_close = False
-        self.waiting_for_close = False
-        self.close_cancel_event = None
-        self.close_params = None
-        self.close_btn.configure(text="🛑 Close Position", state=tk.NORMAL)
-        self.open_btn.configure(state=tk.NORMAL)
+        """Reset close button to default state."""
+        return controller_reset_close_button(self)
             
     def _cancel_close_process(self):
-        """Cancel the closing process (analyze or splits)"""
-        # Cancel analyze if running
-        if getattr(self, 'close_cancel_event', None):
-            self.close_cancel_event.set()
-            self._log("🛑 Đang cancel analyze/close...")
-        
-        # Cancel splits if running
-        if self.split_cancel_event:
-            self.split_cancel_event.set()
-            self._log("🛑 Sending cancel signal to close process...")
-        
-        self._reset_close_button()
-
-    
+        """Cancel the closing process."""
+        return controller_cancel_close_process(self)
 
     def _execute_close_workflow(self):
         """Execute the full close workflow through the shared GUI service."""
-        params = self.close_params
-        if not params:
-            return
-
-        self.waiting_for_close = True
-        self.close_btn.configure(text="Closing... (Cancel)")
-
-        async def async_close():
-            self.split_cancel_event = self.close_cancel_event
-            return await self.service.close_position_with_analysis(
-                pair=params['pair'],
-                long_exchange=params['long_exchange'],
-                short_exchange=params['short_exchange'],
-                splits=params['splits'],
-                log_callback=lambda msg: self.root.after(0, lambda m=msg: self._log(m)),
-                cancel_event=self.close_cancel_event,
-                skip_spread_check=params.get('skip_spread_check', False),
-                close_size=params.get('close_size'),
-            )
-
-        future = self._run_async(async_close())
-        if future:
-            future.add_done_callback(self._on_close_complete)
-
+        return controller_execute_close_workflow(self)
 
     def _load_existing_positions(self):
         """Load existing positions from exchanges and allow monitoring/closing them"""
@@ -977,44 +867,9 @@ class FundingHunterGUI:
         load_existing_hedged_position(self, hedged_pair, open_time)
 
     def _on_close_complete(self, future):
-        """Handle close complete"""
-        # Save position info before clearing for PnL calculation
-        closed_position = self.active_position.copy() if self.active_position else None
-        
-        def update_ui():
-            self.split_cancel_event = None
-            self._reset_close_button()
-            
-            try:
-                result = future.result()
-                
-                if result.get("cancelled"):
-                    self._log("Close process cancelled")
-                    return
-                
-                if result["success"]:
-                    self._log("Position closed successfully!")
-                    self._stop_monitoring()
-                    self.active_position = None
-                    self._clear_position_display()
-                    
-                    # Calculate and display final PnL
-                    if closed_position:
-                        self._calculate_and_show_final_pnl(closed_position)
-                    
-                    # If auto trading is enabled, it will resume scanning
-                    if getattr(self, 'auto_trading_active', False):
-                        self._log(f"Auto Trading: Resuming signal scanning...")
-                else:
-                    self._log(f"Close failed: {result.get('error', 'Unknown error')}")
-                    # If partially closed, we should keep the position active but maybe update size?
-                    # For now just leave as is, user can check or retry
-            except Exception as e:
-                self._log(f"Error: {e}")
-        
-        # Run on main thread
-        self.root.after(0, update_ui)
-    
+        """Handle close completion."""
+        return controller_on_close_complete(self, future)
+
     def _calculate_and_show_final_pnl(self, closed_position: Dict[str, Any]):
         """Calculate and display final PnL after closing position via API history"""
         long_ex = closed_position.get('long_exchange')
