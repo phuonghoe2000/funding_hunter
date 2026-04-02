@@ -26,6 +26,12 @@ try:
     )
     from gui.exchange_display import from_display_name, parse_recommendation_display_names
     from gui.layout import create_widgets as build_widgets
+    from gui.monitor_controller import (
+        check_funding_reversal as controller_check_funding_reversal,
+        start_monitoring as controller_start_monitoring,
+        stop_monitoring as controller_stop_monitoring,
+        toggle_monitoring as controller_toggle_monitoring,
+    )
     from gui.open_controller import (
         cancel_open_position as controller_cancel_open_position,
         cancel_price_spread_wait as controller_cancel_price_spread_wait,
@@ -52,6 +58,12 @@ except ImportError:
     )
     from exchange_display import from_display_name, parse_recommendation_display_names
     from layout import create_widgets as build_widgets
+    from monitor_controller import (
+        check_funding_reversal as controller_check_funding_reversal,
+        start_monitoring as controller_start_monitoring,
+        stop_monitoring as controller_stop_monitoring,
+        toggle_monitoring as controller_toggle_monitoring,
+    )
     from open_controller import (
         cancel_open_position as controller_cancel_open_position,
         cancel_price_spread_wait as controller_cancel_price_spread_wait,
@@ -1076,233 +1088,21 @@ class FundingHunterGUI:
             future.add_done_callback(on_pnl_calculated)
     
     def _start_monitoring(self):
-        """Start position monitoring"""
-        if self.monitoring:
-            return
-
-        self.monitoring = True
-        self._log("Started position monitoring")
-
-        def safe_log(msg):
-            self.root.after(0, lambda: self._log(msg))
-
-        async def monitor_loop():
-            safe_log("Monitor loop started...")
-
-            while self.monitoring and self.active_position:
-                try:
-                    pos = self.active_position
-                    snapshot = await self.service.build_monitor_snapshot(pos)
-                    long_pnl = snapshot["long_pnl"]
-                    short_pnl = snapshot["short_pnl"]
-                    risk_percent = snapshot["risk_percent"]
-                    total_balance = snapshot["total_balance"]
-
-                    pos["long_pnl"] = long_pnl
-                    pos["short_pnl"] = short_pnl
-
-                    long_ex_name = pos["long_exchange"].value.capitalize()
-                    short_ex_name = pos["short_exchange"].value.capitalize()
-
-                    def update_label(risk=risk_percent, lp=long_pnl, sp=short_pnl, le=long_ex_name, se=short_ex_name):
-                        color = 'red' if risk > 5 else ('orange' if risk > 2 else 'green')
-                        self.pos_pnl_label.config(
-                            text=f"Risk: {risk:.2f}% | Long({le}): ${lp:+.2f} | Short({se}): ${sp:+.2f}",
-                            foreground=color
-                        )
-
-                    self.root.after(0, update_label)
-
-                    if self.auto_close_risk_var.get():
-                        try:
-                            risk_threshold = float(self.risk_threshold_var.get())
-                        except Exception:
-                            risk_threshold = 10.0
-
-                        bingx_pnl = 0.0
-                        if pos['long_exchange'] == Exchange.BINGX:
-                            bingx_pnl = long_pnl
-                        elif pos['short_exchange'] == Exchange.BINGX:
-                            bingx_pnl = short_pnl
-
-                        effective_threshold = risk_threshold * 2 if bingx_pnl > 0 else risk_threshold
-                        if bingx_pnl > 0:
-                            safe_log(f"BingX is +${bingx_pnl:.2f} -> threshold x2: {effective_threshold:.1f}%")
-
-                        if risk_percent >= effective_threshold:
-                            safe_log(
-                                f"Risk {risk_percent:.2f}% >= threshold {effective_threshold:.1f}% "
-                                f"(balance ${total_balance:.2f})"
-                            )
-                            try:
-                                splits = max(1, int(self.split_count_var.get()))
-                            except Exception:
-                                splits = 1
-
-                            close_result = await self.service.close_position_with_analysis(
-                                pair=pos['pair'],
-                                long_exchange=pos['long_exchange'],
-                                short_exchange=pos['short_exchange'],
-                                splits=splits,
-                                log_callback=safe_log,
-                            )
-                            if close_result.get("success"):
-                                safe_log(f"Position closed due to risk >= {effective_threshold:.1f}%")
-                                self.root.after(0, lambda r=risk_percent, t=effective_threshold: messagebox.showwarning(
-                                    "Risk Auto-Close",
-                                    f"Position closed!\nRisk was {r:.2f}% (threshold: {t:.1f}%)"
-                                ))
-                            else:
-                                safe_log(f"Auto-close failed: {close_result.get('error')}")
-
-                            self.monitoring = False
-                            self.active_position = None
-                            self.root.after(0, self._clear_position_display)
-                            break
-
-                    if self.auto_close_reversal_var.get() and 'initial_net_funding' in pos:
-                        should_close, reason = await self._check_funding_reversal(pos)
-                        if should_close:
-                            safe_log(f"Funding reversal detected: {reason}")
-                            try:
-                                splits = max(1, int(self.split_count_var.get()))
-                            except Exception:
-                                splits = 1
-
-                            close_result = await self.service.close_position_with_analysis(
-                                pair=pos['pair'],
-                                long_exchange=pos['long_exchange'],
-                                short_exchange=pos['short_exchange'],
-                                splits=splits,
-                                log_callback=safe_log,
-                            )
-                            if close_result.get("success"):
-                                safe_log(f"Position auto-closed due to: {reason}")
-                                self.root.after(0, lambda r=reason: messagebox.showinfo("Auto-Close", f"Position closed:\n{r}"))
-                            else:
-                                safe_log(f"Auto-close failed: {close_result.get('error')}")
-
-                            self.monitoring = False
-                            self.active_position = None
-                            self.root.after(0, self._clear_position_display)
-                            break
-
-                    await asyncio.sleep(2)
-
-                except Exception as e:
-                    logger.error(f"Monitor error: {e}")
-                    await asyncio.sleep(2)
-
-        future = self._run_async(monitor_loop())
-        if not future:
-            self._log("Failed to schedule monitor loop - no event loop!")
+        """Start position monitoring."""
+        return controller_start_monitoring(self)
 
     def _stop_monitoring(self):
-        """Stop monitoring"""
-        self.monitoring = False
-        self._log("⏹ Monitoring stopped")
-        self.monitor_btn.config(text="👁 Start Monitor")
+        """Stop monitoring."""
+        return controller_stop_monitoring(self)
     
     def _toggle_monitoring(self):
-        """Toggle monitoring on/off"""
-        if not self.active_position:
-            messagebox.showwarning("Warning", "No active position to monitor")
-            return
-        
-        if self.monitoring:
-            self._stop_monitoring()
-        else:
-            self._start_monitoring()
-            self.monitor_btn.config(text="⏹ Stop Monitor")
+        """Toggle monitoring on/off."""
+        return controller_toggle_monitoring(self)
     
     async def _check_funding_reversal(self, position: Dict[str, Any]) -> tuple[bool, str]:
-        """
-        Check if funding rate has reversed and position should be closed
-        Returns: (should_close: bool, reason: str)
-        """
-        try:
-            # Get threshold setting
-            try:
-                min_threshold = float(self.min_spread_threshold.get()) / 100  # Convert % to decimal
-            except:
-                min_threshold = 0.0001  # Default 0.01%
-            
-            # Get initial funding data
-            initial_net_funding = position.get('initial_net_funding', 0)
-            initial_long_rate = position.get('initial_long_rate', 0)
-            initial_short_rate = position.get('initial_short_rate', 0)
-            
-            # Get current funding rates
-            long_ex = position['long_exchange']
-            short_ex = position['short_exchange']
-            pair = position['pair']
-            
-            current_rates = {}
-            for ex in [long_ex, short_ex]:
-                client = self.manager.clients.get(ex)
-                if client:
-                    try:
-                        symbol = get_exchange_symbol(pair, ex)
-                        funding_rate_obj = await client.get_funding_rate(symbol)
-                        current_rates[ex] = funding_rate_obj.funding_rate
-                    except Exception as e:
-                        logger.debug(f"Could not get funding rate from {ex.value}: {e}")
-                        return False, ""
-            
-            if len(current_rates) < 2:
-                return False, ""
-            
-            current_long_rate = current_rates.get(long_ex, 0)
-            current_short_rate = current_rates.get(short_ex, 0)
-            current_net_funding = current_short_rate - current_long_rate
-            
-            # Log current vs initial
-            logger.debug(f"Funding check - Initial: {initial_net_funding*100:.6f}%, Current: {current_net_funding*100:.6f}%")
-            
-            # Check 1: Direction reversal (sign change)
-            if initial_net_funding != 0 and (initial_net_funding * current_net_funding) < 0:
-                reason = (
-                    f"Funding direction reversed\n"
-                    f"Initial: {initial_net_funding*100:.6f}% "
-                    f"({'positive' if initial_net_funding > 0 else 'negative'})\n"
-                    f"Current: {current_net_funding*100:.6f}% "
-                    f"({'positive' if current_net_funding > 0 else 'negative'})\n"
-                    f"LONG {long_ex.value}: {initial_long_rate*100:.6f}% → {current_long_rate*100:.6f}%\n"
-                    f"SHORT {short_ex.value}: {initial_short_rate*100:.6f}% → {current_short_rate*100:.6f}%"
-                )
-                return True, reason
-            
-            # Check 2: Spread too low (below threshold)
-            if abs(current_net_funding) < min_threshold:
-                reason = (
-                    f"Spread dropped below threshold\n"
-                    f"Current spread: {abs(current_net_funding)*100:.6f}%\n"
-                    f"Threshold: {min_threshold*100:.6f}%\n"
-                    f"Initial spread: {abs(initial_net_funding)*100:.6f}%\n"
-                    f"LONG {long_ex.value}: {current_long_rate*100:.6f}%\n"
-                    f"SHORT {short_ex.value}: {current_short_rate*100:.6f}%"
-                )
-                return True, reason
-            
-            # Check 3: Spread dropped significantly (>70% reduction)
-            if abs(initial_net_funding) > 0:
-                spread_reduction = 1 - (abs(current_net_funding) / abs(initial_net_funding))
-                if spread_reduction > 0.97:  # 70% drop
-                    reason = (
-                        f"Spread dropped by {spread_reduction*100:.1f}%\n"
-                        f"Initial: {abs(initial_net_funding)*100:.6f}%\n"
-                        f"Current: {abs(current_net_funding)*100:.6f}%\n"
-                        f"LONG {long_ex.value}: {initial_long_rate*100:.6f}% → {current_long_rate*100:.6f}%\n"
-                        f"SHORT {short_ex.value}: {initial_short_rate*100:.6f}% → {current_short_rate*100:.6f}%"
-                    )
-                    return True, reason
-            
-            return False, ""
-            
-        except Exception as e:
-            logger.error(f"Error checking funding reversal: {e}")
-            return False, ""
-    
+        """Check whether funding conditions reversed enough to close."""
+        return await controller_check_funding_reversal(self, position)
+
     def _update_position_display(self):
         """Update position display"""
         if self.active_position:
