@@ -17,9 +17,13 @@ import aiohttp
 
 from config.settings import settings
 from core.gui_service import GUIWorkflowService
-from core.opportunity import build_best_opportunity, normalize_funding_rate_obj
 
 try:
+    from gui.display_formatters import (
+        build_final_pnl_report_lines,
+        build_funding_table_rows,
+        build_pair_snapshot_display,
+    )
     from gui.exchange_display import from_display_name, parse_recommendation_display_names
     from gui.layout import create_widgets as build_widgets
     from gui.position_loader import (
@@ -28,6 +32,11 @@ try:
         show_position_selector as show_existing_position_selector,
     )
 except ImportError:
+    from display_formatters import (
+        build_final_pnl_report_lines,
+        build_funding_table_rows,
+        build_pair_snapshot_display,
+    )
     from exchange_display import from_display_name, parse_recommendation_display_names
     from layout import create_widgets as build_widgets
     from position_loader import (
@@ -1508,39 +1517,8 @@ class FundingHunterGUI:
                 try:
                     result = future.result(timeout=15)
                     if result:
-                        self._log("=" * 50)
-                        self._log(f"FINAL TRADE REPORT: {result['pair']}")
-                        self._log("=" * 50)
-                        
-                        # LONG side
-                        long_data = result['long']
-                        self._log(f"LONG ({result['long_ex'].value}):")
-                        self._log(f"   Realized PnL: ${long_data['realized_pnl']:+.2f}")
-                        self._log(f"   Trading Fees: -${long_data['commission']:.2f}")
-                        self._log(f"   Funding Fees: ${long_data['funding_fee']:+.2f}")
-                        self._log(f"   Net PnL:      ${long_data['net_pnl']:+.2f}")
-                        self._log("")
-                        
-                        # SHORT side
-                        short_data = result['short']
-                        self._log(f"SHORT ({result['short_ex'].value}):")
-                        self._log(f"   Realized PnL: ${short_data['realized_pnl']:+.2f}")
-                        self._log(f"   Trading Fees: -${short_data['commission']:.2f}")
-                        self._log(f"   Funding Fees: ${short_data['funding_fee']:+.2f}")
-                        self._log(f"   Net PnL:      ${short_data['net_pnl']:+.2f}")
-                        self._log("")
-                        
-                        # TOTALS
-                        total = result['total']
-                        pnl_status = "PROFIT" if total['net_pnl'] >= 0 else "LOSS"
-                        self._log("-" * 50)
-                        self._log(f"TOTAL REALIZED PnL: ${total['realized_pnl']:+.2f}")
-                        self._log(f"TOTAL TRADING FEES: -${total['commission']:.2f}")
-                        self._log(f"TOTAL FUNDING FEES: ${total['funding_fee']:+.2f}")
-                        self._log(f">>> FINAL NET PnL: ${total['net_pnl']:+.2f} ({pnl_status}) <<<")
-                        self._log("=" * 50)
-                        
-                        # Clear balance_before_open since it's no longer strictly needed, but kept for legacy cleanup
+                        for line in build_final_pnl_report_lines(result):
+                            self._log(line)
                         self.balance_before_open = {}
                     else:
                         self._log("Could not calculate final PnL")
@@ -1850,58 +1828,12 @@ class FundingHunterGUI:
         
         # Cache the funding rates for later use
         self.cached_funding_rates = all_rates
-        
-        def normalize_to_4h(rate_obj):
-            """Normalize a funding rate to 4h equivalent"""
-            if not rate_obj:
-                return None
-            return normalize_funding_rate_obj(rate_obj)
 
-        # Calculate fee-adjusted opportunities for sorting
-        pairs_with_spreads = []
-        for pair, rates in all_rates.items():
-            metrics = build_best_opportunity(pair, rates)
-            net_edge = metrics.net_edge_pct if metrics else float("-inf")
-            pairs_with_spreads.append((pair, rates, metrics, net_edge))
-        
-        # Sort by net edge (highest to lowest), show top 10
-        sorted_pairs = sorted(pairs_with_spreads, key=lambda x: x[3], reverse=True)
-        top_pairs = sorted_pairs[:10]
+        rows, total_pairs = build_funding_table_rows(all_rates, limit=10)
+        for row in rows:
+            self.funding_tree.insert("", tk.END, values=row)
 
-        for pair, rates, metrics, _ in top_pairs:
-            # Normalize each rate for display
-            def fmt_rate(ex_enum):
-                rate_obj = rates.get(ex_enum)
-                if not rate_obj:
-                    return "-"
-                norm = normalize_to_4h(rate_obj)
-                interval = getattr(rate_obj, 'funding_interval_hours', 8) or 8
-                if interval != 4:
-                    return f"{norm * 100:.6f}% ({interval}h)"
-                return f"{norm * 100:.6f}%"
-            
-            okx_val = fmt_rate(Exchange.OKX)
-            binance_val = fmt_rate(Exchange.BINANCE)
-            bingx_val = fmt_rate(Exchange.BINGX)
-            gate_val = fmt_rate(Exchange.GATE)
-            aster_val = fmt_rate(Exchange.ASTERDEX)
-            bybit_val = fmt_rate(Exchange.BYBIT)
-            gross_edge = "-"
-            cost = "-"
-            net_edge = "-"
-            recommendation = "-"
-            
-            if metrics:
-                gross_edge = f"{metrics.gross_spread_pct:.6f}%"
-                cost = f"{metrics.round_trip_cost_pct:.6f}%"
-                net_edge = f"{metrics.net_edge_pct:.6f}%"
-                recommendation = f"Long {metrics.long_exchange.value}, Short {metrics.short_exchange.value}"
-            
-            self.funding_tree.insert("", tk.END, values=(
-                pair, okx_val, binance_val, bingx_val, gate_val, aster_val, bybit_val, gross_edge, cost, net_edge, recommendation
-            ))
-        
-        self._log(f"Loaded top 10 from {len(sorted_pairs)} pairs sorted by net edge after estimated costs")
+        self._log(f"Loaded top 10 from {total_pairs} pairs sorted by net edge after estimated costs")
     
     def _on_funding_select(self, event):
         """Handle funding row double-click - auto select pair and exchanges in Trading Panel"""
@@ -2031,7 +1963,6 @@ class FundingHunterGUI:
             try:
                 snapshot = future.result(timeout=0.1)
                 result_data = snapshot.get("result_data", {})
-                funding_rates = snapshot.get("funding_rates", {})
 
                 if len(result_data) < 2:
                     self.root.after(0, lambda: self.selected_pair_info.config(
@@ -2039,88 +1970,14 @@ class FundingHunterGUI:
                         foreground="red",
                     ))
                     return
-
-                long_data = result_data.get(long_ex, {})
-                short_data = result_data.get(short_ex, {})
-                long_order_book = long_data.get("order_book")
-                short_order_book = short_data.get("order_book")
-
-                long_price = snapshot.get("long_entry_price", long_data.get("price", 0))
-                short_price = snapshot.get("short_entry_price", short_data.get("price", 0))
-                long_price_type = "ASK" if snapshot.get("long_entry_price") is not None else "Mark"
-                short_price_type = "BID" if snapshot.get("short_entry_price") is not None else "Mark"
-
-                hours_until = snapshot.get("hours_until_funding", 999)
-                if hours_until <= 1:
-                    entry_status = "GOOD - Within 1h before funding"
-                    entry_color = "green"
-                elif hours_until <= 2:
-                    entry_status = "OK - 1-2h before funding"
-                    entry_color = "orange"
-                else:
-                    entry_status = f"WAIT - {hours_until:.1f}h until funding"
-                    entry_color = "red"
-
-                long_funding = funding_rates.get(long_ex)
-                short_funding = funding_rates.get(short_ex)
-                long_rate_str = f"{long_funding.funding_rate * 100:+.6f}%" if long_funding else "N/A"
-                short_rate_str = f"{short_funding.funding_rate * 100:+.6f}%" if short_funding else "N/A"
-                net_funding_str = "N/A"
-                funding_interval_text = "Every 8 hours"
-                if long_funding and short_funding:
-                    net_funding = short_funding.funding_rate - long_funding.funding_rate
-                    net_funding_str = f"{net_funding * 100:+.6f}%"
-                    interval_hours = long_funding.funding_interval_hours or 8
-                    funding_interval_text = f"Every {interval_hours} hours"
-
-                info_lines = [
-                    f"=== {pair} ===",
-                    "",
-                    f"LONG  ({long_display}):  ${long_price:,.6f} [{long_price_type}]",
-                ]
-                if long_order_book and long_order_book.get('asks'):
-                    for i, (price, qty) in enumerate(long_order_book['asks'][:3], start=1):
-                        info_lines.append(f"  ASK{i}: ${price:,.6f} x {qty:.4f}")
-
-                info_lines.extend([
-                    "",
-                    f"SHORT ({short_display}): ${short_price:,.6f} [{short_price_type}]",
-                ])
-                if short_order_book and short_order_book.get('bids'):
-                    for i, (price, qty) in enumerate(short_order_book['bids'][:3], start=1):
-                        info_lines.append(f"  BID{i}: ${price:,.6f} x {qty:.4f}")
-
-                price_diff = snapshot.get("price_diff", 0.0)
-                open_spread_pct = snapshot.get("open_spread_pct", 0.0)
-                spread_sign = "+" if price_diff >= 0 else ""
-                info_lines.extend([
-                    "",
-                    f"Real Spread (OI): {spread_sign}${price_diff:,.6f} ({spread_sign}{open_spread_pct:.3f}%)",
-                    f"Entry Signal: {'OK - BID > ASK' if price_diff > 0 else 'BAD - BID < ASK'}",
-                    "-------------------------",
-                    f"Funding Rate ({long_display}):  {long_rate_str}",
-                    f"Funding Rate ({short_display}): {short_rate_str}",
-                    f"Net Funding (SHORT-LONG): {net_funding_str}",
-                    f"Next Funding: {snapshot.get('time_until_funding_text', 'N/A')}",
-                    f"Entry Timing: {entry_status}",
-                    f"Funding Interval: {funding_interval_text}",
-                ])
-
-                selected_trade = snapshot.get("selected_trade")
-                if selected_trade:
-                    info_lines.append(
-                        f"Selected Edge (4H): gross {selected_trade['gross_spread_pct']:.4f}% | "
-                        f"cost {selected_trade['round_trip_cost_pct']:.4f}% | "
-                        f"net {selected_trade['net_edge_pct']:.4f}%"
-                    )
-                recommended_trade = snapshot.get("recommended_trade")
-                if recommended_trade:
-                    info_lines.append(
-                        f"Best Direction: Long {recommended_trade['long_exchange']}, "
-                        f"Short {recommended_trade['short_exchange']}"
-                    )
-
-                info_text = "\n".join(info_lines)
+                info_text, entry_color = build_pair_snapshot_display(
+                    pair=pair,
+                    snapshot=snapshot,
+                    long_ex=long_ex,
+                    short_ex=short_ex,
+                    long_display=long_display,
+                    short_display=short_display,
+                )
                 self.root.after(0, lambda: self.selected_pair_info.config(
                     text=info_text,
                     foreground=entry_color,
