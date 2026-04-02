@@ -1951,7 +1951,6 @@ class FundingHunterGUI:
             "long_exchange": pos["long_exchange"],
             "short_exchange": pos["short_exchange"],
             "splits": splits,
-            "price_spread_min": -100.0 if skip_spread else None,  # Will be set after analyze
             "skip_spread_check": skip_spread,
             "close_size": close_size,  # None = full close, float = partial close (token amount)
         }
@@ -1961,11 +1960,11 @@ class FundingHunterGUI:
         
         if skip_spread:
             self._log(f"⚡ Bỏ qua analyze spread, tiến hành đóng lệnh ngay cho {pos['pair']}...")
-            self._execute_close_with_splits()
+            self._execute_close_workflow()
         else:
             self._log(f"📊 Bắt đầu analyze spread 2 phút cho CLOSE...")
             # Start analyze for close
-            self._start_analyze_for_close()
+            self._execute_close_workflow()
     
     def _start_analyze_for_close(self):
         """Run analyze spread and then start closing"""
@@ -2081,6 +2080,44 @@ class FundingHunterGUI:
         self._reset_close_button()
 
     
+    def _start_analyze_for_close(self):
+        """Backward-compatible wrapper after moving close orchestration into the service."""
+        self._execute_close_workflow()
+
+    def _on_analyze_for_close_complete(self, future):
+        """Backward-compatible wrapper after moving close orchestration into the service."""
+        self._execute_close_workflow()
+
+    def _execute_close_workflow(self):
+        """Execute the full close workflow through the shared GUI service."""
+        params = self.close_params
+        if not params:
+            return
+
+        self.waiting_for_close = True
+        self.close_btn.configure(text="â³ Closing... (Cancel)")
+
+        async def async_close():
+            self.split_cancel_event = self.close_cancel_event
+            return await self.service.close_position_with_analysis(
+                pair=params['pair'],
+                long_exchange=params['long_exchange'],
+                short_exchange=params['short_exchange'],
+                splits=params['splits'],
+                log_callback=lambda msg: self.root.after(0, lambda m=msg: self._log(m)),
+                cancel_event=self.close_cancel_event,
+                skip_spread_check=params.get('skip_spread_check', False),
+                close_size=params.get('close_size'),
+            )
+
+        future = self._run_async(async_close())
+        if future:
+            future.add_done_callback(self._on_close_complete)
+
+    def _execute_close_with_splits(self):
+        """Backward-compatible wrapper after moving close orchestration into the service."""
+        self._execute_close_workflow()
+
     def _load_existing_positions(self):
         """Load existing positions from exchanges and allow monitoring/closing them"""
         if not self.connected:
@@ -2379,9 +2416,8 @@ class FundingHunterGUI:
         closed_position = self.active_position.copy() if self.active_position else None
         
         def update_ui():
-            self.waiting_for_close = False
-            self.close_btn.configure(text="Close Position", state=tk.NORMAL)
-            self.open_btn.configure(state=tk.NORMAL)
+            self.split_cancel_event = None
+            self._reset_close_button()
             
             try:
                 result = future.result()

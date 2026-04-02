@@ -442,8 +442,13 @@ class GUIWorkflowService:
             )
             if analyze_result.get("success"):
                 threshold = analyze_result["second_best_spread"]
+                if log_callback:
+                    log_callback(f"✅ Analyze done. Threshold = {threshold:.4f}%")
             elif log_callback:
                 log_callback(f"Analyze failed: {analyze_result.get('error')}. Falling back to immediate close threshold.")
+
+        if log_callback:
+            log_callback(f"🔄 Closing position in {splits} split(s)...")
 
         result = await self.manager.close_hedged_position_split(
             pair,
