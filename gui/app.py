@@ -82,7 +82,6 @@ from exchanges.bingx_client import BingXClient
 from exchanges.gate_client import GateClient
 from exchanges.aster_client import AsterClient
 from exchanges.bybit_client import BybitClient
-from exchanges.base import BaseExchangeClient, FundingRate
 logger = logging.getLogger(__name__)
 
 # Config file path
@@ -917,101 +916,7 @@ class FundingHunterGUI:
             time_sync_fn=sync_windows_time,
             log_callback=self._log,
         )
-        connected = []
-        
-        # Sync Windows time trước khi connect
-        success, msg = sync_windows_time()
-        self._log(msg)
-        
-        # OKX
-        if self.okx_enabled.get():
-            okx_key = self.okx_api_key.get().strip()
-            okx_secret = self.okx_secret.get().strip()
-            okx_pass = self.okx_passphrase.get().strip()
-            
-            if okx_key and okx_secret and okx_pass:
-                settings.okx.api_key = okx_key
-                settings.okx.secret_key = okx_secret
-                settings.okx.passphrase = okx_pass
-                settings.okx.testnet = self.okx_testnet.get()
-                
-                client = OKXClient(settings.okx, debug=self.debug_mode.get())
-                if await self.manager.connect_exchange(Exchange.OKX, client):
-                    connected.append("OKX")
-        
-        # Binance
-        if self.binance_enabled.get():
-            binance_key = self.binance_api_key.get().strip()
-            binance_secret = self.binance_secret.get().strip()
-            
-            if binance_key and binance_secret:
-                settings.binance.api_key = binance_key
-                settings.binance.secret_key = binance_secret
-                settings.binance.testnet = self.binance_testnet.get()
-                
-                client = BinanceClient(settings.binance, debug=self.debug_mode.get())
-                if await self.manager.connect_exchange(Exchange.BINANCE, client):
-                    connected.append("Binance")
-        
-        # BingX
-        if self.bingx_enabled.get():
-            bingx_key = self.bingx_api_key.get().strip()
-            bingx_secret = self.bingx_secret.get().strip()
-            
-            if bingx_key and bingx_secret:
-                settings.bingx.api_key = bingx_key
-                settings.bingx.secret_key = bingx_secret
-                
-                client = BingXClient(settings.bingx, debug=self.debug_mode.get())
-                if await self.manager.connect_exchange(Exchange.BINGX, client):
-                    connected.append("BingX")
-        
-        # Gate.io
-        if self.gate_enabled.get():
-            gate_key = self.gate_api_key.get().strip()
-            gate_secret = self.gate_secret.get().strip()
-            
-            if gate_key and gate_secret:
-                settings.gate.api_key = gate_key
-                settings.gate.secret_key = gate_secret
-                
-                client = GateClient(settings.gate, debug=self.debug_mode.get())
-                if await self.manager.connect_exchange(Exchange.GATE, client):
-                    connected.append("Gate.io")
-                    
-        # Asterdex
-        if self.asterdex_enabled.get():
-            aster_key = self.asterdex_api_key.get().strip()
-            aster_secret = self.asterdex_secret.get().strip()
-            
-            if aster_key and aster_secret:
-                settings.asterdex.api_key = aster_key
-                settings.asterdex.secret_key = aster_secret
-                settings.asterdex.testnet = self.asterdex_testnet.get()
-                
-                client = AsterClient(settings.asterdex, debug=self.debug_mode.get())
-                if await self.manager.connect_exchange(Exchange.ASTERDEX, client):
-                    connected.append("Asterdex")
 
-        # Bybit
-        if self.bybit_enabled.get():
-            bybit_key = self.bybit_api_key.get().strip()
-            bybit_secret = self.bybit_secret.get().strip()
-
-            if bybit_key and bybit_secret:
-                settings.bybit.api_key = bybit_key
-                settings.bybit.secret_key = bybit_secret
-                settings.bybit.testnet = self.bybit_testnet.get()
-
-                client = BybitClient(settings.bybit, debug=self.debug_mode.get())
-                if await self.manager.connect_exchange(Exchange.BYBIT, client):
-                    connected.append("Bybit")
-        
-        # Get balances
-        balances = await self.manager.get_all_balances()
-        
-        return connected, balances
-    
     def _on_connect_complete(self, future):
         """Handle connection complete"""
         try:
@@ -1719,7 +1624,7 @@ class FundingHunterGUI:
                 try:
                     self.active_position = fut.result(timeout=0.1)
                     self._log(
-                        f"📊 Initial Funding - LONG: {self.active_position['initial_long_rate']*100:.6f}%, "
+                        f"Initial Funding - LONG: {self.active_position['initial_long_rate']*100:.6f}%, "
                         f"SHORT: {self.active_position['initial_short_rate']*100:.6f}%, "
                         f"Net: {self.active_position['initial_net_funding']*100:.6f}%"
                     )
@@ -1732,152 +1637,7 @@ class FundingHunterGUI:
         future = self._run_async(get_initial_state())
         if future:
             future.add_done_callback(on_state_ready)
-        return
 
-        logger.debug("_setup_position_tracking: ENTER")
-        
-        async def get_initial_funding():
-            logger.debug("_setup_position_tracking.get_initial_funding: ENTER")
-            rates = {}
-            for ex in [long_ex, short_ex]:
-                client = self.manager.clients.get(ex)
-                if client:
-                    try:
-                        symbol = get_exchange_symbol(pair, ex)
-                        funding_rate = await client.get_funding_rate(symbol)
-                        rates[ex] = funding_rate.funding_rate
-                    except Exception as e:
-                        logger.debug(f"Could not get funding rate from {ex.value}: {e}")
-            logger.debug("_setup_position_tracking.get_initial_funding: EXIT")
-            return rates
-        
-        def on_funding_fetched(fut):
-            logger.debug("_setup_position_tracking.on_funding_fetched: ENTER")
-            def update_ui():
-                logger.debug("_setup_position_tracking.update_ui: ENTER")
-                try:
-                    initial_rates = fut.result(timeout=0.1)  # Should already be done
-                    long_rate = initial_rates.get(long_ex, 0)
-                    short_rate = initial_rates.get(short_ex, 0)
-                    initial_net_funding = short_rate - long_rate
-                    
-                    from datetime import datetime
-                    self.active_position = {
-                        "pair": pair,
-                        "long_exchange": long_ex,
-                        "short_exchange": short_ex,
-                        "size": size,
-                        "open_time": datetime.now(timezone.utc),
-                        "total_funding_fees": 0.0,
-                        "last_funding_check": datetime.now(timezone.utc),
-                        # Funding reversal tracking
-                        "initial_long_rate": long_rate,
-                        "initial_short_rate": short_rate,
-                        "initial_net_funding": initial_net_funding,
-                    }
-                    
-                    self._log(f"📊 Initial Funding - LONG: {long_rate*100:.6f}%, SHORT: {short_rate*100:.6f}%, Net: {initial_net_funding*100:.6f}%")
-                    self._update_position_display()
-                    logger.debug("_setup_position_tracking.update_ui: EXIT")
-                    
-                except Exception as e:
-                    logger.error(f"Error fetching initial funding: {e}")
-            
-            # Run on main thread
-            self.root.after(0, update_ui)
-            logger.debug("_setup_position_tracking.on_funding_fetched: EXIT")
-        
-        future = self._run_async(get_initial_funding())
-        if future:
-            future.add_done_callback(on_funding_fetched)
-        logger.debug("_setup_position_tracking: EXIT")
-    
-    def _on_open_complete(self, future, pair, long_ex, short_ex, size):
-        """Handle open complete"""
-        def update_ui():
-            self.open_btn.config(state=tk.NORMAL)
-            
-            try:
-                result = future.result()
-                if result["success"]:
-                    self._log("✅ Position opened successfully!")
-                    
-                    # Get initial funding rates
-                    async def get_initial_funding():
-                        rates = {}
-                        for ex in [long_ex, short_ex]:
-                            client = self.manager.clients.get(ex)
-                            if client:
-                                try:
-                                    symbol = get_exchange_symbol(pair, ex)
-                                    funding_rate = await client.get_funding_rate(symbol)
-                                    rates[ex] = funding_rate.funding_rate
-                                except Exception as e:
-                                    logger.debug(f"Could not get funding rate from {ex.value}: {e}")
-                        return rates
-                    
-                    def on_funding_fetched(fut):
-                        def inner_update():
-                            try:
-                                initial_rates = fut.result()
-                                long_rate = initial_rates.get(long_ex, 0)
-                                short_rate = initial_rates.get(short_ex, 0)
-                                initial_net_funding = short_rate - long_rate
-                                
-                                from datetime import datetime
-                                self.active_position = {
-                                    "pair": pair,
-                                    "long_exchange": long_ex,
-                                    "short_exchange": short_ex,
-                                    "size": size,
-                                    "open_time": datetime.now(timezone.utc),
-                                    "total_funding_fees": 0.0,
-                                    "last_funding_check": datetime.now(timezone.utc),
-                                    # Funding reversal tracking
-                                    "initial_long_rate": long_rate,
-                                    "initial_short_rate": short_rate,
-                                    "initial_net_funding": initial_net_funding,
-                                }
-                                
-                                self._log(f"📊 Initial Funding - LONG: {long_rate*100:.6f}%, SHORT: {short_rate*100:.6f}%, Net: {initial_net_funding*100:.6f}%")
-                                self._update_position_display()
-
-                                    
-                            except Exception as e:
-                                logger.error(f"Error tracking initial funding: {e}")
-                        
-                        self.root.after(0, inner_update)
-                    
-                    # Fetch initial funding rates
-                    funding_future = self._run_async(get_initial_funding())
-                    if funding_future:
-                        funding_future.add_done_callback(on_funding_fetched)
-                    else:
-                        # Fallback if async fails
-                        from datetime import datetime
-                        self.active_position = {
-                            "pair": pair,
-                            "long_exchange": long_ex,
-                            "short_exchange": short_ex,
-                            "size": size,
-                            "open_time": datetime.now(timezone.utc),
-                            "total_funding_fees": 0.0,
-                            "last_funding_check": datetime.now(timezone.utc),
-                            "initial_long_rate": 0,
-                            "initial_short_rate": 0,
-                            "initial_net_funding": 0,
-                        }
-                        self._update_position_display()
-
-                else:
-                    self._log(f"❌ Failed: {result['error']}")
-                    messagebox.showerror("Error", result['error'])
-            except Exception as e:
-                self._log(f"Error: {e}")
-        
-        # Run on main thread
-        self.root.after(0, update_ui)
-    
     def _close_position(self):
         """Close position - analyze spread first, then close in splits. Supports partial close."""
         if not self.active_position:
@@ -1966,96 +1726,6 @@ class FundingHunterGUI:
             # Start analyze for close
             self._execute_close_workflow()
     
-    def _start_analyze_for_close(self):
-        """Run analyze spread and then start closing"""
-        params = self.close_params
-        if not params:
-            return
-        
-        def safe_log(msg):
-            self.root.after(0, lambda m=msg: self._log(m))
-        
-        async def do_analyze():
-            result = await self.manager.analyze_spread(
-                params["pair"],
-                params["long_exchange"],
-                params["short_exchange"],
-                duration_seconds=120.0,  # 2 phút
-                check_interval=2.0,      # 2 giây
-                log_callback=safe_log,
-                cancel_event=self.close_cancel_event,
-                mode="close"  # Mode đóng: LONG_BID - SHORT_ASK
-            )
-            return result
-        
-        future = self._run_async(do_analyze())
-        if future:
-            future.add_done_callback(lambda f: self._on_analyze_for_close_complete(f))
-    
-    def _on_analyze_for_close_complete(self, future):
-        """Handle analyze completion for close"""
-        def update_ui():
-            try:
-                result = future.result(timeout=1.0)
-                self.analyzing_close = False
-                
-                if not result.get("success"):
-                    error = result.get("error", "Unknown error")
-                    self._log(f"❌ Analyze thất bại: {error}")
-                    self._reset_close_button()
-                    return
-                
-                # Get second best spread as threshold
-                second_best = result["second_best_spread"]
-                self.close_params["price_spread_min"] = second_best
-                
-                self._log(f"✅ Analyze xong! Threshold = {second_best:.4f}% (giá trị cao thứ 2)")
-                self._log(f"⏳ Đang chờ spread >= {second_best:.4f}% để đóng position...")
-                
-                # Update button to show waiting/closing state
-                self.close_btn.configure(text="⏳ Closing... (Cancel)")
-                
-                # Now start closing with splits
-                self.waiting_for_close = True
-                self._execute_close_with_splits()
-                
-            except Exception as e:
-                self._log(f"❌ Lỗi analyze: {e}")
-                self._reset_close_button()
-        
-        self.root.after(0, update_ui)
-    
-    def _execute_close_with_splits(self):
-        """Execute the actual close with splits after analyze"""
-        params = self.close_params
-        if not params:
-            return
-
-        # Create cancel event for splits
-        self.split_cancel_event = threading.Event()
-
-        def progress_callback(split_num, total_splits, message):
-            self.root.after(0, lambda: self._log(f"   {message}"))
-
-        async def async_close():
-            return await self.manager.close_hedged_position_split(
-                params['pair'],
-                params['long_exchange'],
-                params['short_exchange'],
-                splits=params['splits'],
-                interval_seconds=2.0,
-                price_spread_min=params['price_spread_min'],
-                spread_check_interval=2.0,
-                progress_callback=progress_callback,
-                cancel_event=self.split_cancel_event,
-                skip_spread_check=params.get('skip_spread_check', False),
-                close_size=params.get('close_size'),
-            )
-        
-        future = self._run_async(async_close())
-        if future:
-            future.add_done_callback(self._on_close_complete)
-    
     def _reset_close_button(self):
         """Reset close button to default state"""
         self.analyzing_close = False
@@ -2080,13 +1750,6 @@ class FundingHunterGUI:
         self._reset_close_button()
 
     
-    def _start_analyze_for_close(self):
-        """Backward-compatible wrapper after moving close orchestration into the service."""
-        self._execute_close_workflow()
-
-    def _on_analyze_for_close_complete(self, future):
-        """Backward-compatible wrapper after moving close orchestration into the service."""
-        self._execute_close_workflow()
 
     def _execute_close_workflow(self):
         """Execute the full close workflow through the shared GUI service."""
@@ -2095,7 +1758,7 @@ class FundingHunterGUI:
             return
 
         self.waiting_for_close = True
-        self.close_btn.configure(text="â³ Closing... (Cancel)")
+        self.close_btn.configure(text="Closing... (Cancel)")
 
         async def async_close():
             self.split_cancel_event = self.close_cancel_event
@@ -2114,9 +1777,6 @@ class FundingHunterGUI:
         if future:
             future.add_done_callback(self._on_close_complete)
 
-    def _execute_close_with_splits(self):
-        """Backward-compatible wrapper after moving close orchestration into the service."""
-        self._execute_close_workflow()
 
     def _load_existing_positions(self):
         """Load existing positions from exchanges and allow monitoring/closing them"""
@@ -2556,7 +2216,7 @@ class FundingHunterGUI:
         """Start position monitoring"""
         if self.monitoring:
             return
-        
+
         self.monitoring = True
         self._log("Started position monitoring")
 
@@ -2564,7 +2224,7 @@ class FundingHunterGUI:
             self.root.after(0, lambda: self._log(msg))
 
         async def monitor_loop():
-            safe_log("📊 Monitor loop started...")
+            safe_log("Monitor loop started...")
 
             while self.monitoring and self.active_position:
                 try:
@@ -2604,11 +2264,11 @@ class FundingHunterGUI:
 
                         effective_threshold = risk_threshold * 2 if bingx_pnl > 0 else risk_threshold
                         if bingx_pnl > 0:
-                            safe_log(f"💰 BingX đang +${bingx_pnl:.2f} → threshold x2: {effective_threshold:.1f}%")
+                            safe_log(f"BingX is +${bingx_pnl:.2f} -> threshold x2: {effective_threshold:.1f}%")
 
                         if risk_percent >= effective_threshold:
                             safe_log(
-                                f"🚨 Risk {risk_percent:.2f}% >= threshold {effective_threshold:.1f}% "
+                                f"Risk {risk_percent:.2f}% >= threshold {effective_threshold:.1f}% "
                                 f"(balance ${total_balance:.2f})"
                             )
                             try:
@@ -2624,13 +2284,13 @@ class FundingHunterGUI:
                                 log_callback=safe_log,
                             )
                             if close_result.get("success"):
-                                safe_log(f"✅ Position closed do risk >= {effective_threshold:.1f}%")
+                                safe_log(f"Position closed due to risk >= {effective_threshold:.1f}%")
                                 self.root.after(0, lambda r=risk_percent, t=effective_threshold: messagebox.showwarning(
                                     "Risk Auto-Close",
                                     f"Position closed!\nRisk was {r:.2f}% (threshold: {t:.1f}%)"
                                 ))
                             else:
-                                safe_log(f"❌ Auto-close failed: {close_result.get('error')}")
+                                safe_log(f"Auto-close failed: {close_result.get('error')}")
 
                             self.monitoring = False
                             self.active_position = None
@@ -2640,7 +2300,7 @@ class FundingHunterGUI:
                     if self.auto_close_reversal_var.get() and 'initial_net_funding' in pos:
                         should_close, reason = await self._check_funding_reversal(pos)
                         if should_close:
-                            safe_log(f"🔄 Funding reversal detected: {reason}")
+                            safe_log(f"Funding reversal detected: {reason}")
                             try:
                                 splits = max(1, int(self.split_count_var.get()))
                             except Exception:
@@ -2654,10 +2314,10 @@ class FundingHunterGUI:
                                 log_callback=safe_log,
                             )
                             if close_result.get("success"):
-                                safe_log(f"✅ Position auto-closed due to: {reason}")
+                                safe_log(f"Position auto-closed due to: {reason}")
                                 self.root.after(0, lambda r=reason: messagebox.showinfo("Auto-Close", f"Position closed:\n{r}"))
                             else:
-                                safe_log(f"❌ Auto-close failed: {close_result.get('error')}")
+                                safe_log(f"Auto-close failed: {close_result.get('error')}")
 
                             self.monitoring = False
                             self.active_position = None
@@ -2672,274 +2332,8 @@ class FundingHunterGUI:
 
         future = self._run_async(monitor_loop())
         if not future:
-            self._log("❌ Failed to schedule monitor loop - no event loop!")
-        return
-        
-        # Thread-safe log for async context
-        def safe_log(msg):
-            self.root.after(0, lambda: self._log(msg))
-        
-        async def monitor_loop():
-            safe_log("📊 Monitor loop started...")
-            
-            # Get account balance for risk calculation
-            total_balance = 0.0
-            for ex, client in self.manager.clients.items():
-                try:
-                    balance = await client.get_balance()
-                    if balance:
-                        total_balance += balance.available
-                except:
-                    pass
-            if total_balance <= 0:
-                total_balance = 1000.0  # Fallback to avoid division by zero
-            safe_log(f"📊 Total balance for risk calc: ${total_balance:.2f}")
-            
-            while self.monitoring and self.active_position:
-                try:
-                    pos = self.active_position
-                    result = await self.manager.check_positions(
-                        pos['pair'], pos['long_exchange'], pos['short_exchange']
-                    )
-                    
-                    # Get unrealized PnL from each side
-                    long_pnl = result['long'].unrealized_pnl if result['long'] else 0
-                    short_pnl = result['short'].unrealized_pnl if result['short'] else 0
-                    
-                    # Update active_position with latest data
-                    pos['long_pnl'] = long_pnl
-                    pos['short_pnl'] = short_pnl
-                    
-                    # Calculate % Risk = |negative PnL| / Balance * 100
-                    # Only count the losing side for risk
-                    losing_pnl = 0.0
-                    if long_pnl < 0:
-                        losing_pnl += abs(long_pnl)
-                    if short_pnl < 0:
-                        losing_pnl += abs(short_pnl)
-                    risk_percent = (losing_pnl / total_balance) * 100
-                    
-                    # Get exchange names
-                    long_ex_name = pos['long_exchange'].value.capitalize()
-                    short_ex_name = pos['short_exchange'].value.capitalize()
-                    
-                    # Update display: Risk% | Long(Exchange): $X | Short(Exchange): $X
-                    def update_label(risk=risk_percent, lp=long_pnl, sp=short_pnl, le=long_ex_name, se=short_ex_name):
-                        # Color based on which side is losing more
-                        color = 'red' if risk > 5 else ('orange' if risk > 2 else 'green')
-                        self.pos_pnl_label.config(
-                            text=f"Risk: {risk:.2f}% | Long({le}): ${lp:+.2f} | Short({se}): ${sp:+.2f}",
-                            foreground=color
-                        )
-                    self.root.after(0, update_label)
-                    
-                    # Check auto-close on risk threshold
-                    if self.auto_close_risk_var.get():
-                        try:
-                            risk_threshold = float(self.risk_threshold_var.get())
-                        except:
-                            risk_threshold = 10.0
-                        
-                        # Check if BingX is profitable - if so, double the threshold
-                        # to let BingX win more before closing
-                        bingx_pnl = 0.0
-                        if pos['long_exchange'] == Exchange.BINGX:
-                            bingx_pnl = long_pnl
-                        elif pos['short_exchange'] == Exchange.BINGX:
-                            bingx_pnl = short_pnl
-                        
-                        effective_threshold = risk_threshold
-                        if bingx_pnl > 0:
-                            # BingX đang lời → cho phép risk gấp đôi để BingX thắng nhiều hơn
-                            effective_threshold = risk_threshold * 2
-                            safe_log(f"💰 BingX đang +${bingx_pnl:.2f} → threshold x2: {effective_threshold:.1f}%")
-                        
-                        if risk_percent >= effective_threshold:
-                            safe_log(f"🚨 Risk {risk_percent:.2f}% >= threshold {effective_threshold:.1f}%!")
-                            safe_log(f"🔄 Bắt đầu analyze spread 2 phút trước khi close...")
-                            
-                            # Analyze spread first
-                            try:
-                                analyze_result = await self.manager.analyze_spread(
-                                    pos['pair'],
-                                    pos['long_exchange'],
-                                    pos['short_exchange'],
-                                    duration_seconds=120.0,  # 2 phút
-                                    check_interval=2.0,
-                                    log_callback=safe_log,
-                                    cancel_event=None,
-                                    mode="close"
-                                )
-                                
-                                if not analyze_result.get("success"):
-                                    safe_log(f"❌ Analyze thất bại: {analyze_result.get('error')}")
-                                    price_spread_threshold = -100.0  # Fallback
-                                else:
-                                    price_spread_threshold = analyze_result["second_best_spread"]
-                                    safe_log(f"✅ Analyze xong! Threshold = {price_spread_threshold:.4f}%")
-                                
-                                # Close with spread check + reduce threshold after 30 failed checks
-                                safe_log(f"🔄 Đang chờ spread >= {price_spread_threshold:.4f}% để close...")
-                                
-                                check_count = 0
-                                current_threshold = price_spread_threshold
-                                
-                                while True:
-                                    # Get current spread for close (LONG_BID - SHORT_ASK)
-                                    try:
-                                        long_client = self.manager.clients.get(pos['long_exchange'])
-                                        short_client = self.manager.clients.get(pos['short_exchange'])
-                                        long_symbol = get_exchange_symbol(pos['pair'], pos['long_exchange'])
-                                        short_symbol = get_exchange_symbol(pos['pair'], pos['short_exchange'])
-                                        
-                                        long_book = await long_client.get_order_book(long_symbol)
-                                        short_book = await short_client.get_order_book(short_symbol)
-                                        
-                                        long_bid = float(long_book['bids'][0][0])
-                                        short_ask = float(short_book['asks'][0][0])
-                                        mid_price = (long_bid + short_ask) / 2
-                                        spread_pct = ((long_bid - short_ask) / mid_price) * 100
-                                        
-                                        if spread_pct >= current_threshold:
-                                            safe_log(f"✅ Spread {spread_pct:.4f}% >= {current_threshold:.4f}% OK! Closing...")
-                                            break
-                                        
-                                        check_count += 1
-                                        
-                                        # After 30 checks, reduce threshold by 0.01%
-                                        if check_count >= 30:
-                                            old_threshold = current_threshold
-                                            current_threshold -= 0.01
-                                            safe_log(f"⚠️ 30 lần chưa đạt, giảm threshold: {old_threshold:.4f}% → {current_threshold:.4f}%")
-                                            check_count = 0
-                                        
-                                        await asyncio.sleep(2)
-                                        
-                                    except Exception as e:
-                                        safe_log(f"⚠️ Spread check error: {e}, retrying...")
-                                        await asyncio.sleep(2)
-                                
-                                # Now close position with splits
-                                # Get split count from UI
-                                try:
-                                    splits = int(self.split_count_var.get())
-                                    if splits < 1: splits = 1
-                                except:
-                                    splits = 1
-                                
-                                safe_log(f"🔄 Closing position in {splits} split(s)...")
-                                close_result = await self.manager.close_hedged_position_split(
-                                    pos['pair'], 
-                                    pos['long_exchange'], 
-                                    pos['short_exchange'],
-                                    splits=splits,
-                                    interval_seconds=2.0,
-                                    price_spread_min=current_threshold,
-                                    spread_check_interval=2.0,
-                                    progress_callback=lambda s, t, m: safe_log(f"   {m}"),
-                                    cancel_event=None
-                                )
-                                
-                                if close_result.get("success"):
-                                    safe_log(f"✅ Position closed do risk >= {effective_threshold:.1f}%")
-                                    self.root.after(0, lambda r=risk_percent, t=effective_threshold: messagebox.showwarning(
-                                        "Risk Auto-Close", 
-                                        f"Position closed!\nRisk was {r:.2f}% (threshold: {t:.1f}%)"
-                                    ))
-                                else:
-                                    safe_log(f"❌ Auto-close failed: {close_result.get('error')}")
-                                    
-                            except Exception as e:
-                                safe_log(f"❌ Auto-close error: {e}")
-                            
-                            self.monitoring = False
-                            self.active_position = None
-                            self.root.after(0, self._clear_position_display)
-                            break
-                    
-                    # Check funding reversal (if enabled)
-                    if self.auto_close_reversal_var.get() and 'initial_net_funding' in pos:
-                        should_close, reason = await self._check_funding_reversal(pos)
-                        if should_close:
-                            safe_log(f"🔄 Funding reversal detected: {reason}")
-                            safe_log(f"🔄 Bắt đầu analyze spread 5 phút trước khi auto-close...")
-                            
-                            # Get split count from UI
-                            try:
-                                splits = int(self.split_count_var.get())
-                                if splits < 1: splits = 1
-                            except:
-                                splits = 1
-                            
-                            # Analyze spread first
-                            try:
-                                analyze_result = await self.manager.analyze_spread(
-                                    pos['pair'],
-                                    pos['long_exchange'],
-                                    pos['short_exchange'],
-                                    duration_seconds=120.0,  # 2 phút
-                                    check_interval=2.0,
-                                    log_callback=safe_log,
-                                    cancel_event=None,
-                                    mode="close"
-                                )
-                                
-                                if not analyze_result.get("success"):
-                                    safe_log(f"❌ Analyze thất bại: {analyze_result.get('error')}")
-                                    # Still try to close with default threshold
-                                    price_spread_min = -100.0
-                                else:
-                                    price_spread_min = analyze_result["second_best_spread"]
-                                    safe_log(f"✅ Analyze xong! Threshold = {price_spread_min:.4f}%")
-                                
-                                # Close position with splits
-                                safe_log(f"🔄 Auto-closing position in {splits} split(s)...")
-                                close_result = await self.manager.close_hedged_position_split(
-                                    pos['pair'], 
-                                    pos['long_exchange'], 
-                                    pos['short_exchange'],
-                                    splits=splits,
-                                    interval_seconds=2.0,
-                                    price_spread_min=price_spread_min,
-                                    spread_check_interval=2.0,
-                                    progress_callback=lambda s, t, m: safe_log(f"   {m}"),
-                                    cancel_event=None
-                                )
-                                
-                                if close_result.get("success"):
-                                    safe_log(f"✅ Position auto-closed due to: {reason}")
-                                    self.root.after(0, lambda r=reason: messagebox.showinfo(
-                                        "Auto-Close", 
-                                        f"Position closed:\n{r}"
-                                    ))
-                                    
-                                    # If auto trading is enabled, it will resume scanning
-                                    if self.auto_trading_active:
-                                        safe_log(f"🤖 Auto Trading: Resuming signal scanning...")
-                                else:
-                                    safe_log(f"❌ Auto-close failed: {close_result.get('error')}")
-                                    
-                            except Exception as e:
-                                safe_log(f"❌ Auto-close error: {e}")
-                            
-                            self.monitoring = False
-                            self.active_position = None
-                            self.root.after(0, self._clear_position_display)
-                            break
-                    
-                    await asyncio.sleep(2)
-                    
-                except Exception as e:
-                    logger.error(f"Monitor error: {e}")
-                    # Don't spam GUI with errors, just log to console
-                    await asyncio.sleep(2)
-        
-        # Debug log for scheduling
-        logger.debug(f"Scheduling monitor loop... (loop exists: {self.loop is not None})")
-        future = self._run_async(monitor_loop())
-        if not future:
-            self._log("❌ Failed to schedule monitor loop - no event loop!")
-    
+            self._log("Failed to schedule monitor loop - no event loop!")
+
     def _stop_monitoring(self):
         """Stop monitoring"""
         self.monitoring = False
@@ -3201,121 +2595,7 @@ class FundingHunterGUI:
         future = self._run_async(async_refresh())
         if future:
             future.add_done_callback(self._on_funding_complete)
-        return
 
-        self._log("Scanning ALL funding rates from all exchanges...")
-
-        async def async_refresh():
-            from config.constants import get_exchange_symbol, get_unified_pair
-
-            # ── Step 1: Bulk fetch from exchanges that support it ──
-            bulk_tasks = {}
-
-            binance_client = self.manager.clients.get(Exchange.BINANCE)
-            if binance_client:
-                bulk_tasks[Exchange.BINANCE] = binance_client.get_all_funding_rates()
-
-            aster_client = self.manager.clients.get(Exchange.ASTERDEX)
-            if aster_client:
-                bulk_tasks[Exchange.ASTERDEX] = aster_client.get_all_funding_rates()
-
-            bingx_client = self.manager.clients.get(Exchange.BINGX)
-            if bingx_client:
-                bulk_tasks[Exchange.BINGX] = bingx_client.get_all_funding_rates()
-
-            bybit_client = self.manager.clients.get(Exchange.BYBIT)
-            if bybit_client:
-                bulk_tasks[Exchange.BYBIT] = bybit_client.get_all_funding_rates()
-
-            if not bulk_tasks:
-                logger.error("No exchange connected for bulk funding rate fetch")
-                return {}
-
-            # Fetch all in parallel
-            exchanges_list = list(bulk_tasks.keys())
-            results = await asyncio.gather(*bulk_tasks.values(), return_exceptions=True)
-
-            # ── Step 2: Build unified pair map from all bulk results ──
-            # pair -> {Exchange: FundingRate}
-            all_rates = {}
-            total_pairs_scanned = 0
-
-            for ex, result in zip(exchanges_list, results):
-                if isinstance(result, Exception):
-                    logger.warning(f"Failed to fetch {ex.value} rates: {result}")
-                    continue
-
-                total_pairs_scanned += len(result)
-                for rate_obj in result:
-                    pair = get_unified_pair(rate_obj.symbol, ex)
-                    if pair not in all_rates:
-                        all_rates[pair] = {}
-                    all_rates[pair][ex] = rate_obj
-
-            self._log(f"Bulk fetched {total_pairs_scanned} rates from {len(exchanges_list)} exchanges, {len(all_rates)} unique pairs")
-
-            # ── Step 3: Pre-calculate spreads to find top candidates ──
-            def normalize_to_4h(rate_obj):
-                if not rate_obj:
-                    return None
-                interval = getattr(rate_obj, 'funding_interval_hours', 8) or 8
-                return rate_obj.funding_rate * (4.0 / interval)
-
-            pair_spreads = []
-            for pair, rates in all_rates.items():
-                normed = {}
-                for ex, r in rates.items():
-                    v = normalize_to_4h(r)
-                    if v is not None:
-                        normed[ex] = v
-                if len(normed) >= 2:
-                    vals = sorted(normed.values())
-                    spread = abs(vals[-1] - vals[0])
-                else:
-                    spread = 0.0
-                pair_spreads.append((pair, spread))
-
-            # Sort by spread, take top 20 candidates for OKX/Gate lookup
-            pair_spreads.sort(key=lambda x: x[1], reverse=True)
-            top_candidates = [p for p, _ in pair_spreads[:20]]
-
-            # ── Step 4: Fetch OKX / Gate for top candidates only ──
-            okx_client = self.manager.clients.get(Exchange.OKX)
-            gate_client = self.manager.clients.get(Exchange.GATE)
-
-            if okx_client or gate_client:
-                async def fetch_single_rate(client, ex, pair):
-                    try:
-                        symbol = get_exchange_symbol(pair, ex)
-                        return pair, ex, await asyncio.wait_for(client.get_funding_rate(symbol), timeout=8.0)
-                    except Exception:
-                        return pair, ex, None
-
-                single_tasks = []
-                for pair in top_candidates:
-                    if okx_client:
-                        single_tasks.append(fetch_single_rate(okx_client, Exchange.OKX, pair))
-                    if gate_client:
-                        single_tasks.append(fetch_single_rate(gate_client, Exchange.GATE, pair))
-
-                if single_tasks:
-                    single_results = await asyncio.gather(*single_tasks, return_exceptions=True)
-                    for res in single_results:
-                        if isinstance(res, Exception) or res is None:
-                            continue
-                        pair, ex, rate_obj = res
-                        if rate_obj:
-                            if pair not in all_rates:
-                                all_rates[pair] = {}
-                            all_rates[pair][ex] = rate_obj
-
-            self._log(f"Total: {len(all_rates)} pairs scanned, showing top 10 by spread")
-            return all_rates
-        
-        future = self._run_async(async_refresh())
-        if future:
-            future.add_done_callback(self._on_funding_complete)
-    
     def _on_funding_complete(self, future):
         """Handle funding refresh complete"""
         def update_ui():
@@ -3553,13 +2833,13 @@ class FundingHunterGUI:
 
                 hours_until = snapshot.get("hours_until_funding", 999)
                 if hours_until <= 1:
-                    entry_status = "🟢 GOOD - Within 1h before funding"
+                    entry_status = "GOOD - Within 1h before funding"
                     entry_color = "green"
                 elif hours_until <= 2:
-                    entry_status = "🟡 OK - 1-2h before funding"
+                    entry_status = "OK - 1-2h before funding"
                     entry_color = "orange"
                 else:
-                    entry_status = f"🔴 WAIT - {hours_until:.1f}h until funding"
+                    entry_status = f"WAIT - {hours_until:.1f}h until funding"
                     entry_color = "red"
 
                 long_funding = funding_rates.get(long_ex)
@@ -3574,45 +2854,54 @@ class FundingHunterGUI:
                     interval_hours = long_funding.funding_interval_hours or 8
                     funding_interval_text = f"Every {interval_hours} hours"
 
-                info_text = f"═══ {pair} ═══\n\n"
-                info_text += f"LONG  ({long_display}):  ${long_price:,.6f} [{long_price_type}]\n"
+                info_lines = [
+                    f"=== {pair} ===",
+                    "",
+                    f"LONG  ({long_display}):  ${long_price:,.6f} [{long_price_type}]",
+                ]
                 if long_order_book and long_order_book.get('asks'):
-                    for i, (price, qty) in enumerate(long_order_book['asks'][:3]):
-                        info_text += f"  ASK{i+1}: ${price:,.6f} x {qty:.4f}\n"
+                    for i, (price, qty) in enumerate(long_order_book['asks'][:3], start=1):
+                        info_lines.append(f"  ASK{i}: ${price:,.6f} x {qty:.4f}")
 
-                info_text += f"\nSHORT ({short_display}): ${short_price:,.6f} [{short_price_type}]\n"
+                info_lines.extend([
+                    "",
+                    f"SHORT ({short_display}): ${short_price:,.6f} [{short_price_type}]",
+                ])
                 if short_order_book and short_order_book.get('bids'):
-                    for i, (price, qty) in enumerate(short_order_book['bids'][:3]):
-                        info_text += f"  BID{i+1}: ${price:,.6f} x {qty:.4f}\n"
+                    for i, (price, qty) in enumerate(short_order_book['bids'][:3], start=1):
+                        info_lines.append(f"  BID{i}: ${price:,.6f} x {qty:.4f}")
 
-                info_text += "\n"
                 price_diff = snapshot.get("price_diff", 0.0)
                 open_spread_pct = snapshot.get("open_spread_pct", 0.0)
                 spread_sign = "+" if price_diff >= 0 else ""
-                info_text += f"Real Spread (OI): {spread_sign}${price_diff:,.6f} ({spread_sign}{open_spread_pct:.3f}%)\n"
-                info_text += f"Entry Signal: {'✅ BID > ASK (Profitable!)' if price_diff > 0 else '❌ BID < ASK (Would Lose!)'}\n"
-                info_text += f"─────────────────────────\n"
-                info_text += f"Funding Rate ({long_display}):  {long_rate_str}\n"
-                info_text += f"Funding Rate ({short_display}): {short_rate_str}\n"
-                info_text += f"Net Funding (SHORT-LONG): {net_funding_str}\n"
-                info_text += f"Next Funding: {snapshot.get('time_until_funding_text', 'N/A')}\n"
-                info_text += f"Entry Timing: {entry_status}\n"
-                info_text += f"Funding Interval: {funding_interval_text}\n"
+                info_lines.extend([
+                    "",
+                    f"Real Spread (OI): {spread_sign}${price_diff:,.6f} ({spread_sign}{open_spread_pct:.3f}%)",
+                    f"Entry Signal: {'OK - BID > ASK' if price_diff > 0 else 'BAD - BID < ASK'}",
+                    "-------------------------",
+                    f"Funding Rate ({long_display}):  {long_rate_str}",
+                    f"Funding Rate ({short_display}): {short_rate_str}",
+                    f"Net Funding (SHORT-LONG): {net_funding_str}",
+                    f"Next Funding: {snapshot.get('time_until_funding_text', 'N/A')}",
+                    f"Entry Timing: {entry_status}",
+                    f"Funding Interval: {funding_interval_text}",
+                ])
 
                 selected_trade = snapshot.get("selected_trade")
                 if selected_trade:
-                    info_text += (
-                        f"\nSelected Edge (4H): gross {selected_trade['gross_spread_pct']:.4f}% | "
+                    info_lines.append(
+                        f"Selected Edge (4H): gross {selected_trade['gross_spread_pct']:.4f}% | "
                         f"cost {selected_trade['round_trip_cost_pct']:.4f}% | "
                         f"net {selected_trade['net_edge_pct']:.4f}%"
                     )
                 recommended_trade = snapshot.get("recommended_trade")
                 if recommended_trade:
-                    info_text += (
-                        f"\nBest Direction: Long {recommended_trade['long_exchange']}, "
+                    info_lines.append(
+                        f"Best Direction: Long {recommended_trade['long_exchange']}, "
                         f"Short {recommended_trade['short_exchange']}"
                     )
 
+                info_text = "\n".join(info_lines)
                 self.root.after(0, lambda: self.selected_pair_info.config(
                     text=info_text,
                     foreground=entry_color,
@@ -3630,258 +2919,7 @@ class FundingHunterGUI:
         future = self._run_async(async_get_snapshot())
         if future:
             future.add_done_callback(on_snapshot_complete)
-        return
 
-        async def async_get_prices():
-            result_data = {}
-            funding_rates = {}
-            
-            # Get order books, prices and funding rates from both exchanges with timeout
-            tasks = []
-            for exchange in [long_ex, short_ex]:
-                client = self.manager.clients.get(exchange)
-                if client:
-                    symbol = get_exchange_symbol(pair, exchange)
-                    tasks.append(self._fetch_exchange_data(client, exchange, symbol))
-            
-            if tasks:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for result in results:
-                    if isinstance(result, dict) and not isinstance(result, Exception):
-                        if 'exchange' in result:
-                            ex = result['exchange']
-                            # Store full result data (order_book, price, funding_rate)
-                            result_data[ex] = result
-                            if 'funding_rate' in result:
-                                funding_rates[ex] = result['funding_rate']
-            
-            return result_data, funding_rates
-        
-        async def _timeout_wrapper():
-            try:
-                return await asyncio.wait_for(async_get_prices(), timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.warning("Timeout fetching pair prices")
-                return {}, {}
-        
-        def on_complete(future):
-            try:
-                result_data, funding_rates = future.result(timeout=0.1)
-                
-                if len(result_data) >= 2:
-                    long_data = result_data.get(long_ex, {})
-                    short_data = result_data.get(short_ex, {})
-                    
-                    # Extract order book or fallback to mark price
-                    long_order_book = long_data.get('order_book')
-                    short_order_book = short_data.get('order_book')
-                    
-                    # Get real execution prices from order book
-                    if long_order_book and long_order_book.get('asks') and len(long_order_book['asks']) > 0:
-                        long_price = long_order_book['asks'][0][0]  # ASK price (we buy here)
-                        long_price_type = "ASK"
-                    else:
-                        long_price = long_data.get('price', 0)
-                        long_price_type = "Mark"
-                    
-                    if short_order_book and short_order_book.get('bids') and len(short_order_book['bids']) > 0:
-                        short_price = short_order_book['bids'][0][0]  # BID price (we sell here)
-                        short_price_type = "BID"
-                    else:
-                        short_price = short_data.get('price', 0)
-                        short_price_type = "Mark"
-                    
-                    # Calculate price spread (BID - ASK)
-                    # Positive = profitable (sell high at BID, buy low at ASK)
-                    # Negative = losing (buy high, sell low)
-                    price_diff = short_price - long_price
-                    price_spread_pct = (price_diff / long_price * 100) if long_price > 0 else 0
-                    
-                    # Determine if spread is good for entry
-                    is_good_entry = price_diff > 0
-                    
-                    # Get funding rates to determine next funding time from API
-                    from datetime import datetime, timezone, timedelta
-                    now = datetime.now(timezone.utc)
-                    
-                    # Get next funding time from exchange API (use whichever is available)
-                    long_funding = funding_rates.get(long_ex)
-                    short_funding = funding_rates.get(short_ex)
-                    
-                    # Use the next funding time from API (prefer long exchange, fallback to short)
-                    next_funding_time = None
-                    if long_funding and long_funding.next_funding_time:
-                        next_funding_time = long_funding.next_funding_time
-                    elif short_funding and short_funding.next_funding_time:
-                        next_funding_time = short_funding.next_funding_time
-                    
-                    # Fallback: calculate manually if API didn't provide it
-                    if not next_funding_time:
-                        current_hour = now.hour
-                        # Default funding times: 00:00, 08:00, 16:00 UTC (8-hour intervals)
-                        funding_hours = [0, 8, 16]
-                        next_funding_hour = None
-                        for fh in funding_hours:
-                            if current_hour < fh:
-                                next_funding_hour = fh
-                                break
-                        
-                        if next_funding_hour is None:
-                            next_funding_hour = funding_hours[0]  # Next day 00:00
-                        
-                        next_funding_time = now.replace(hour=next_funding_hour, minute=0, second=0, microsecond=0)
-                        if next_funding_time <= now:
-                            next_funding_time += timedelta(days=1)
-                    
-                    # Calculate time until next funding
-                    time_until_funding = next_funding_time - now
-                    hours_until = time_until_funding.total_seconds() / 3600
-                    
-                    # Format time remaining
-                    hours = int(time_until_funding.total_seconds() // 3600)
-                    minutes = int((time_until_funding.total_seconds() % 3600) // 60)
-                    seconds = int(time_until_funding.total_seconds() % 60)
-                    time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-                    
-                    # Entry timing recommendation
-                    entry_status = ""
-                    entry_color = "black"
-                    if hours_until <= 1:
-                        # Within 1 hour before funding - BEST TIME
-                        entry_status = "🟢 GOOD - Within 1h before funding"
-                        entry_color = "green"
-                    elif hours_until <= 2:
-                        entry_status = "🟡 OK - 1-2h before funding"
-                        entry_color = "orange"
-                    else:
-                        entry_status = f"🔴 WAIT - {hours_until:.1f}h until funding"
-                        entry_color = "red"
-                    
-                    # Build funding info display
-                    funding_info = ""
-                    funding_interval_text = "Every 8 hours"  # Default
-                    long_rate_str = "N/A"
-                    short_rate_str = "N/A"
-                    net_funding_str = "N/A"
-                    
-                    if long_funding:
-                        long_rate = long_funding.funding_rate * 100
-                        long_rate_str = f"{long_rate:+.6f}%"
-                    
-                    if short_funding:
-                        short_rate = short_funding.funding_rate * 100
-                        short_rate_str = f"{short_rate:+.6f}%"
-                    
-                    if long_funding and short_funding:
-                        net_funding = short_funding.funding_rate - long_funding.funding_rate
-                        net_funding_str = f"{net_funding * 100:+.6f}%"
-                        
-                        # Use funding interval from the exchanges (they should be the same)
-                        interval_hours = long_funding.funding_interval_hours or 8
-                        if interval_hours == 4:
-                            funding_interval_text = "Every 4 hours"
-                        elif interval_hours == 8:
-                            funding_interval_text = "Every 8 hours"
-                        else:
-                            funding_interval_text = f"Every {interval_hours} hours"
-                    
-                    # Build display text with order book info
-                    info_text = f"═══ {pair} ═══\n\n"
-                    info_text += f"LONG  ({long_display}):  ${long_price:,.6f} [{long_price_type}]\n"
-                    
-                    # Show top 3 ASKs for LONG if available
-                    if long_order_book and long_order_book.get('asks'):
-                        asks = long_order_book['asks'][:3]
-                        for i, (price, qty) in enumerate(asks):
-                            info_text += f"  ASK{i+1}: ${price:,.6f} x {qty:.4f}\n"
-                    
-                    info_text += f"\nSHORT ({short_display}): ${short_price:,.6f} [{short_price_type}]\n"
-                    
-                    # Show top 3 BIDs for SHORT if available
-                    if short_order_book and short_order_book.get('bids'):
-                        bids = short_order_book['bids'][:3]
-                        for i, (price, qty) in enumerate(bids):
-                            info_text += f"  BID{i+1}: ${price:,.6f} x {qty:.4f}\n"
-                    
-                    info_text += "\n"
-                    
-                    # Display spread with sign (positive = good, negative = bad)
-                    spread_sign = "+" if price_diff >= 0 else ""
-                    info_text += f"Real Spread (OI): {spread_sign}${price_diff:,.6f} ({spread_sign}{price_spread_pct:.3f}%)\n"
-                    
-                    if is_good_entry:
-                        info_text += f"Entry Signal: ✅ BID > ASK (Profitable!)\n"
-                    else:
-                        info_text += f"Entry Signal: ❌ BID < ASK (Would Lose!)\n"
-                    
-                    info_text += f"─────────────────────────\n"
-                    info_text += f"Funding Rate ({long_display}):  {long_rate_str}\n"
-                    info_text += f"Funding Rate ({short_display}): {short_rate_str}\n"
-                    info_text += f"Net Funding (SHORT-LONG): {net_funding_str}\n"
-                    info_text += f"Next Funding: {time_str}\n"
-                    info_text += f"Entry Timing: {entry_status}\n"
-                    info_text += f"Funding Interval: {funding_interval_text}"
-                    
-                    self.root.after(0, lambda: self.selected_pair_info.config(
-                        text=info_text, 
-                        foreground=entry_color,
-                        font=('Courier', 9)
-                    ))
-                    
-                    # Schedule next update in 2 seconds for continuous refresh
-                    # BUT only if no active position (to avoid overloading)
-                    if not self.active_position:
-                        self._pair_info_update_task = self.root.after(2000, self._update_pair_info)
-                    
-                else:
-                    self.root.after(0, lambda: self.selected_pair_info.config(
-                        text="Could not fetch prices from selected exchanges",
-                        foreground="red"
-                    ))
-                    
-            except asyncio.TimeoutError:
-                logger.warning("Timeout in on_complete getting future result")
-            except Exception as e:
-                logger.error(f"Error updating pair info: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        future = self._run_async(_timeout_wrapper())
-        if future:
-            future.add_done_callback(on_complete)
-    
-    async def _fetch_exchange_data(self, client, exchange, symbol):
-        """Fetch order book, mark price and funding rate from a single exchange with timeout"""
-        result = {'exchange': exchange}
-        
-        # Fetch order book for real execution prices
-        try:
-            order_book = await asyncio.wait_for(client.get_order_book(symbol, limit=5), timeout=8.0)
-            result['order_book'] = order_book
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout getting order book from {exchange.value}")
-        except Exception as e:
-            logger.debug(f"Could not get order book from {exchange.value}: {e}")
-        
-        # Fetch mark price as fallback
-        try:
-            price = await asyncio.wait_for(client.get_mark_price(symbol), timeout=8.0)
-            result['price'] = price
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout getting price from {exchange.value}")
-        except Exception as e:
-            logger.debug(f"Could not get price from {exchange.value}: {e}")
-        
-        try:
-            funding_rate = await asyncio.wait_for(client.get_funding_rate(symbol), timeout=8.0)
-            result['funding_rate'] = funding_rate
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout getting funding rate from {exchange.value}")
-        except Exception as e:
-            logger.debug(f"Could not get funding rate from {exchange.value}: {e}")
-        
-        return result
-    
     def _update_pair_price_info(self, pair: str, recommendation: str = ""):
         """Fetch and display current price information for the selected pair"""
         if not self.connected:
