@@ -49,11 +49,15 @@ def start_monitoring(app: Any) -> None:
                 total_balance = snapshot["total_balance"]
                 trade_plan = snapshot.get("trade_plan") or {}
                 monitor_advice = snapshot.get("monitor_advice") or {}
+                liquidation = snapshot.get("liquidation") or {}
+                min_liq_distance = snapshot.get("min_liquidation_distance_pct")
+                nearest_liq_exchange = liquidation.get("nearest_liquidation_exchange")
 
                 position["long_pnl"] = long_pnl
                 position["short_pnl"] = short_pnl
                 position["latest_trade_plan"] = trade_plan
                 position["latest_monitor_advice"] = monitor_advice
+                position["latest_liquidation"] = liquidation
 
                 long_exchange_name = position["long_exchange"].value.capitalize()
                 short_exchange_name = position["short_exchange"].value.capitalize()
@@ -65,10 +69,18 @@ def start_monitoring(app: Any) -> None:
                     long_name=long_exchange_name,
                     short_name=short_exchange_name,
                     advice=monitor_advice,
+                    liq_distance=min_liq_distance,
+                    liq_exchange=nearest_liq_exchange,
                 ) -> None:
                     color = "red" if risk > 5 else ("orange" if risk > 2 else "green")
+                    label_text = (
+                        f"Risk: {risk:.2f}% | Long({long_name}): ${long_value:+.2f} | "
+                        f"Short({short_name}): ${short_value:+.2f}"
+                    )
+                    if liq_distance is not None and liq_exchange:
+                        label_text += f" | LiqDist({liq_exchange}): {liq_distance:.2f}%"
                     app.pos_pnl_label.config(
-                        text=f"Risk: {risk:.2f}% | Long({long_name}): ${long_value:+.2f} | Short({short_name}): ${short_value:+.2f}",
+                        text=label_text,
                         foreground=color,
                     )
                     advice_text = advice.get("action", "OPEN")
@@ -92,6 +104,68 @@ def start_monitoring(app: Any) -> None:
                             "risk_percent": risk_percent,
                         },
                     )
+
+                if app.auto_reduce_liq_var.get():
+                    try:
+                        liq_threshold = float(app.liq_distance_threshold_var.get())
+                    except Exception:
+                        liq_threshold = 3.0
+
+                    if min_liq_distance is not None and min_liq_distance <= liq_threshold:
+                        cooldown_remaining = 0.0
+                        last_reduce_at = _parse_dt(position.get("last_risk_reduce_at"))
+                        if last_reduce_at:
+                            cooldown_remaining = max(
+                                0.0,
+                                60.0 - (datetime.now(timezone.utc) - last_reduce_at).total_seconds(),
+                            )
+
+                        if cooldown_remaining > 0:
+                            safe_log(
+                                f"Liq-distance reduce cooldown: {cooldown_remaining:.1f}s remaining "
+                                f"(distance {min_liq_distance:.2f}% <= {liq_threshold:.1f}%)"
+                            )
+                        else:
+                            safe_log(
+                                f"Liq distance {min_liq_distance:.2f}% on {nearest_liq_exchange} "
+                                f"<= threshold {liq_threshold:.1f}% -> reducing both legs by 50%"
+                            )
+                            reduce_result = await app.service.reduce_position_on_risk(
+                                pair=position["pair"],
+                                long_exchange=position["long_exchange"],
+                                short_exchange=position["short_exchange"],
+                                risk_percent=risk_percent,
+                                threshold_percent=liq_threshold,
+                                reason="gui_monitor_liq_distance_threshold",
+                            )
+                            if reduce_result.get("success"):
+                                remaining_size = float(reduce_result.get("remaining_size_tokens", position.get("size", 0.0)) or 0.0)
+                                position["size"] = remaining_size
+                                position["long_size"] = float(reduce_result.get("remaining_long_size", position.get("long_size", 0.0)) or 0.0)
+                                position["short_size"] = float(reduce_result.get("remaining_short_size", position.get("short_size", 0.0)) or 0.0)
+                                position["last_risk_reduce_at"] = datetime.now(timezone.utc)
+                                position["risk_reduce_count"] = int(position.get("risk_reduce_count", 0) or 0) + 1
+                                safe_log(
+                                    f"Liq-distance reduce done: remaining size {remaining_size:.6f} | "
+                                    f"count {position['risk_reduce_count']}"
+                                )
+                                app.root.after(
+                                    0,
+                                    lambda liq_value=min_liq_distance, threshold=liq_threshold, exchange_name=nearest_liq_exchange: messagebox.showwarning(
+                                        "Liq Distance Reduce",
+                                        f"Triggered both-legs reduce 50%.\n"
+                                        f"Liq distance was {liq_value:.2f}% on {exchange_name} (threshold: {threshold:.1f}%).",
+                                    ),
+                                )
+                                if remaining_size <= 0:
+                                    safe_log("Position fully closed after liq-distance reduce")
+                                    app.service.clear_active_position()
+                                    app.monitoring = False
+                                    app.active_position = None
+                                    app.root.after(0, app._clear_position_display)
+                                    break
+                                continue
+                            safe_log(f"Liq-distance reduce failed: {reduce_result.get('error')}")
 
                 if app.auto_close_risk_var.get():
                     try:
@@ -162,6 +236,7 @@ def start_monitoring(app: Any) -> None:
                                     app.active_position = None
                                     app.root.after(0, app._clear_position_display)
                                     break
+                                continue
                             else:
                                 safe_log(f"Risk reduce failed: {reduce_result.get('error')}")
 

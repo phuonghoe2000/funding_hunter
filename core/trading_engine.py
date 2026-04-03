@@ -12,7 +12,7 @@ from core.opportunity import (
     build_directional_opportunity,
 )
 from core.session_store import SessionStore
-from core.trade_advisor import build_monitor_advice, build_trade_plan
+from core.trade_advisor import build_liquidation_context, build_monitor_advice, build_trade_plan
 from config.constants import Exchange, get_exchange_symbol, Side
 from config.settings import Settings
 from exchanges.okx_client import OKXClient
@@ -665,6 +665,7 @@ class TradingEngine:
     # ------------------------------------------------------------------
     async def monitor_position(self, pair: str, long_ex_name: str, short_ex_name: str,
                                auto_close_risk: Optional[float] = None,
+                               auto_reduce_liq_distance: Optional[float] = None,
                                auto_close_reversal: bool = False,
                                funding_spread_min: float = 0.0001,
                                interval: float = 5.0,
@@ -747,7 +748,11 @@ class TradingEngine:
                     )
 
         logger.info(f"[monitor] Monitoring {pair} | LONG: {long_ex_name} | SHORT: {short_ex_name}")
-        logger.info(f"   Auto-reduce risk: {auto_close_risk}% | Reversal: {auto_close_reversal}")
+        logger.info(
+            f"   Auto-reduce risk: {auto_close_risk}% | "
+            f"Auto-reduce liq distance: {auto_reduce_liq_distance}% | "
+            f"Reversal: {auto_close_reversal}"
+        )
         logger.info(f"   Auto-close on monitor advice: {auto_close_on_advice}")
         logger.info("   Press Ctrl+C to stop.")
 
@@ -767,14 +772,20 @@ class TradingEngine:
                 if short_pnl < 0:
                     losing += abs(short_pnl)
                 risk_pct = (losing / total_balance) * 100
+                liquidation_context = build_liquidation_context(position=tracked_position, check_result=result)
+                min_liq_distance_pct = liquidation_context.get("min_liquidation_distance_pct")
+                nearest_liq_exchange = liquidation_context.get("nearest_liquidation_exchange")
 
                 color_tag = "GREEN" if risk_pct < 2 else ("YELLOW" if risk_pct < 5 else "RED")
-                logger.info(
+                status_line = (
                     f"{color_tag} Risk: {risk_pct:.2f}% | "
                     f"Long({long_ex_name}): ${long_pnl:+.2f} | "
                     f"Short({short_ex_name}): ${short_pnl:+.2f} | "
                     f"Net: ${net_pnl:+.2f}"
                 )
+                if min_liq_distance_pct is not None and nearest_liq_exchange:
+                    status_line += f" | LiqDist({nearest_liq_exchange}): {min_liq_distance_pct:.2f}%"
+                logger.info(status_line)
 
                 if tracked_size <= 0 and long_pos and short_pos:
                     tracked_size = min(abs(long_pos.size), abs(short_pos.size))
@@ -819,6 +830,7 @@ class TradingEngine:
                                 "pair": pair,
                                 "advice": monitor_advice,
                                 "risk_percent": risk_pct,
+                                "min_liquidation_distance_pct": min_liq_distance_pct,
                             },
                         )
 
@@ -828,6 +840,7 @@ class TradingEngine:
                     active_session["latest_monitor_advice"] = monitor_advice
                     active_session["long_pnl"] = long_pnl
                     active_session["short_pnl"] = short_pnl
+                    active_session["latest_liquidation"] = liquidation_context
                     self.session_store.save_active_session(active_session)
 
                 if result.get("one_side_missing"):
@@ -845,6 +858,39 @@ class TradingEngine:
                     )
                     logger.info(f"Close result: {close_result}")
                     break
+
+                if auto_reduce_liq_distance is not None and min_liq_distance_pct is not None and min_liq_distance_pct <= auto_reduce_liq_distance:
+                    cooldown_remaining = self._remaining_risk_reduce_cooldown(active_session or tracked_position)
+                    if cooldown_remaining > 0:
+                        logger.warning(
+                            f"[monitor] Liq-distance reduce cooldown active for {cooldown_remaining:.1f}s "
+                            f"(distance {min_liq_distance_pct:.2f}% <= threshold {auto_reduce_liq_distance}%)"
+                        )
+                    else:
+                        logger.warning(
+                            f"[monitor] Liq distance {min_liq_distance_pct:.2f}% on {nearest_liq_exchange} "
+                            f"<= threshold {auto_reduce_liq_distance}%! Triggering fast both-legs reduce..."
+                        )
+                        reduce_result = await self.reduce_position_on_risk(
+                            pair,
+                            long_ex_name,
+                            short_ex_name,
+                            risk_percent=risk_pct,
+                            threshold_percent=auto_reduce_liq_distance,
+                            reason="monitor_liq_distance_threshold",
+                        )
+                        logger.info(f"Risk reduce result: {reduce_result}")
+                        if reduce_result.get("success"):
+                            tracked_position["size"] = reduce_result.get("remaining_size_tokens", tracked_position.get("size", 0.0))
+                            tracked_position["long_size"] = reduce_result.get("remaining_long_size", tracked_position.get("long_size", 0.0))
+                            tracked_position["short_size"] = reduce_result.get("remaining_short_size", tracked_position.get("short_size", 0.0))
+                            tracked_position["last_risk_reduce_at"] = datetime.now(timezone.utc)
+                            tracked_position["risk_reduce_count"] = int(tracked_position.get("risk_reduce_count", 0) or 0) + 1
+                            active_session = self.get_active_session()
+                            if active_session and self._session_matches(active_session, pair, long_ex, short_ex):
+                                tracked_position.update(active_session)
+                            continue
+                        logger.warning(f"[monitor] Liq-distance reduce failed: {reduce_result.get('error')}")
 
                 if auto_close_risk is not None and risk_pct >= auto_close_risk:
                     cooldown_remaining = self._remaining_risk_reduce_cooldown(active_session or tracked_position)
@@ -876,6 +922,7 @@ class TradingEngine:
                             active_session = self.get_active_session()
                             if active_session and self._session_matches(active_session, pair, long_ex, short_ex):
                                 tracked_position.update(active_session)
+                            continue
                         else:
                             logger.warning(f"[monitor] Risk reduce failed: {reduce_result.get('error')}")
 

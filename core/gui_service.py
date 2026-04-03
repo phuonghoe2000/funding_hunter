@@ -8,7 +8,7 @@ from config.settings import Settings
 from core.multi_exchange import MultiExchangeManager
 from core.opportunity import build_best_opportunity, build_directional_opportunity
 from core.session_store import SessionStore
-from core.trade_advisor import build_monitor_advice, build_trade_plan
+from core.trade_advisor import build_liquidation_context, build_monitor_advice, build_trade_plan
 from core.trading_engine import TradingEngine
 from exchanges.aster_client import AsterClient
 from exchanges.binance_client import BinanceClient
@@ -584,6 +584,7 @@ class GUIWorkflowService:
             risk_percent=risk_percent,
             check_result=result,
         )
+        liquidation_context = build_liquidation_context(position=position, check_result=result)
 
         return {
             "total_balance": total_balance,
@@ -591,6 +592,8 @@ class GUIWorkflowService:
             "long_pnl": long_pnl,
             "short_pnl": short_pnl,
             "risk_percent": risk_percent,
+            "liquidation": liquidation_context,
+            "min_liquidation_distance_pct": liquidation_context.get("min_liquidation_distance_pct"),
             "check_result": result,
             "pair_snapshot": snapshot,
             "trade_plan": trade_plan,

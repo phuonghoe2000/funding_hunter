@@ -334,6 +334,18 @@ def create_trading_frame(app: Any, parent: tk.Widget) -> None:
     ttk.Entry(risk_frame, textvariable=app.risk_threshold_var, width=5).pack(side=tk.LEFT, padx=2)
     ttk.Label(risk_frame, text="%").pack(side=tk.LEFT)
 
+    liq_frame = ttk.Frame(option_frame)
+    liq_frame.pack(anchor=tk.W, pady=2)
+    app.auto_reduce_liq_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(
+        liq_frame,
+        text="Auto-reduce 50% when Liq Distance <=",
+        variable=app.auto_reduce_liq_var,
+    ).pack(side=tk.LEFT)
+    app.liq_distance_threshold_var = tk.StringVar(value="3")
+    ttk.Entry(liq_frame, textvariable=app.liq_distance_threshold_var, width=5).pack(side=tk.LEFT, padx=2)
+    ttk.Label(liq_frame, text="%").pack(side=tk.LEFT)
+
     app.auto_close_reversal_var = tk.BooleanVar(value=False)
     ttk.Checkbutton(
         option_frame,

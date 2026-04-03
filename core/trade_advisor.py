@@ -148,6 +148,8 @@ class MonitorAdvice:
     current_net_edge_pct: float
     edge_retention_pct: Optional[float]
     expected_next_cycle_pnl_usd: float
+    liquidation_distance_pct: Optional[float] = None
+    liquidation_exchange: Optional[str] = None
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -158,6 +160,8 @@ class MonitorAdvice:
             "current_net_edge_pct": self.current_net_edge_pct,
             "edge_retention_pct": self.edge_retention_pct,
             "expected_next_cycle_pnl_usd": self.expected_next_cycle_pnl_usd,
+            "liquidation_distance_pct": self.liquidation_distance_pct,
+            "liquidation_exchange": self.liquidation_exchange,
             "warnings": list(self.warnings),
         }
 
@@ -373,6 +377,52 @@ def _plan_value(trade_plan: Optional[Any], key: str, default: Any = None) -> Any
     return getattr(trade_plan, key, default)
 
 
+def calculate_liquidation_distance_pct(position: Optional[Any]) -> Optional[float]:
+    if position is None:
+        return None
+
+    mark_price = _safe_float(getattr(position, "mark_price", 0.0))
+    liquidation_price = _safe_float(getattr(position, "liquidation_price", 0.0))
+    if mark_price <= 0 or liquidation_price <= 0:
+        return None
+
+    return abs(mark_price - liquidation_price) / mark_price * 100
+
+
+def build_liquidation_context(
+    *,
+    position: Optional[Dict[str, Any]],
+    check_result: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    check_result = check_result or {}
+    long_position = check_result.get("long")
+    short_position = check_result.get("short")
+    long_distance = calculate_liquidation_distance_pct(long_position)
+    short_distance = calculate_liquidation_distance_pct(short_position)
+
+    candidates: list[tuple[str, float]] = []
+    long_exchange = position.get("long_exchange") if position else None
+    short_exchange = position.get("short_exchange") if position else None
+    if long_distance is not None:
+        exchange_name = getattr(long_exchange, "value", long_exchange) or "LONG"
+        candidates.append((str(exchange_name), long_distance))
+    if short_distance is not None:
+        exchange_name = getattr(short_exchange, "value", short_exchange) or "SHORT"
+        candidates.append((str(exchange_name), short_distance))
+
+    nearest_exchange = None
+    min_distance = None
+    if candidates:
+        nearest_exchange, min_distance = min(candidates, key=lambda item: item[1])
+
+    return {
+        "long_liquidation_distance_pct": long_distance,
+        "short_liquidation_distance_pct": short_distance,
+        "min_liquidation_distance_pct": min_distance,
+        "nearest_liquidation_exchange": nearest_exchange,
+    }
+
+
 def build_monitor_advice(
     *,
     position: Dict[str, Any],
@@ -381,17 +431,9 @@ def build_monitor_advice(
     check_result: Optional[Dict[str, Any]] = None,
 ) -> MonitorAdvice:
     check_result = check_result or {}
-    if trade_plan is None:
-        return MonitorAdvice(
-            action="CONTINUE",
-            severity="info",
-            reason="Market analytics temporarily unavailable. Keep monitoring.",
-            current_net_edge_pct=0.0,
-            edge_retention_pct=None,
-            expected_next_cycle_pnl_usd=0.0,
-            warnings=[],
-        )
-
+    liquidation_context = build_liquidation_context(position=position, check_result=check_result)
+    min_liq_distance_pct = liquidation_context["min_liquidation_distance_pct"]
+    nearest_liq_exchange = liquidation_context["nearest_liquidation_exchange"]
     if check_result.get("one_side_missing"):
         return MonitorAdvice(
             action="EMERGENCY_CLOSE",
@@ -400,6 +442,8 @@ def build_monitor_advice(
             current_net_edge_pct=_plan_value(trade_plan, "net_edge_pct", 0.0),
             edge_retention_pct=None,
             expected_next_cycle_pnl_usd=_plan_value(trade_plan, "expected_net_pnl_next_cycle_usd", 0.0),
+            liquidation_distance_pct=min_liq_distance_pct,
+            liquidation_exchange=nearest_liq_exchange,
             warnings=["Possible liquidation or asymmetric fill detected."],
         )
 
@@ -413,6 +457,53 @@ def build_monitor_advice(
     warnings: list[str] = []
     if trade_plan:
         warnings.extend(_plan_value(trade_plan, "warnings", [])[:3])
+    else:
+        warnings.append("Market analytics temporarily unavailable.")
+
+    if min_liq_distance_pct is not None and nearest_liq_exchange:
+        if min_liq_distance_pct <= 5:
+            warnings.insert(0, f"Liquidation distance is only {min_liq_distance_pct:.2f}% on {nearest_liq_exchange}.")
+        elif min_liq_distance_pct <= 10:
+            warnings.insert(0, f"Nearest liquidation distance is {min_liq_distance_pct:.2f}% on {nearest_liq_exchange}.")
+
+    if min_liq_distance_pct is not None and nearest_liq_exchange and min_liq_distance_pct <= 1.0:
+        return MonitorAdvice(
+            action="REDUCE",
+            severity="critical",
+            reason=f"Liquidation proximity is critical at {min_liq_distance_pct:.2f}% on {nearest_liq_exchange}. Reduce immediately.",
+            current_net_edge_pct=current_net_edge_pct,
+            edge_retention_pct=edge_retention_pct,
+            expected_next_cycle_pnl_usd=expected_cycle_pnl,
+            liquidation_distance_pct=min_liq_distance_pct,
+            liquidation_exchange=nearest_liq_exchange,
+            warnings=warnings,
+        )
+
+    if min_liq_distance_pct is not None and nearest_liq_exchange and min_liq_distance_pct <= 3.0:
+        return MonitorAdvice(
+            action="REDUCE",
+            severity="high",
+            reason=f"Liquidation proximity is tight at {min_liq_distance_pct:.2f}% on {nearest_liq_exchange}. Consider reducing now.",
+            current_net_edge_pct=current_net_edge_pct,
+            edge_retention_pct=edge_retention_pct,
+            expected_next_cycle_pnl_usd=expected_cycle_pnl,
+            liquidation_distance_pct=min_liq_distance_pct,
+            liquidation_exchange=nearest_liq_exchange,
+            warnings=warnings,
+        )
+
+    if trade_plan is None:
+        return MonitorAdvice(
+            action="CONTINUE",
+            severity="info",
+            reason="Market analytics temporarily unavailable. Keep monitoring.",
+            current_net_edge_pct=current_net_edge_pct,
+            edge_retention_pct=edge_retention_pct,
+            expected_next_cycle_pnl_usd=expected_cycle_pnl,
+            liquidation_distance_pct=min_liq_distance_pct,
+            liquidation_exchange=nearest_liq_exchange,
+            warnings=warnings,
+        )
 
     if current_net_edge_pct <= 0:
         return MonitorAdvice(
@@ -422,6 +513,8 @@ def build_monitor_advice(
             current_net_edge_pct=current_net_edge_pct,
             edge_retention_pct=edge_retention_pct,
             expected_next_cycle_pnl_usd=expected_cycle_pnl,
+            liquidation_distance_pct=min_liq_distance_pct,
+            liquidation_exchange=nearest_liq_exchange,
             warnings=warnings,
         )
 
@@ -433,6 +526,8 @@ def build_monitor_advice(
             current_net_edge_pct=current_net_edge_pct,
             edge_retention_pct=edge_retention_pct,
             expected_next_cycle_pnl_usd=expected_cycle_pnl,
+            liquidation_distance_pct=min_liq_distance_pct,
+            liquidation_exchange=nearest_liq_exchange,
             warnings=warnings,
         )
 
@@ -444,6 +539,8 @@ def build_monitor_advice(
             current_net_edge_pct=current_net_edge_pct,
             edge_retention_pct=edge_retention_pct,
             expected_next_cycle_pnl_usd=expected_cycle_pnl,
+            liquidation_distance_pct=min_liq_distance_pct,
+            liquidation_exchange=nearest_liq_exchange,
             warnings=warnings,
         )
 
@@ -455,6 +552,8 @@ def build_monitor_advice(
             current_net_edge_pct=current_net_edge_pct,
             edge_retention_pct=edge_retention_pct,
             expected_next_cycle_pnl_usd=expected_cycle_pnl,
+            liquidation_distance_pct=min_liq_distance_pct,
+            liquidation_exchange=nearest_liq_exchange,
             warnings=warnings,
         )
 
@@ -466,6 +565,8 @@ def build_monitor_advice(
             current_net_edge_pct=current_net_edge_pct,
             edge_retention_pct=edge_retention_pct,
             expected_next_cycle_pnl_usd=expected_cycle_pnl,
+            liquidation_distance_pct=min_liq_distance_pct,
+            liquidation_exchange=nearest_liq_exchange,
             warnings=warnings,
         )
 
@@ -476,5 +577,7 @@ def build_monitor_advice(
         current_net_edge_pct=current_net_edge_pct,
         edge_retention_pct=edge_retention_pct,
         expected_next_cycle_pnl_usd=expected_cycle_pnl,
+        liquidation_distance_pct=min_liq_distance_pct,
+        liquidation_exchange=nearest_liq_exchange,
         warnings=warnings,
     )

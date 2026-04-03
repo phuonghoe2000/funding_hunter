@@ -66,7 +66,7 @@ Examples:
   python cli.py info --pair BTC/USDT --long binance --short bingx
   python cli.py open --pair BTC/USDT --long gate --short binance --size 100 --leverage 3
   python cli.py close --pair BTC/USDT --long gate --short binance --splits 3
-  python cli.py monitor --pair BTC/USDT --long gate --short binance --auto-reduce-risk 10
+  python cli.py monitor --pair BTC/USDT --long gate --short binance --auto-reduce-risk 10 --auto-reduce-liq-distance 3
   python cli.py pnl --pair BTC/USDT --long gate --short binance
   python cli.py analyze --pair BTC/USDT --long gate --short binance --duration 120
   python cli.py session
@@ -131,6 +131,12 @@ Examples:
         type=float,
         default=None,
         help="Reduce both legs by 50%% when risk >= X%%",
+    )
+    p.add_argument(
+        "--auto-reduce-liq-distance",
+        type=float,
+        default=None,
+        help="Reduce both legs by 50%% when nearest liquidation distance <= X%%",
     )
     p.add_argument("--auto-close-reversal", action="store_true", help="Auto-close on funding reversal")
     p.add_argument("--auto-close-on-advice", action="store_true", help="Auto-close on CLOSE_NOW or EMERGENCY_CLOSE advice")
@@ -308,6 +314,7 @@ async def cmd_monitor(engine, args):
     await engine.monitor_position(
         pair=args.pair, long_ex_name=args.long, short_ex_name=args.short,
         auto_close_risk=args.auto_close_risk,
+        auto_reduce_liq_distance=args.auto_reduce_liq_distance,
         auto_close_reversal=args.auto_close_reversal,
         funding_spread_min=args.funding_spread_min / 100,  # Convert % to decimal
         interval=args.interval,
