@@ -7,6 +7,8 @@ from config.constants import Exchange, get_exchange_symbol, get_unified_pair
 from config.settings import Settings
 from core.multi_exchange import MultiExchangeManager
 from core.opportunity import build_best_opportunity, build_directional_opportunity
+from core.session_store import SessionStore
+from core.trade_advisor import build_monitor_advice, build_trade_plan
 from core.trading_engine import TradingEngine
 from exchanges.aster_client import AsterClient
 from exchanges.binance_client import BinanceClient
@@ -26,6 +28,7 @@ class GUIWorkflowService:
         self.manager = MultiExchangeManager()
         self.engine = TradingEngine(settings)
         self.engine.exchange_manager = self.manager
+        self.session_store = SessionStore()
 
     async def connect_exchanges(
         self,
@@ -111,6 +114,65 @@ class GUIWorkflowService:
 
         balances = await self.manager.get_all_balances()
         return connected, balances
+
+    def new_session_id(self) -> str:
+        return self.session_store.new_session_id()
+
+    def persist_active_position(self, position: Dict[str, Any]) -> None:
+        self.session_store.save_active_session(position)
+
+    def clear_active_position(self) -> None:
+        self.session_store.clear_active_session()
+
+    def record_trade_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+        self.session_store.append_journal_event(event_type, payload)
+
+    def _restore_position_types(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        restored = dict(payload)
+        for field in ("long_exchange", "short_exchange"):
+            value = restored.get(field)
+            if isinstance(value, str):
+                restored[field] = Exchange(value)
+        for field in ("open_time", "last_funding_check", "saved_at"):
+            value = restored.get(field)
+            if isinstance(value, str):
+                try:
+                    restored[field] = datetime.fromisoformat(value)
+                except ValueError:
+                    pass
+        return restored
+
+    async def recover_active_session(self) -> Optional[Dict[str, Any]]:
+        payload = self.session_store.load_active_session()
+        if not payload:
+            return None
+
+        restored = self._restore_position_types(payload)
+        pair = restored.get("pair")
+        long_exchange = restored.get("long_exchange")
+        short_exchange = restored.get("short_exchange")
+        if not pair or not long_exchange or not short_exchange:
+            return None
+
+        check_result = await self.manager.check_positions(pair, long_exchange, short_exchange)
+        long_position = check_result.get("long")
+        short_position = check_result.get("short")
+        if not long_position and not short_position:
+            self.session_store.clear_active_session()
+            self.session_store.append_journal_event(
+                "session_stale",
+                {"pair": pair, "long_exchange": long_exchange, "short_exchange": short_exchange},
+            )
+            return None
+
+        if long_position and short_position:
+            restored["long_size"] = getattr(long_position, "size", restored.get("long_size", 0.0))
+            restored["short_size"] = getattr(short_position, "size", restored.get("short_size", 0.0))
+            restored["size"] = min(
+                value for value in [restored["long_size"], restored["short_size"]] if value is not None and value > 0
+            ) if restored.get("long_size") and restored.get("short_size") else restored.get("size", 0.0)
+
+        return restored
 
     async def scan_funding_rates(self, top_candidates: int = 20) -> Dict[str, Dict[Exchange, Any]]:
         """
@@ -267,12 +329,82 @@ class GUIWorkflowService:
 
         return snapshot
 
+    def build_trade_plan_from_snapshot(
+        self,
+        snapshot: Dict[str, Any],
+        *,
+        requested_size_tokens: float,
+        leverage: int,
+        balances: Optional[Dict[Exchange, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        funding_rates = snapshot.get("funding_rates", {})
+        long_exchange = snapshot.get("long_exchange")
+        short_exchange = snapshot.get("short_exchange")
+        if long_exchange not in funding_rates or short_exchange not in funding_rates:
+            return None
+
+        result_data = snapshot.get("result_data", {})
+        long_data = result_data.get(long_exchange, {})
+        short_data = result_data.get(short_exchange, {})
+        long_balance = balances.get(long_exchange) if balances else None
+        short_balance = balances.get(short_exchange) if balances else None
+
+        plan = build_trade_plan(
+            pair=snapshot["pair"],
+            long_exchange=long_exchange,
+            short_exchange=short_exchange,
+            long_rate_obj=funding_rates[long_exchange],
+            short_rate_obj=funding_rates[short_exchange],
+            long_order_book=long_data.get("order_book"),
+            short_order_book=short_data.get("order_book"),
+            long_ticker=long_data.get("ticker"),
+            short_ticker=short_data.get("ticker"),
+            long_balance=long_balance,
+            short_balance=short_balance,
+            requested_size_tokens=requested_size_tokens,
+            leverage=leverage,
+            long_price=snapshot.get("long_entry_price", long_data.get("price")),
+            short_price=snapshot.get("short_entry_price", short_data.get("price")),
+        )
+        return plan.to_dict()
+
+    async def build_open_assessment(
+        self,
+        *,
+        pair: str,
+        long_exchange: Exchange,
+        short_exchange: Exchange,
+        requested_size_tokens: float,
+        leverage: int,
+        balances: Optional[Dict[Exchange, Any]] = None,
+    ) -> Dict[str, Any]:
+        snapshot = await self.get_pair_snapshot(pair, long_exchange, short_exchange)
+        live_balances = balances or await self.get_balances_subset(long_exchange, short_exchange)
+        trade_plan = self.build_trade_plan_from_snapshot(
+            snapshot,
+            requested_size_tokens=requested_size_tokens,
+            leverage=leverage,
+            balances=live_balances,
+        )
+        if trade_plan:
+            snapshot["trade_plan"] = trade_plan
+        return {
+            "snapshot": snapshot,
+            "trade_plan": trade_plan,
+            "balances": live_balances,
+        }
+
     async def get_initial_position_state(
         self,
         pair: str,
         long_exchange: Exchange,
         short_exchange: Exchange,
         size: float,
+        *,
+        leverage: int = 1,
+        pretrade_assessment: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        open_time: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         rates = {}
         for exchange in [long_exchange, short_exchange]:
@@ -287,18 +419,39 @@ class GUIWorkflowService:
 
         long_rate = rates.get(long_exchange, 0.0)
         short_rate = rates.get(short_exchange, 0.0)
-        return {
+        state = {
             "pair": pair,
             "long_exchange": long_exchange,
             "short_exchange": short_exchange,
             "size": size,
-            "open_time": datetime.now(timezone.utc),
+            "leverage": leverage,
+            "open_time": open_time or datetime.now(timezone.utc),
             "total_funding_fees": 0.0,
             "last_funding_check": datetime.now(timezone.utc),
             "initial_long_rate": long_rate,
             "initial_short_rate": short_rate,
             "initial_net_funding": short_rate - long_rate,
+            "session_id": session_id or self.new_session_id(),
         }
+        if pretrade_assessment:
+            state["pretrade_assessment"] = pretrade_assessment
+            state["initial_net_edge_pct"] = pretrade_assessment.get("net_edge_pct", 0.0)
+            state["initial_quality_score"] = pretrade_assessment.get("quality_score", 0.0)
+        return state
+
+    async def get_balances_subset(self, *exchanges: Exchange) -> Dict[Exchange, Any]:
+        balances: Dict[Exchange, Any] = {}
+        for exchange in exchanges:
+            client = self.manager.clients.get(exchange)
+            if not client:
+                continue
+            try:
+                balance = await client.get_balance()
+                if balance:
+                    balances[exchange] = balance
+            except Exception as exc:
+                logger.debug(f"Could not get balance from {exchange.value}: {exc}")
+        return balances
 
     async def check_open_spread(
         self,
@@ -383,10 +536,12 @@ class GUIWorkflowService:
 
     async def build_monitor_snapshot(self, position: Dict[str, Any]) -> Dict[str, Any]:
         total_balance = 0.0
-        for _, client in self.manager.clients.items():
+        balances: Dict[Exchange, Any] = {}
+        for exchange, client in self.manager.clients.items():
             try:
                 balance = await client.get_balance()
                 if balance:
+                    balances[exchange] = balance
                     total_balance += balance.available
             except Exception:
                 continue
@@ -406,12 +561,34 @@ class GUIWorkflowService:
         losing_pnl = (abs(long_pnl) if long_pnl < 0 else 0.0) + (abs(short_pnl) if short_pnl < 0 else 0.0)
         risk_percent = (losing_pnl / total_balance) * 100
 
+        snapshot = await self.get_pair_snapshot(
+            position["pair"],
+            position["long_exchange"],
+            position["short_exchange"],
+        )
+        trade_plan = self.build_trade_plan_from_snapshot(
+            snapshot,
+            requested_size_tokens=float(position.get("size", 0.0) or 0.0),
+            leverage=int(position.get("leverage", 1) or 1),
+            balances=balances,
+        )
+        advice = build_monitor_advice(
+            position=position,
+            trade_plan=trade_plan,
+            risk_percent=risk_percent,
+            check_result=result,
+        )
+
         return {
             "total_balance": total_balance,
+            "balances": balances,
             "long_pnl": long_pnl,
             "short_pnl": short_pnl,
             "risk_percent": risk_percent,
             "check_result": result,
+            "pair_snapshot": snapshot,
+            "trade_plan": trade_plan,
+            "monitor_advice": advice.to_dict(),
         }
 
     async def close_position_with_analysis(
@@ -486,6 +663,11 @@ class GUIWorkflowService:
             result["price"] = await asyncio.wait_for(client.get_mark_price(symbol), timeout=8.0)
         except Exception as exc:
             logger.debug(f"Could not get price from {exchange.value}: {exc}")
+
+        try:
+            result["ticker"] = await asyncio.wait_for(client.get_ticker(symbol), timeout=8.0)
+        except Exception as exc:
+            logger.debug(f"Could not get ticker from {exchange.value}: {exc}")
 
         try:
             result["funding_rate"] = await asyncio.wait_for(client.get_funding_rate(symbol), timeout=8.0)

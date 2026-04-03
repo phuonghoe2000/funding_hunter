@@ -35,9 +35,13 @@ def start_monitoring(app: Any) -> None:
                 short_pnl = snapshot["short_pnl"]
                 risk_percent = snapshot["risk_percent"]
                 total_balance = snapshot["total_balance"]
+                trade_plan = snapshot.get("trade_plan") or {}
+                monitor_advice = snapshot.get("monitor_advice") or {}
 
                 position["long_pnl"] = long_pnl
                 position["short_pnl"] = short_pnl
+                position["latest_trade_plan"] = trade_plan
+                position["latest_monitor_advice"] = monitor_advice
 
                 long_exchange_name = position["long_exchange"].value.capitalize()
                 short_exchange_name = position["short_exchange"].value.capitalize()
@@ -48,14 +52,34 @@ def start_monitoring(app: Any) -> None:
                     short_value=short_pnl,
                     long_name=long_exchange_name,
                     short_name=short_exchange_name,
+                    advice=monitor_advice,
                 ) -> None:
                     color = "red" if risk > 5 else ("orange" if risk > 2 else "green")
                     app.pos_pnl_label.config(
                         text=f"Risk: {risk:.2f}% | Long({long_name}): ${long_value:+.2f} | Short({short_name}): ${short_value:+.2f}",
                         foreground=color,
                     )
+                    advice_text = advice.get("action", "OPEN")
+                    app.pos_status_label.config(text=f"Status: {advice_text}", foreground=color)
 
                 app.root.after(0, update_label)
+                app.service.persist_active_position(position)
+
+                advice_reason = monitor_advice.get("reason")
+                advice_action = monitor_advice.get("action")
+                advice_signature = f"{advice_action}:{advice_reason}"
+                if advice_reason and app.last_monitor_advice != advice_signature:
+                    app.last_monitor_advice = advice_signature
+                    safe_log(f"Monitor advice -> {advice_action}: {advice_reason}")
+                    app.service.record_trade_event(
+                        "monitor_advice",
+                        {
+                            "session_id": position.get("session_id"),
+                            "pair": position.get("pair"),
+                            "advice": monitor_advice,
+                            "risk_percent": risk_percent,
+                        },
+                    )
 
                 if app.auto_close_risk_var.get():
                     try:
@@ -89,6 +113,7 @@ def start_monitoring(app: Any) -> None:
                             short_exchange=position["short_exchange"],
                             splits=splits,
                             log_callback=safe_log,
+                            skip_spread_check=True,
                         )
                         if close_result.get("success"):
                             safe_log(f"Position closed due to risk >= {effective_threshold:.1f}%")
@@ -99,13 +124,23 @@ def start_monitoring(app: Any) -> None:
                                     f"Position closed!\nRisk was {risk_value:.2f}% (threshold: {threshold:.1f}%)",
                                 ),
                             )
+                            app.service.record_trade_event(
+                                "auto_close_risk",
+                                {
+                                    "session_id": position.get("session_id"),
+                                    "pair": position.get("pair"),
+                                    "risk_percent": risk_percent,
+                                    "threshold": effective_threshold,
+                                    "close_result": close_result,
+                                },
+                            )
+                            app.service.clear_active_position()
+                            app.monitoring = False
+                            app.active_position = None
+                            app.root.after(0, app._clear_position_display)
+                            break
                         else:
                             safe_log(f"Auto-close failed: {close_result.get('error')}")
-
-                        app.monitoring = False
-                        app.active_position = None
-                        app.root.after(0, app._clear_position_display)
-                        break
 
                 if app.auto_close_reversal_var.get() and "initial_net_funding" in position:
                     should_close, reason = await check_funding_reversal(app, position)
@@ -122,6 +157,7 @@ def start_monitoring(app: Any) -> None:
                             short_exchange=position["short_exchange"],
                             splits=splits,
                             log_callback=safe_log,
+                            skip_spread_check=True,
                         )
                         if close_result.get("success"):
                             safe_log(f"Position auto-closed due to: {reason}")
@@ -132,13 +168,22 @@ def start_monitoring(app: Any) -> None:
                                     f"Position closed:\n{reason_text}",
                                 ),
                             )
+                            app.service.record_trade_event(
+                                "auto_close_reversal",
+                                {
+                                    "session_id": position.get("session_id"),
+                                    "pair": position.get("pair"),
+                                    "reason": reason,
+                                    "close_result": close_result,
+                                },
+                            )
+                            app.service.clear_active_position()
+                            app.monitoring = False
+                            app.active_position = None
+                            app.root.after(0, app._clear_position_display)
+                            break
                         else:
                             safe_log(f"Auto-close failed: {close_result.get('error')}")
-
-                        app.monitoring = False
-                        app.active_position = None
-                        app.root.after(0, app._clear_position_display)
-                        break
 
                 await asyncio.sleep(2)
             except Exception as exc:

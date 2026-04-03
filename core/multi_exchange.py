@@ -360,6 +360,56 @@ class MultiExchangeManager:
         
         # Should not reach here, but just in case
         raise Exception(f"Order failed after {max_retries} retries: {last_error}")
+
+    async def _recover_exposed_leg(
+        self,
+        client: BaseExchangeClient,
+        symbol: str,
+        exchange: Exchange,
+        label: str,
+    ) -> bool:
+        """Attempt to flatten a single exposed leg after asymmetric execution."""
+        try:
+            logger.warning(f"Recovering exposed {label} leg on {exchange.value}...")
+            await asyncio.sleep(0.5)
+
+            position = await client.get_position(symbol)
+            if not position or position.size == 0:
+                logger.warning(f"No exposed position found on {exchange.value}; nothing to recover.")
+                return True
+
+            await client.close_position(symbol, aggressive=True)
+            logger.info(f"Recovered exposed {label} leg on {exchange.value}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to recover exposed {label} leg on {exchange.value}: {e}")
+            return False
+
+    async def _restore_closed_leg_after_failed_close(
+        self,
+        client: BaseExchangeClient,
+        symbol: str,
+        exchange: Exchange,
+        side: Side,
+        size: float,
+        label: str,
+    ) -> bool:
+        """Re-open the already closed leg so the hedge stays balanced."""
+        try:
+            logger.warning(f"Restoring {label} leg on {exchange.value} after close mismatch...")
+            await self._place_order_with_retry(
+                client,
+                symbol,
+                side,
+                size,
+                exchange,
+                max_retries=2,
+            )
+            logger.info(f"Restored {label} leg on {exchange.value}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to restore {label} leg on {exchange.value}: {e}")
+            return False
     
     async def close_hedged_position(
         self,
@@ -448,7 +498,9 @@ class MultiExchangeManager:
             "error": None, 
             "closed_splits": 0,
             "splits_total": splits,
-            "cancelled": False
+            "cancelled": False,
+            "recovery_attempted": False,
+            "recovery_success": None,
         }
         
         long_client = self.clients.get(long_exchange)
@@ -659,8 +711,26 @@ class MultiExchangeManager:
                                 await asyncio.sleep(0.5 * (2 ** attempt))
                     
                     if not short_closed:
-                        log_msg(f"❌ SHORT close failed after 3 retries. Stopping.")
-                        results["error"] = "SHORT close failed after 3 retries"
+                        recovery_message = ""
+                        if long_closed and long_size_to_close > 0:
+                            results["recovery_attempted"] = True
+                            recovery_success = await self._restore_closed_leg_after_failed_close(
+                                long_client,
+                                long_symbol,
+                                long_exchange,
+                                Side.LONG,
+                                long_size_to_close,
+                                "LONG",
+                            )
+                            results["recovery_success"] = recovery_success
+                            if recovery_success:
+                                recovery_message = " Restored LONG leg to prevent net exposure."
+                            else:
+                                recovery_message = " Failed to restore LONG leg after mismatch."
+
+                        log_msg(f"? SHORT close failed after 3 retries.{recovery_message}")
+                        results["error"] = f"SHORT close failed after 3 retries.{recovery_message}".strip()
+                        results["success"] = results["closed_splits"] > 0
                         return results
                 
                 results["closed_splits"] = split_num
@@ -993,7 +1063,9 @@ class MultiExchangeManager:
             "total_short_size": 0,
             "error": None,
             "split_results": [],
-            "cancelled": False
+            "cancelled": False,
+            "recovery_attempted": False,
+            "recovery_success": None,
         }
         
         if long_exchange not in self.clients or short_exchange not in self.clients:
@@ -1178,14 +1250,69 @@ class MultiExchangeManager:
                         break
                 
                 try:
-                    # Open both sides simultaneously for this split with timeout
+                    # Open both sides simultaneously for this split with timeout.
+                    # If only one side succeeds, immediately try to neutralize it.
                     long_order, short_order = await asyncio.wait_for(
                         asyncio.gather(
                             long_client.place_market_order(long_symbol, Side.LONG, size_per_split),
-                            short_client.place_market_order(short_symbol, Side.SHORT, size_per_split)
+                            short_client.place_market_order(short_symbol, Side.SHORT, size_per_split),
+                            return_exceptions=True,
                         ),
-                        timeout=30.0
+                        timeout=30.0,
                     )
+
+                    long_error = long_order if isinstance(long_order, Exception) else None
+                    short_error = short_order if isinstance(short_order, Exception) else None
+                    long_order = None if long_error else long_order
+                    short_order = None if short_error else short_order
+
+                    if long_error or short_error:
+                        results["recovery_attempted"] = True
+                        recovery_success = True
+                        recovery_errors = []
+
+                        if long_order and not short_order:
+                            recovery_success = await self._recover_exposed_leg(
+                                long_client,
+                                long_symbol,
+                                long_exchange,
+                                "LONG",
+                            )
+                            if not recovery_success:
+                                recovery_errors.append("Failed to recover exposed LONG leg")
+
+                        if short_order and not long_order:
+                            short_recovery = await self._recover_exposed_leg(
+                                short_client,
+                                short_symbol,
+                                short_exchange,
+                                "SHORT",
+                            )
+                            recovery_success = recovery_success and short_recovery
+                            if not short_recovery:
+                                recovery_errors.append("Failed to recover exposed SHORT leg")
+
+                        results["recovery_success"] = recovery_success
+                        error_parts = []
+                        if long_error:
+                            error_parts.append(f"LONG failed: {long_error}")
+                        if short_error:
+                            error_parts.append(f"SHORT failed: {short_error}")
+                        if recovery_errors:
+                            error_parts.extend(recovery_errors)
+
+                        error_message = " | ".join(error_parts) if error_parts else "Asymmetric split execution"
+                        log_important(f"❌ Split {split_num} execution mismatch: {error_message}")
+                        results["split_results"].append({
+                            "split": split_num,
+                            "success": False,
+                            "error": error_message,
+                            "recovery_attempted": True,
+                            "recovery_success": recovery_success,
+                        })
+                        results["error"] = error_message
+                        results["success"] = results["splits_completed"] > 0
+                        return results
                     
                     results["splits_completed"] += 1
                     results["total_long_size"] += size_per_split

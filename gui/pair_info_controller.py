@@ -123,6 +123,25 @@ def fetch_pair_prices_for_display(
                 )
                 return
 
+            try:
+                requested_size = float(app.size_entry.get())
+            except (ValueError, AttributeError):
+                requested_size = 0.0
+
+            try:
+                leverage = int(app.leverage_var.get())
+            except (ValueError, AttributeError):
+                leverage = 1
+
+            trade_plan = app.service.build_trade_plan_from_snapshot(
+                snapshot,
+                requested_size_tokens=requested_size,
+                leverage=leverage,
+                balances=app.latest_balances,
+            )
+            if trade_plan:
+                snapshot["trade_plan"] = trade_plan
+
             info_text, entry_color = build_pair_snapshot_display(
                 pair=pair,
                 snapshot=snapshot,

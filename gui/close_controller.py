@@ -67,6 +67,18 @@ def close_position(app: Any) -> None:
     if not messagebox.askyesno("Confirm Close", confirm_message):
         return
 
+    if app.active_position:
+        app.service.record_trade_event(
+            "close_requested",
+            {
+                "session_id": app.active_position.get("session_id"),
+                "pair": app.active_position.get("pair"),
+                "requested_close_size": close_size,
+                "splits": splits,
+                "skip_spread_check": skip_spread,
+            },
+        )
+
     app._log(f"Starting close workflow for {position['pair']}...")
     app._stop_all_background_tasks()
 
@@ -171,11 +183,19 @@ def on_close_complete(app: Any, future: Any) -> None:
             if result["success"]:
                 app._log("Position closed successfully!")
                 app._stop_monitoring()
+                if closed_position:
+                    app.service.record_trade_event(
+                        "position_closed",
+                        {
+                            "session_id": closed_position.get("session_id"),
+                            "position": closed_position,
+                            "close_result": result,
+                        },
+                    )
+                    calculate_and_show_final_pnl(app, closed_position)
+                app.service.clear_active_position()
                 app.active_position = None
                 app._clear_position_display()
-
-                if closed_position:
-                    calculate_and_show_final_pnl(app, closed_position)
 
                 if getattr(app, "auto_trading_active", False):
                     app._log("Auto Trading: resuming signal scan...")
@@ -240,6 +260,14 @@ def calculate_and_show_final_pnl(app: Any, closed_position: dict[str, Any]) -> N
                     for line in build_final_pnl_report_lines(result):
                         app._log(line)
                     app.balance_before_open = {}
+                    app.service.record_trade_event(
+                        "position_pnl_final",
+                        {
+                            "pair": result["pair"],
+                            "session_id": closed_position.get("session_id"),
+                            "report": result,
+                        },
+                    )
                     return
 
                 app._log("Could not calculate final PnL")

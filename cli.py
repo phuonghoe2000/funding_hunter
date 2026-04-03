@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Funding Hunter CLI - Full Feature Parity with GUI
-Commands: scan, status, positions, info, open, close, monitor, pnl, analyze
+Commands: scan, status, positions, info, open, close, monitor, pnl, analyze, session, journal
 """
 import asyncio
 import argparse
@@ -16,6 +16,11 @@ from tabulate import tabulate
 
 from core.config_manager import ConfigManager
 from core.trading_engine import TradingEngine
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 class DataclassEncoder(json.JSONEncoder):
@@ -64,6 +69,8 @@ Examples:
   python cli.py monitor --pair BTC/USDT --long gate --short binance --auto-close-risk 10
   python cli.py pnl --pair BTC/USDT --long gate --short binance
   python cli.py analyze --pair BTC/USDT --long gate --short binance --duration 120
+  python cli.py session
+  python cli.py journal --limit 20
         """
     )
     sub = parser.add_subparsers(dest="command", help="Available commands")
@@ -86,6 +93,8 @@ Examples:
     p.add_argument("--pair", required=True, help="Trading pair (e.g. BTC/USDT)")
     p.add_argument("--long", required=True, help="Long exchange name")
     p.add_argument("--short", required=True, help="Short exchange name")
+    p.add_argument("--size", type=float, default=0.0, help="Requested token size to evaluate trade plan")
+    p.add_argument("--leverage", type=int, default=1, help="Leverage for trade plan sizing")
 
     # ── open ──
     p = sub.add_parser("open", help="Open hedged position with spread analysis & DCA splits")
@@ -117,8 +126,11 @@ Examples:
     p.add_argument("--short", required=True, help="Short exchange")
     p.add_argument("--auto-close-risk", type=float, default=None, help="Auto-close when risk >= X%%")
     p.add_argument("--auto-close-reversal", action="store_true", help="Auto-close on funding reversal")
+    p.add_argument("--auto-close-on-advice", action="store_true", help="Auto-close on CLOSE_NOW or EMERGENCY_CLOSE advice")
     p.add_argument("--funding-spread-min", type=float, default=0.01, help="Min funding spread %% for reversal check")
     p.add_argument("--interval", type=float, default=5.0, help="Check interval in seconds (default: 5)")
+    p.add_argument("--size", type=float, default=None, help="Override monitored token size")
+    p.add_argument("--leverage", type=int, default=None, help="Override leverage used in monitor trade-plan evaluation")
 
     # ── pnl ──
     p = sub.add_parser("pnl", help="Calculate realized PnL from trade and income history")
@@ -134,6 +146,11 @@ Examples:
     p.add_argument("--short", required=True, help="Short exchange")
     p.add_argument("--duration", type=float, default=120.0, help="Analysis duration in seconds (default: 120)")
     p.add_argument("--mode", choices=["open", "close"], default="open", help="Analysis mode")
+
+    sub.add_parser("session", help="Show the currently persisted active session")
+
+    p = sub.add_parser("journal", help="Show recent trade journal events")
+    p.add_argument("--limit", type=int, default=20, help="Number of recent events to show")
 
     return parser
 
@@ -206,7 +223,13 @@ async def cmd_positions(engine, args):
 
 
 async def cmd_info(engine, args):
-    info = await engine.get_pair_info(args.pair, args.long, args.short)
+    info = await engine.get_pair_info(
+        args.pair,
+        args.long,
+        args.short,
+        requested_size_tokens=args.size,
+        leverage=args.leverage,
+    )
     logger.info(f"\n📊 Pair Info: {args.pair}\n{'='*50}")
     for label, side in [("LONG", "long"), ("SHORT", "short")]:
         d = info.get(side, {})
@@ -236,6 +259,21 @@ async def cmd_info(engine, args):
             f"\n  Recommended Direction: LONG {recommended_trade['long_exchange']} / "
             f"SHORT {recommended_trade['short_exchange']}"
         )
+    trade_plan = info.get("trade_plan")
+    if trade_plan:
+        logger.info("\n  Trade Plan:")
+        logger.info(f"    Recommendation:         {trade_plan['recommendation']}")
+        logger.info(f"    Quality Score:          {trade_plan['quality_score']:.1f}/100")
+        logger.info(f"    Requested Size:         {trade_plan['requested_size_tokens']:.6f}")
+        logger.info(f"    Suggested Size:         {trade_plan['recommended_size_tokens']:.6f}")
+        logger.info(f"    Expected Next-Cycle:    ${trade_plan['expected_net_pnl_next_cycle_usd']:+.2f}")
+        logger.info(f"    Net Edge (4H):          {trade_plan['net_edge_pct']:.4f}%")
+        logger.info(f"    Depth Ratio:            {trade_plan['depth_ratio']:.2f}x")
+        logger.info(f"    Divergence:             {trade_plan['price_divergence_pct']:.4f}%")
+        for blocker in trade_plan.get("blockers", []):
+            logger.info(f"    Blocker:                {blocker}")
+        for warning in trade_plan.get("warnings", [])[:3]:
+            logger.info(f"    Warning:                {warning}")
 
 
 async def cmd_open(engine, args):
@@ -266,6 +304,9 @@ async def cmd_monitor(engine, args):
         auto_close_reversal=args.auto_close_reversal,
         funding_spread_min=args.funding_spread_min / 100,  # Convert % to decimal
         interval=args.interval,
+        size=args.size,
+        leverage=args.leverage,
+        auto_close_on_advice=args.auto_close_on_advice,
     )
 
 
@@ -308,6 +349,34 @@ async def cmd_analyze(engine, args):
     _json(result)
 
 
+async def cmd_session(engine, args):
+    session = engine.get_active_session()
+    if not session:
+        logger.info("No active session persisted.")
+        return
+    _json(session)
+
+
+async def cmd_journal(engine, args):
+    events = engine.get_recent_journal(limit=args.limit)
+    if not events:
+        logger.info("Trade journal is empty.")
+        return
+
+    table = []
+    for event in events:
+        payload = event.get("payload", {})
+        pair = payload.get("pair", "-")
+        action = payload.get("advice", {}).get("action") or payload.get("result", {}).get("success")
+        table.append([
+            event.get("timestamp", "-"),
+            event.get("event_type", "-"),
+            pair,
+            action if action is not None else "-",
+        ])
+    print(tabulate(table, headers=["Timestamp", "Event", "Pair", "Detail"], tablefmt="grid"))
+
+
 # ── Main ───────────────────────────────────────────────────────────
 COMMAND_MAP = {
     "scan": cmd_scan,
@@ -319,6 +388,8 @@ COMMAND_MAP = {
     "monitor": cmd_monitor,
     "pnl": cmd_pnl,
     "analyze": cmd_analyze,
+    "session": cmd_session,
+    "journal": cmd_journal,
 }
 
 
@@ -330,9 +401,15 @@ async def main():
         parser.print_help()
         return
 
-    # Initialize (suppress noisy print() from exchange clients during connect)
     config = ConfigManager("user_config.json").get_settings()
     engine = TradingEngine(config)
+    if args.command in {"session", "journal"}:
+        handler = COMMAND_MAP.get(args.command)
+        if handler:
+            await handler(engine, args)
+        return
+
+    # Initialize (suppress noisy print() from exchange clients during connect)
     _real_stdout = sys.stdout
     sys.stdout = open(os.devnull, 'w')
     try:

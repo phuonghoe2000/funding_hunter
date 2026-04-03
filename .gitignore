@@ -27,3 +27,4 @@ user_config_lite.json
 
 # Logs
 *.log
+runtime/

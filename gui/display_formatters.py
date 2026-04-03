@@ -157,6 +157,27 @@ def build_pair_snapshot_display(
             f"Short {recommended_trade['short_exchange']}"
         )
 
+    trade_plan = snapshot.get("trade_plan")
+    if trade_plan:
+        info_lines.extend(
+            [
+                "-------------------------",
+                f"Plan: {trade_plan['recommendation']} | Score: {trade_plan['quality_score']:.1f}/100",
+                f"Expected Net PnL (next cycle): ${trade_plan['expected_net_pnl_next_cycle_usd']:+.2f}",
+                f"Suggested Size: {trade_plan['recommended_size_tokens']:.6f} "
+                f"(~${trade_plan['recommended_notional_usd']:.2f})",
+                f"Depth Ratio: {trade_plan['depth_ratio']:.2f}x | Divergence: {trade_plan['price_divergence_pct']:.3f}%",
+            ]
+        )
+        if trade_plan.get("warnings"):
+            info_lines.append("Warnings:")
+            for warning in trade_plan["warnings"][:3]:
+                info_lines.append(f"  - {warning}")
+        if trade_plan.get("blockers"):
+            info_lines.append("Blockers:")
+            for blocker in trade_plan["blockers"][:2]:
+                info_lines.append(f"  - {blocker}")
+
     return "\n".join(info_lines), entry_color
 
 

@@ -11,6 +11,8 @@ from core.opportunity import (
     build_best_opportunity,
     build_directional_opportunity,
 )
+from core.session_store import SessionStore
+from core.trade_advisor import build_monitor_advice, build_trade_plan
 from config.constants import Exchange, get_exchange_symbol, Side
 from config.settings import Settings
 from exchanges.okx_client import OKXClient
@@ -38,6 +40,7 @@ class TradingEngine:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.exchange_manager = MultiExchangeManager()
+        self.session_store = SessionStore()
 
     # ------------------------------------------------------------------
     # Connection
@@ -67,6 +70,66 @@ class TradingEngine:
 
     async def shutdown(self):
         await self.exchange_manager.disconnect_all()
+
+    def get_active_session(self) -> Optional[Dict[str, Any]]:
+        return self.session_store.load_active_session()
+
+    def get_recent_journal(self, limit: int = 50) -> List[Dict[str, Any]]:
+        return self.session_store.read_recent_journal(limit)
+
+    def _session_matches(
+        self,
+        session: Optional[Dict[str, Any]],
+        pair: str,
+        long_ex: Exchange,
+        short_ex: Exchange,
+    ) -> bool:
+        if not session:
+            return False
+        return (
+            session.get("pair") == pair
+            and session.get("long_exchange") in (long_ex, long_ex.value)
+            and session.get("short_exchange") in (short_ex, short_ex.value)
+        )
+
+    async def _fetch_exchange_market_context(self, pair: str, exchange: Exchange) -> Dict[str, Any]:
+        client = self.exchange_manager.clients.get(exchange)
+        if not client:
+            raise RuntimeError(f"{exchange.value} not connected")
+
+        symbol = get_exchange_symbol(pair, exchange)
+        context: Dict[str, Any] = {
+            "exchange": exchange,
+            "symbol": symbol,
+            "client": client,
+        }
+
+        try:
+            context["order_book"] = await client.get_order_book(symbol, limit=5)
+        except Exception as e:
+            context["order_book_error"] = str(e)
+
+        try:
+            context["funding"] = await client.get_funding_rate(symbol)
+        except Exception as e:
+            context["funding_error"] = str(e)
+
+        try:
+            context["mark_price"] = await client.get_mark_price(symbol)
+        except Exception as e:
+            context["mark_price_error"] = str(e)
+
+        try:
+            context["ticker"] = await client.get_ticker(symbol)
+        except Exception as e:
+            context["ticker_error"] = str(e)
+
+        try:
+            context["balance"] = await client.get_balance()
+        except Exception as e:
+            context["balance_error"] = str(e)
+
+        return context
 
     # ------------------------------------------------------------------
     # 1. Scan funding rates
@@ -148,6 +211,9 @@ class TradingEngine:
             "total_available": total_available,
             "total_active_positions": total_active_positions,
         }
+        active_session = self.get_active_session()
+        if active_session:
+            status["active_session"] = active_session
         return status
 
     # ------------------------------------------------------------------
@@ -161,34 +227,53 @@ class TradingEngine:
                             skip_spread_check: bool = False) -> Dict:
         long_ex = _resolve_exchange(long_ex_name)
         short_ex = _resolve_exchange(short_ex_name)
+        pair_info = {}
         economics = None
+        trade_plan = None
+        session_id = self.session_store.new_session_id()
+
+        self.session_store.append_journal_event(
+            "open_requested_cli",
+            {
+                "session_id": session_id,
+                "pair": pair,
+                "long_exchange": long_ex,
+                "short_exchange": short_ex,
+                "size": size,
+                "leverage": leverage,
+                "splits": splits,
+                "skip_spread_check": skip_spread_check,
+            },
+        )
 
         try:
-            long_client = self.exchange_manager.clients.get(long_ex)
-            short_client = self.exchange_manager.clients.get(short_ex)
-            if long_client and short_client:
-                long_symbol = get_exchange_symbol(pair, long_ex)
-                short_symbol = get_exchange_symbol(pair, short_ex)
-                long_rate_obj, short_rate_obj = await asyncio.gather(
-                    long_client.get_funding_rate(long_symbol),
-                    short_client.get_funding_rate(short_symbol),
-                )
-                economics = build_directional_opportunity(
-                    pair=pair,
-                    long_exchange=long_ex,
-                    short_exchange=short_ex,
-                    long_rate_obj=long_rate_obj,
-                    short_rate_obj=short_rate_obj,
-                )
+            pair_info = await self.get_pair_info(
+                pair,
+                long_ex_name,
+                short_ex_name,
+                requested_size_tokens=size,
+                leverage=leverage,
+            )
+            selected_trade = pair_info.get("selected_trade")
+            trade_plan = pair_info.get("trade_plan")
+            if selected_trade:
+                economics = selected_trade
                 logger.info(
-                    f"Funding edge ({DEFAULT_TARGET_HOURS:.0f}H): gross {economics.gross_spread_pct:.4f}% | "
-                    f"cost {economics.round_trip_cost_pct:.4f}% | net {economics.net_edge_pct:.4f}%"
+                    f"Funding edge ({DEFAULT_TARGET_HOURS:.0f}H): gross {selected_trade['gross_spread_pct']:.4f}% | "
+                    f"cost {selected_trade['round_trip_cost_pct']:.4f}% | net {selected_trade['net_edge_pct']:.4f}%"
                 )
-                if not economics.profitable_after_costs:
-                    logger.warning(
-                        "Selected direction is not profitable after estimated round-trip costs. "
-                        "Continuing because no hard block is enforced."
-                    )
+            if trade_plan:
+                logger.info(
+                    f"Execution plan: {trade_plan['recommendation']} | "
+                    f"score {trade_plan['quality_score']:.1f}/100 | "
+                    f"suggested size {trade_plan['recommended_size_tokens']:.6f}"
+                )
+                for blocker in trade_plan.get("blockers", []):
+                    logger.warning(f"Blocker: {blocker}")
+                for warning in trade_plan.get("warnings", [])[:3]:
+                    logger.warning(f"Warning: {warning}")
+                if trade_plan.get("recommendation") == "AVOID":
+                    logger.warning("Pre-trade plan says AVOID. Continuing because CLI command was explicit.")
         except Exception as e:
             logger.warning(f"Could not evaluate funding economics before opening: {e}")
 
@@ -225,12 +310,52 @@ class TradingEngine:
             skip_leverage_set=skip_leverage,
             skip_spread_check=skip_spread_check
         )
+
         if economics:
-            open_result["economics"] = economics.to_dict()
-            if not economics.profitable_after_costs:
+            open_result["economics"] = economics
+            if economics["net_edge_pct"] <= 0:
                 open_result.setdefault("warnings", []).append(
                     "Funding edge is below estimated round-trip cost."
                 )
+        if trade_plan:
+            open_result["trade_plan"] = trade_plan
+
+        if open_result.get("success") and open_result.get("splits_completed", 0) > 0:
+            initial_long_rate = pair_info.get("long", {}).get("funding_rate") or 0.0
+            initial_short_rate = pair_info.get("short", {}).get("funding_rate") or 0.0
+            opened_size = open_result.get("total_long_size") or open_result.get("total_short_size") or size
+            session_payload = {
+                "session_id": session_id,
+                "pair": pair,
+                "long_exchange": long_ex,
+                "short_exchange": short_ex,
+                "size": opened_size,
+                "long_size": open_result.get("total_long_size", opened_size),
+                "short_size": open_result.get("total_short_size", opened_size),
+                "leverage": leverage,
+                "open_time": datetime.now(timezone.utc),
+                "initial_long_rate": initial_long_rate,
+                "initial_short_rate": initial_short_rate,
+                "initial_net_funding": initial_short_rate - initial_long_rate,
+                "pretrade_assessment": trade_plan,
+                "initial_net_edge_pct": (trade_plan or {}).get("net_edge_pct", 0.0),
+                "initial_quality_score": (trade_plan or {}).get("quality_score", 0.0),
+                "entry_result": open_result,
+            }
+            self.session_store.save_active_session(session_payload)
+            self.session_store.append_journal_event("position_opened_cli", session_payload)
+            open_result["session"] = session_payload
+        elif open_result.get("error"):
+            self.session_store.append_journal_event(
+                "open_failed_cli",
+                {
+                    "session_id": session_id,
+                    "pair": pair,
+                    "long_exchange": long_ex,
+                    "short_exchange": short_ex,
+                    "result": open_result,
+                },
+            )
         return open_result
 
     # ------------------------------------------------------------------
@@ -242,6 +367,19 @@ class TradingEngine:
                              skip_spread_check: bool = False) -> Dict:
         long_ex = _resolve_exchange(long_ex_name)
         short_ex = _resolve_exchange(short_ex_name)
+        active_session = self.get_active_session()
+
+        self.session_store.append_journal_event(
+            "close_requested_cli",
+            {
+                "session_id": active_session.get("session_id") if self._session_matches(active_session, pair, long_ex, short_ex) else None,
+                "pair": pair,
+                "long_exchange": long_ex,
+                "short_exchange": short_ex,
+                "splits": splits,
+                "skip_spread_check": skip_spread_check,
+            },
+        )
 
         # Step 1: Analyze close spread (unless skipping check)
         if price_spread_min is None and not skip_spread_check:
@@ -269,6 +407,26 @@ class TradingEngine:
             progress_callback=lambda s, t, m: logger.info(f"   {m}"),
             skip_spread_check=skip_spread_check
         )
+        if close_result.get("success"):
+            if self._session_matches(active_session, pair, long_ex, short_ex):
+                self.session_store.append_journal_event(
+                    "position_closed_cli",
+                    {
+                        "session_id": active_session.get("session_id"),
+                        "pair": pair,
+                        "result": close_result,
+                    },
+                )
+                self.session_store.clear_active_session()
+        else:
+            self.session_store.append_journal_event(
+                "close_failed_cli",
+                {
+                    "session_id": active_session.get("session_id") if self._session_matches(active_session, pair, long_ex, short_ex) else None,
+                    "pair": pair,
+                    "result": close_result,
+                },
+            )
         return close_result
 
     # ------------------------------------------------------------------
@@ -318,28 +476,56 @@ class TradingEngine:
                                auto_close_risk: Optional[float] = None,
                                auto_close_reversal: bool = False,
                                funding_spread_min: float = 0.0001,
-                               interval: float = 5.0) -> None:
+                               interval: float = 5.0,
+                               size: Optional[float] = None,
+                               leverage: Optional[int] = None,
+                               auto_close_on_advice: bool = False) -> None:
         long_ex = _resolve_exchange(long_ex_name)
         short_ex = _resolve_exchange(short_ex_name)
+        active_session = self.get_active_session()
+        session_matches = self._session_matches(active_session, pair, long_ex, short_ex)
+        tracked_position: Dict[str, Any] = {
+            "pair": pair,
+            "long_exchange": long_ex,
+            "short_exchange": short_ex,
+        }
 
-        # Get total balance for risk calculation
+        if session_matches and active_session:
+            tracked_position.update(active_session)
+        if leverage is not None:
+            tracked_position["leverage"] = leverage
+        leverage = int(tracked_position.get("leverage", leverage or 1) or 1)
+        if size is not None:
+            tracked_position["size"] = size
+        tracked_size = float(tracked_position.get("size", size or 0.0) or 0.0)
+        last_advice_signature = None
+
         total_balance = 0.0
         for _, client in self.exchange_manager.clients.items():
             try:
-                b = await client.get_balance()
-                if b:
-                    total_balance += b.available
-            except:
+                balance = await client.get_balance()
+                if balance:
+                    total_balance += balance.available
+            except Exception:
                 pass
         if total_balance <= 0:
             total_balance = 1000.0
-        logger.info(f"📊 Total balance for risk calc: ${total_balance:.2f}")
+        logger.info(f"?? Total balance for risk calc: ${total_balance:.2f}")
+        if session_matches and active_session:
+            logger.info(
+                f"?? Recovered session {active_session.get('session_id')} | "
+                f"initial edge {active_session.get('initial_net_edge_pct', 0.0):.4f}% | "
+                f"quality {active_session.get('initial_quality_score', 0.0):.1f}/100"
+            )
 
-        # Get initial funding rates for reversal detection
-        initial_net_funding = 0.0
+        initial_net_funding = tracked_position.get("initial_net_funding", 0.0) or 0.0
         initial_rates = {}
         initial_rate_objects: Dict[Exchange, FundingRate] = {}
         if auto_close_reversal:
+            if tracked_position.get("initial_long_rate") is not None:
+                initial_rates[long_ex] = tracked_position.get("initial_long_rate", 0.0)
+            if tracked_position.get("initial_short_rate") is not None:
+                initial_rates[short_ex] = tracked_position.get("initial_short_rate", 0.0)
             for ex in [long_ex, short_ex]:
                 client = self.exchange_manager.clients.get(ex)
                 if client:
@@ -348,26 +534,31 @@ class TradingEngine:
                         fr = await client.get_funding_rate(sym)
                         initial_rate_objects[ex] = fr
                         initial_rates[ex] = fr.funding_rate
-                    except:
+                    except Exception:
                         pass
             if long_ex in initial_rates and short_ex in initial_rates:
                 initial_net_funding = initial_rates[short_ex] - initial_rates[long_ex]
-                logger.info(f"📊 Initial net funding: {initial_net_funding*100:.6f}%")
-                economics = build_directional_opportunity(
-                    pair=pair,
-                    long_exchange=long_ex,
-                    short_exchange=short_ex,
-                    long_rate_obj=initial_rate_objects[long_ex],
-                    short_rate_obj=initial_rate_objects[short_ex],
-                )
-                logger.info(
-                    f"   Gross edge ({DEFAULT_TARGET_HOURS:.0f}H): {economics.gross_spread_pct:.4f}% | "
-                    f"Cost: {economics.round_trip_cost_pct:.4f}% | Net: {economics.net_edge_pct:.4f}%"
-                )
+                tracked_position["initial_long_rate"] = initial_rates[long_ex]
+                tracked_position["initial_short_rate"] = initial_rates[short_ex]
+                tracked_position["initial_net_funding"] = initial_net_funding
+                logger.info(f"?? Initial net funding: {initial_net_funding*100:.6f}%")
+                if long_ex in initial_rate_objects and short_ex in initial_rate_objects:
+                    economics = build_directional_opportunity(
+                        pair=pair,
+                        long_exchange=long_ex,
+                        short_exchange=short_ex,
+                        long_rate_obj=initial_rate_objects[long_ex],
+                        short_rate_obj=initial_rate_objects[short_ex],
+                    )
+                    logger.info(
+                        f"   Gross edge ({DEFAULT_TARGET_HOURS:.0f}H): {economics.gross_spread_pct:.4f}% | "
+                        f"Cost: {economics.round_trip_cost_pct:.4f}% | Net: {economics.net_edge_pct:.4f}%"
+                    )
 
-        logger.info(f"👁 Monitoring {pair} | LONG: {long_ex_name} | SHORT: {short_ex_name}")
+        logger.info(f"?? Monitoring {pair} | LONG: {long_ex_name} | SHORT: {short_ex_name}")
         logger.info(f"   Auto-close risk: {auto_close_risk}% | Reversal: {auto_close_reversal}")
-        logger.info(f"   Press Ctrl+C to stop.")
+        logger.info(f"   Auto-close on monitor advice: {auto_close_on_advice}")
+        logger.info("   Press Ctrl+C to stop.")
 
         try:
             while True:
@@ -379,13 +570,14 @@ class TradingEngine:
                 short_pnl = short_pos.unrealized_pnl if short_pos else 0
                 net_pnl = long_pnl + short_pnl
 
-                # Risk = |losing side| / balance * 100
                 losing = 0.0
-                if long_pnl < 0: losing += abs(long_pnl)
-                if short_pnl < 0: losing += abs(short_pnl)
+                if long_pnl < 0:
+                    losing += abs(long_pnl)
+                if short_pnl < 0:
+                    losing += abs(short_pnl)
                 risk_pct = (losing / total_balance) * 100
 
-                color_tag = "🟢" if risk_pct < 2 else ("🟡" if risk_pct < 5 else "🔴")
+                color_tag = "??" if risk_pct < 2 else ("??" if risk_pct < 5 else "??")
                 logger.info(
                     f"{color_tag} Risk: {risk_pct:.2f}% | "
                     f"Long({long_ex_name}): ${long_pnl:+.2f} | "
@@ -393,33 +585,108 @@ class TradingEngine:
                     f"Net: ${net_pnl:+.2f}"
                 )
 
-                # One side missing = potential liquidation
+                if tracked_size <= 0 and long_pos and short_pos:
+                    tracked_size = min(abs(long_pos.size), abs(short_pos.size))
+                    tracked_position["size"] = tracked_size
+
+                trade_plan = None
+                if tracked_size > 0:
+                    try:
+                        pair_info = await self.get_pair_info(
+                            pair,
+                            long_ex_name,
+                            short_ex_name,
+                            requested_size_tokens=tracked_size,
+                            leverage=leverage,
+                        )
+                        trade_plan = pair_info.get("trade_plan")
+                        if trade_plan and not tracked_position.get("initial_net_edge_pct"):
+                            tracked_position["initial_net_edge_pct"] = trade_plan.get("net_edge_pct", 0.0)
+                            tracked_position["initial_quality_score"] = trade_plan.get("quality_score", 0.0)
+                    except Exception as e:
+                        logger.warning(f"Could not refresh trade plan while monitoring: {e}")
+
+                monitor_advice = build_monitor_advice(
+                    position=tracked_position,
+                    trade_plan=trade_plan,
+                    risk_percent=risk_pct,
+                    check_result=result,
+                ).to_dict()
+                advice_signature = f"{monitor_advice['action']}:{monitor_advice['reason']}"
+                if advice_signature != last_advice_signature:
+                    last_advice_signature = advice_signature
+                    logger.info(
+                        f"?? Advice: {monitor_advice['action']} | {monitor_advice['reason']} | "
+                        f"net edge {monitor_advice['current_net_edge_pct']:.4f}% | "
+                        f"next cycle ${monitor_advice['expected_next_cycle_pnl_usd']:+.2f}"
+                    )
+                    if session_matches and active_session:
+                        self.session_store.append_journal_event(
+                            "monitor_advice_cli",
+                            {
+                                "session_id": active_session.get("session_id"),
+                                "pair": pair,
+                                "advice": monitor_advice,
+                                "risk_percent": risk_pct,
+                            },
+                        )
+
+                if session_matches and active_session:
+                    active_session["size"] = tracked_size or active_session.get("size")
+                    active_session["latest_trade_plan"] = trade_plan
+                    active_session["latest_monitor_advice"] = monitor_advice
+                    active_session["long_pnl"] = long_pnl
+                    active_session["short_pnl"] = short_pnl
+                    self.session_store.save_active_session(active_session)
+
                 if result.get("one_side_missing"):
                     missing_ex = result["one_side_missing"]
-                    logger.warning(f"⚠️ ONE SIDE MISSING on {missing_ex.value}! Possible liquidation!")
+                    logger.warning(f"?? ONE SIDE MISSING on {missing_ex.value}! Possible liquidation!")
 
-                # Auto-close on risk
-                if auto_close_risk is not None and risk_pct >= auto_close_risk:
-                    logger.warning(f"🚨 Risk {risk_pct:.2f}% >= threshold {auto_close_risk}%! Auto-closing...")
-                    close_result = await self.close_position(pair, long_ex_name, short_ex_name, splits=1)
+                if auto_close_on_advice and monitor_advice["action"] in {"EMERGENCY_CLOSE", "CLOSE_NOW"}:
+                    logger.warning(f"?? Auto-closing due to monitor advice: {monitor_advice['reason']}")
+                    close_result = await self.close_position(
+                        pair,
+                        long_ex_name,
+                        short_ex_name,
+                        splits=1,
+                        skip_spread_check=True,
+                    )
                     logger.info(f"Close result: {close_result}")
                     break
 
-                # Auto-close on funding reversal
+                if auto_close_risk is not None and risk_pct >= auto_close_risk:
+                    logger.warning(f"?? Risk {risk_pct:.2f}% >= threshold {auto_close_risk}%! Auto-closing...")
+                    close_result = await self.close_position(
+                        pair,
+                        long_ex_name,
+                        short_ex_name,
+                        splits=1,
+                        skip_spread_check=True,
+                    )
+                    logger.info(f"Close result: {close_result}")
+                    break
+
                 if auto_close_reversal and initial_net_funding != 0:
                     should_close, reason = await self._check_funding_reversal(
                         pair, long_ex, short_ex, initial_net_funding, initial_rates, funding_spread_min
                     )
                     if should_close:
-                        logger.warning(f"🔄 Funding reversal: {reason}")
+                        logger.warning(f"?? Funding reversal: {reason}")
                         logger.info("Auto-closing due to funding reversal...")
-                        close_result = await self.close_position(pair, long_ex_name, short_ex_name, splits=1)
+                        close_result = await self.close_position(
+                            pair,
+                            long_ex_name,
+                            short_ex_name,
+                            splits=1,
+                            skip_spread_check=True,
+                        )
                         logger.info(f"Close result: {close_result}")
                         break
 
                 await asyncio.sleep(interval)
         except KeyboardInterrupt:
-            logger.info("🛑 Monitoring stopped by user.")
+            logger.info("?? Monitoring stopped by user.")
 
     async def _check_funding_reversal(self, pair, long_ex, short_ex,
                                        initial_net, initial_rates, min_threshold) -> tuple:
@@ -508,34 +775,54 @@ class TradingEngine:
     # ------------------------------------------------------------------
     # 9. Pair info (prices, funding, order book)
     # ------------------------------------------------------------------
-    async def get_pair_info(self, pair: str, long_ex_name: str, short_ex_name: str) -> Dict:
+    async def get_pair_info(
+        self,
+        pair: str,
+        long_ex_name: str,
+        short_ex_name: str,
+        requested_size_tokens: float = 0.0,
+        leverage: int = 1,
+    ) -> Dict:
         long_ex = _resolve_exchange(long_ex_name)
         short_ex = _resolve_exchange(short_ex_name)
         info = {}
         funding_objs: Dict[Exchange, FundingRate] = {}
-        for label, ex in [("long", long_ex), ("short", short_ex)]:
-            client = self.exchange_manager.clients.get(ex)
-            if not client:
-                info[label] = {"error": f"{ex.value} not connected"}
+        balances: Dict[Exchange, Any] = {}
+        market_contexts: Dict[Exchange, Dict[str, Any]] = {}
+
+        results = await asyncio.gather(
+            self._fetch_exchange_market_context(pair, long_ex),
+            self._fetch_exchange_market_context(pair, short_ex),
+            return_exceptions=True,
+        )
+
+        for (label, ex), result in zip([("long", long_ex), ("short", short_ex)], results):
+            if isinstance(result, Exception):
+                info[label] = {"exchange": ex.value, "error": str(result)}
                 continue
-            try:
-                symbol = get_exchange_symbol(pair, ex)
-                book = await client.get_order_book(symbol, limit=5)
-                funding = await client.get_funding_rate(symbol)
-                mark = await client.get_mark_price(symbol)
+
+            market_contexts[ex] = result
+            funding = result.get("funding")
+            balance = result.get("balance")
+            order_book = result.get("order_book") or {}
+            ticker = result.get("ticker") or {}
+            if funding:
                 funding_objs[ex] = funding
-                info[label] = {
-                    "exchange": ex.value,
-                    "symbol": symbol,
-                    "mark_price": mark,
-                    "best_bid": book["bids"][0][0] if book.get("bids") else None,
-                    "best_ask": book["asks"][0][0] if book.get("asks") else None,
-                    "funding_rate": funding.funding_rate,
-                    "funding_interval_hours": funding.funding_interval_hours,
-                    "next_funding_time": funding.next_funding_time,
-                }
-            except Exception as e:
-                info[label] = {"exchange": ex.value, "error": str(e)}
+            if balance:
+                balances[ex] = balance
+
+            info[label] = {
+                "exchange": ex.value,
+                "symbol": result["symbol"],
+                "mark_price": result.get("mark_price"),
+                "best_bid": order_book["bids"][0][0] if order_book.get("bids") else None,
+                "best_ask": order_book["asks"][0][0] if order_book.get("asks") else None,
+                "funding_rate": funding.funding_rate if funding else None,
+                "funding_interval_hours": funding.funding_interval_hours if funding else None,
+                "next_funding_time": funding.next_funding_time if funding else None,
+                "ticker_volume": ticker.get("volume"),
+                "available_balance": getattr(balance, "available", None) if balance else None,
+            }
 
         # Spread calculation
         try:
@@ -567,4 +854,26 @@ class TradingEngine:
             info["selected_trade"] = selected_trade.to_dict()
             if recommended_trade:
                 info["recommended_trade"] = recommended_trade.to_dict()
+
+            if requested_size_tokens > 0:
+                long_context = market_contexts.get(long_ex, {})
+                short_context = market_contexts.get(short_ex, {})
+                trade_plan = build_trade_plan(
+                    pair=pair,
+                    long_exchange=long_ex,
+                    short_exchange=short_ex,
+                    long_rate_obj=funding_objs[long_ex],
+                    short_rate_obj=funding_objs[short_ex],
+                    long_order_book=long_context.get("order_book"),
+                    short_order_book=short_context.get("order_book"),
+                    long_ticker=long_context.get("ticker"),
+                    short_ticker=short_context.get("ticker"),
+                    long_balance=balances.get(long_ex),
+                    short_balance=balances.get(short_ex),
+                    requested_size_tokens=requested_size_tokens,
+                    leverage=leverage,
+                    long_price=info["long"].get("best_ask") or info["long"].get("mark_price"),
+                    short_price=info["short"].get("best_bid") or info["short"].get("mark_price"),
+                )
+                info["trade_plan"] = trade_plan.to_dict()
         return info

@@ -279,6 +279,9 @@ def load_hedged_position(app: Any, hedged_pair: dict[str, Any], open_time: Optio
         "long_exchange": long_exchange,
         "short_exchange": short_exchange,
         "size": size,
+        "long_size": long_pos["size"],
+        "short_size": short_pos["size"],
+        "leverage": min(long_pos.get("leverage", 1), short_pos.get("leverage", 1)),
         "open_time": open_time,
         "total_funding_fees": 0.0,
         "last_funding_check": datetime.now(timezone.utc),
@@ -286,9 +289,39 @@ def load_hedged_position(app: Any, hedged_pair: dict[str, Any], open_time: Optio
         "initial_short_rate": 0,
         "initial_net_funding": 0,
         "loaded_position": True,
+        "session_id": app.service.new_session_id(),
     }
 
     app._update_position_display()
+    app.service.persist_active_position(app.active_position)
+    app.service.record_trade_event("position_loaded", app.active_position)
+
+    async def enrich_loaded_position() -> dict[str, Any]:
+        return await app.service.get_initial_position_state(
+            pair,
+            long_exchange,
+            short_exchange,
+            size,
+            leverage=app.active_position["leverage"],
+            open_time=open_time,
+            session_id=app.active_position["session_id"],
+        )
+
+    def on_enriched(future: Any) -> None:
+        def update_ui() -> None:
+            try:
+                baseline = future.result(timeout=0.2)
+                app.active_position.update(baseline)
+                app.service.persist_active_position(app.active_position)
+                app._update_position_display()
+            except Exception:
+                pass
+
+        app.root.after(0, update_ui)
+
+    future = app._run_async(enrich_loaded_position())
+    if future:
+        future.add_done_callback(on_enriched)
 
     app.long_exchange.set(to_display_name(long_exchange))
     app.short_exchange.set(to_display_name(short_exchange))

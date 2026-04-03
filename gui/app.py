@@ -28,7 +28,7 @@ try:
         reset_close_button as controller_reset_close_button,
     )
     from gui.display_formatters import build_funding_table_rows
-    from gui.exchange_display import parse_recommendation_display_names
+    from gui.exchange_display import parse_recommendation_display_names, to_display_name
     from gui.layout import create_widgets as build_widgets
     from gui.monitor_controller import (
         check_funding_reversal as controller_check_funding_reversal,
@@ -73,7 +73,7 @@ except ImportError:
         reset_close_button as controller_reset_close_button,
     )
     from display_formatters import build_funding_table_rows
-    from exchange_display import parse_recommendation_display_names
+    from exchange_display import parse_recommendation_display_names, to_display_name
     from layout import create_widgets as build_widgets
     from monitor_controller import (
         check_funding_reversal as controller_check_funding_reversal,
@@ -204,6 +204,8 @@ class FundingHunterGUI:
         self.monitoring = False
         self.active_position = None  # Store active position info
         self.balance_before_open = {}  # Balance of 2 exchanges before opening position
+        self.latest_balances: Dict[Exchange, Any] = {}
+        self.last_monitor_advice: Optional[str] = None
         self._monitor_task = None
         self.cached_funding_rates = {}  # Cache funding rates for quick access
         
@@ -566,6 +568,7 @@ class FundingHunterGUI:
     
     def _update_ui_connected(self, connected, balances):
         """Update UI after connection"""
+        self.latest_balances = dict(balances)
         self.status_label.config(text=f"🟢 Connected: {', '.join(connected)}")
         self.connect_btn.config(state=tk.DISABLED)
         self.disconnect_btn.config(state=tk.NORMAL)
@@ -608,9 +611,13 @@ class FundingHunterGUI:
             self.long_exchange.set(available[0])
             if len(available) > 1:
                 self.short_exchange.set(available[1])
-    
+
+        if not self.active_position:
+            self._attempt_recover_session()
+
     def _update_ui_disconnected(self):
         """Update UI after disconnect"""
+        self.latest_balances = {}
         self.status_label.config(text="⚪ Disconnected")
         self.connect_btn.config(state=tk.NORMAL)
         self.disconnect_btn.config(state=tk.DISABLED)
@@ -721,6 +728,40 @@ class FundingHunterGUI:
         """Open hedged position - analyze spread first, then wait for threshold"""
         return controller_open_position(self)
 
+    def _attempt_recover_session(self):
+        """Attempt to restore an active session after reconnecting."""
+        future = self._run_async(self.service.recover_active_session())
+        if future:
+            future.add_done_callback(self._on_recover_session_complete)
+
+    def _on_recover_session_complete(self, future):
+        """Handle a recovered active session."""
+        def update_ui():
+            try:
+                recovered = future.result(timeout=0.5)
+                if not recovered:
+                    return
+
+                self.active_position = recovered
+                self.pair_combo.set(recovered["pair"])
+                self.long_exchange.set(to_display_name(recovered["long_exchange"]))
+                self.short_exchange.set(to_display_name(recovered["short_exchange"]))
+                self._update_position_display()
+                self._log(
+                    f"Recovered active session: {recovered['pair']} | "
+                    f"LONG {recovered['long_exchange'].value} | SHORT {recovered['short_exchange'].value}"
+                )
+                self.service.persist_active_position(self.active_position)
+                self.service.record_trade_event("session_recovered", self.active_position)
+                self._update_pair_info()
+                if not self.monitoring:
+                    self._start_monitoring()
+                    self.monitor_btn.config(text="Stop Monitor")
+            except Exception as e:
+                self._log(f"Session recovery error: {e}")
+
+        self.root.after(0, update_ui)
+
     def _start_analyze_for_open(self):
         """Run analyze spread and then start waiting for open"""
         return controller_start_analyze_for_open(self)
@@ -760,15 +801,25 @@ class FundingHunterGUI:
         """Called after ALL splits complete"""
         return controller_on_all_splits_complete(self, params, total_size)
 
-    def _setup_position_tracking(self, pair, long_ex, short_ex, size):
+    def _setup_position_tracking(self, pair, long_ex, short_ex, size, *, leverage=1, pretrade_assessment=None, open_time=None):
         """Setup position tracking after successful open"""
         async def get_initial_state():
-            return await self.service.get_initial_position_state(pair, long_ex, short_ex, size)
+            return await self.service.get_initial_position_state(
+                pair,
+                long_ex,
+                short_ex,
+                size,
+                leverage=leverage,
+                pretrade_assessment=pretrade_assessment,
+                open_time=open_time,
+            )
 
         def on_state_ready(fut):
             def update_ui():
                 try:
                     self.active_position = fut.result(timeout=0.1)
+                    self.service.persist_active_position(self.active_position)
+                    self.service.record_trade_event("position_opened", self.active_position)
                     self._log(
                         f"Initial Funding - LONG: {self.active_position['initial_long_rate']*100:.6f}%, "
                         f"SHORT: {self.active_position['initial_short_rate']*100:.6f}%, "
@@ -848,7 +899,15 @@ class FundingHunterGUI:
             self.pos_long_label.config(text=f"Long: {pos['long_exchange'].value}")
             self.pos_short_label.config(text=f"Short: {pos['short_exchange'].value}")
             self.pos_size_label.config(text=f"Size: {pos['size']}")
-            self.pos_status_label.config(text="Status: OPEN", foreground='green')
+            status_text = "Status: OPEN"
+            if pos.get("latest_monitor_advice", {}).get("action"):
+                status_text = f"Status: {pos['latest_monitor_advice']['action']}"
+            elif pos.get("pretrade_assessment", {}).get("recommendation"):
+                status_text = (
+                    f"Status: OPEN | {pos['pretrade_assessment']['recommendation']} "
+                    f"({pos['pretrade_assessment'].get('quality_score', 0):.0f})"
+                )
+            self.pos_status_label.config(text=status_text, foreground='green')
             # Enable monitor button when position exists
             self.monitor_btn.config(state=tk.NORMAL)
     
@@ -863,6 +922,7 @@ class FundingHunterGUI:
         # Disable monitor button and reset text
         self.monitor_btn.config(text="👁 Start Monitor", state=tk.DISABLED)
         
+        self.last_monitor_advice = None
         # Restart pair info update loop when position is closed
         if not self._pair_info_update_task:
             self._update_pair_info()
