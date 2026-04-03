@@ -401,6 +401,9 @@ def create_funding_frame(app: Any, parent: tk.Widget) -> None:
         "Asterdex": Exchange.ASTERDEX,
         "Bybit": Exchange.BYBIT,
     }
+    table_frame = ttk.Frame(frame)
+    table_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
     columns = (
         "Pair",
         "OKX",
@@ -414,7 +417,7 @@ def create_funding_frame(app: Any, parent: tk.Widget) -> None:
         "Net Edge",
         "Recommendation",
     )
-    app.funding_tree = ttk.Treeview(frame, columns=columns, show="headings", height=10)
+    app.funding_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
 
     for name, text in (
         ("Pair", "Pair"),
@@ -445,9 +448,6 @@ def create_funding_frame(app: Any, parent: tk.Widget) -> None:
         ("Recommendation", 170),
     ):
         app.funding_tree.column(name, width=width, stretch=False)
-
-    table_frame = ttk.Frame(frame)
-    table_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
     y_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=app.funding_tree.yview)
     x_scrollbar = ttk.Scrollbar(table_frame, orient="horizontal", command=app.funding_tree.xview)
