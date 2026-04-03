@@ -15,37 +15,27 @@ except ImportError:
     from exchange_display import TRADING_EXCHANGE_OPTIONS
 
 
+FUNDING_EXCHANGE_COLUMNS = {
+    "OKX": Exchange.OKX,
+    "Binance": Exchange.BINANCE,
+    "BingX": Exchange.BINGX,
+    "Gate": Exchange.GATE,
+    "Asterdex": Exchange.ASTERDEX,
+    "Bybit": Exchange.BYBIT,
+}
+
+
 def create_widgets(app: Any) -> None:
     """Create the top-level GUI layout."""
     main_frame = ttk.Frame(app.root, padding="10")
     main_frame.pack(fill=tk.BOTH, expand=True)
+    app._exchange_columns = dict(FUNDING_EXCHANGE_COLUMNS)
 
     create_exchange_frame(app, main_frame)
 
-    middle_pane = ttk.Panedwindow(main_frame, orient=tk.HORIZONTAL)
-    middle_pane.pack(fill=tk.BOTH, expand=True, pady=10)
-
-    trading_container = ttk.Frame(middle_pane, width=540)
-    funding_container = ttk.Frame(middle_pane, width=820)
-    middle_pane.add(trading_container, weight=2)
-    middle_pane.add(funding_container, weight=3)
-
-    create_trading_frame(app, trading_container)
-    create_funding_frame(app, funding_container)
-
-    def _set_initial_split() -> None:
-        try:
-            total_width = middle_pane.winfo_width()
-            if total_width <= 1:
-                app.root.after(50, _set_initial_split)
-                return
-
-            target_width = max(500, min(620, int(total_width * 0.38)))
-            middle_pane.sashpos(0, target_width)
-        except tk.TclError:
-            return
-
-    app.root.after(50, _set_initial_split)
+    content_frame = ttk.Frame(main_frame)
+    content_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+    create_trading_frame(app, content_frame)
 
     bottom_frame = ttk.Frame(main_frame)
     bottom_frame.pack(fill=tk.BOTH, expand=True)
@@ -288,6 +278,8 @@ def create_trading_frame(app: Any, parent: tk.Widget) -> None:
     )
     app.selected_pair_info.pack(fill=tk.X)
 
+    create_market_summary_frame(app, frame)
+
     btn_frame = ttk.Frame(frame)
     btn_frame.pack(fill=tk.X, pady=15)
 
@@ -377,32 +369,73 @@ def create_trading_frame(app: Any, parent: tk.Widget) -> None:
     ttk.Label(threshold_frame, text="%").pack(side=tk.LEFT)
 
 
-def create_funding_frame(app: Any, parent: tk.Widget) -> None:
-    """Create the funding comparison panel."""
-    frame = ttk.LabelFrame(parent, text="💰 Funding Rates Comparison", padding="10")
-    frame.pack(fill=tk.BOTH, expand=True)
+def create_market_summary_frame(app: Any, parent: tk.Widget) -> None:
+    """Create a compact funding summary for the main window."""
+    frame = ttk.LabelFrame(parent, text="Market Summary", padding="10")
+    frame.pack(fill=tk.BOTH, expand=True, pady=10)
 
     btn_frame = ttk.Frame(frame)
-    btn_frame.pack(fill=tk.X, pady=5)
+    btn_frame.pack(fill=tk.X, pady=(0, 6))
+
+    app.open_funding_board_btn = ttk.Button(
+        btn_frame,
+        text="Open Funding Board",
+        command=app._open_funding_board,
+        state=tk.DISABLED,
+    )
+    app.open_funding_board_btn.pack(side=tk.LEFT)
 
     app.refresh_funding_btn = ttk.Button(
         btn_frame,
-        text="🔄 Refresh Rates",
+        text="Refresh Funding",
         command=app._refresh_funding,
         state=tk.DISABLED,
     )
-    app.refresh_funding_btn.pack(side=tk.LEFT, padx=5)
+    app.refresh_funding_btn.pack(side=tk.LEFT, padx=6)
 
-    app._exchange_columns = {
-        "OKX": Exchange.OKX,
-        "Binance": Exchange.BINANCE,
-        "BingX": Exchange.BINGX,
-        "Gate": Exchange.GATE,
-        "Asterdex": Exchange.ASTERDEX,
-        "Bybit": Exchange.BYBIT,
-    }
+    app.market_summary_status = ttk.Label(
+        btn_frame,
+        text="No funding data loaded",
+        foreground="gray",
+    )
+    app.market_summary_status.pack(side=tk.LEFT, padx=10)
+
+    columns = ("Pair", "Net Edge", "Recommendation")
+    app.market_summary_tree = ttk.Treeview(frame, columns=columns, show="headings", height=5)
+    app.market_summary_tree.heading("Pair", text="Pair")
+    app.market_summary_tree.heading("Net Edge", text="Net Edge")
+    app.market_summary_tree.heading("Recommendation", text="Recommendation")
+    app.market_summary_tree.column("Pair", width=110, stretch=False)
+    app.market_summary_tree.column("Net Edge", width=90, stretch=False)
+    app.market_summary_tree.column("Recommendation", width=260, stretch=True)
+    app.market_summary_tree.pack(fill=tk.BOTH, expand=True)
+    app.market_summary_tree.bind("<Double-1>", app._on_funding_select)
+
+
+def create_funding_board_frame(app: Any, parent: tk.Widget) -> None:
+    """Create the detachable funding board contents."""
+    frame = ttk.Frame(parent, padding="10")
+    frame.pack(fill=tk.BOTH, expand=True)
+
+    btn_frame = ttk.Frame(frame)
+    btn_frame.pack(fill=tk.X, pady=(0, 8))
+
+    app.funding_board_refresh_btn = ttk.Button(
+        btn_frame,
+        text="Refresh Rates",
+        command=app._refresh_funding,
+        state=tk.DISABLED,
+    )
+    app.funding_board_refresh_btn.pack(side=tk.LEFT)
+
+    ttk.Label(
+        btn_frame,
+        text="Double-click a row to push pair and exchanges back into the trading panel.",
+        foreground="gray",
+    ).pack(side=tk.LEFT, padx=10)
+
     table_frame = ttk.Frame(frame)
-    table_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+    table_frame.pack(fill=tk.BOTH, expand=True)
 
     columns = (
         "Pair",
@@ -417,7 +450,7 @@ def create_funding_frame(app: Any, parent: tk.Widget) -> None:
         "Net Edge",
         "Recommendation",
     )
-    app.funding_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
+    app.funding_board_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=18)
 
     for name, text in (
         ("Pair", "Pair"),
@@ -432,35 +465,38 @@ def create_funding_frame(app: Any, parent: tk.Widget) -> None:
         ("Net Edge", "Net Edge"),
         ("Recommendation", "Recommendation"),
     ):
-        app.funding_tree.heading(name, text=text)
+        app.funding_board_tree.heading(name, text=text)
 
     for name, width in (
-        ("Pair", 88),
-        ("OKX", 80),
-        ("Binance", 80),
-        ("BingX", 80),
-        ("Gate", 80),
-        ("Asterdex", 80),
-        ("Bybit", 80),
-        ("Gross 4H", 86),
-        ("Cost", 74),
-        ("Net Edge", 86),
-        ("Recommendation", 170),
+        ("Pair", 92),
+        ("OKX", 86),
+        ("Binance", 86),
+        ("BingX", 86),
+        ("Gate", 86),
+        ("Asterdex", 86),
+        ("Bybit", 86),
+        ("Gross 4H", 90),
+        ("Cost", 78),
+        ("Net Edge", 90),
+        ("Recommendation", 180),
     ):
-        app.funding_tree.column(name, width=width, stretch=False)
+        app.funding_board_tree.column(name, width=width, stretch=False)
 
-    y_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=app.funding_tree.yview)
-    x_scrollbar = ttk.Scrollbar(table_frame, orient="horizontal", command=app.funding_tree.xview)
-    app.funding_tree.configure(yscrollcommand=y_scrollbar.set, xscrollcommand=x_scrollbar.set)
+    y_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=app.funding_board_tree.yview)
+    x_scrollbar = ttk.Scrollbar(table_frame, orient="horizontal", command=app.funding_board_tree.xview)
+    app.funding_board_tree.configure(
+        yscrollcommand=y_scrollbar.set,
+        xscrollcommand=x_scrollbar.set,
+    )
 
-    app.funding_tree.grid(row=0, column=0, sticky="nsew")
+    app.funding_board_tree.grid(row=0, column=0, sticky="nsew")
     y_scrollbar.grid(row=0, column=1, sticky="ns")
     x_scrollbar.grid(row=1, column=0, sticky="ew")
 
     table_frame.grid_rowconfigure(0, weight=1)
     table_frame.grid_columnconfigure(0, weight=1)
 
-    app.funding_tree.bind("<Double-1>", app._on_funding_select)
+    app.funding_board_tree.bind("<Double-1>", app._on_funding_select)
 
 
 def create_position_frame(app: Any, parent: tk.Widget) -> None:

@@ -29,7 +29,7 @@ try:
     )
     from gui.display_formatters import build_funding_table_rows
     from gui.exchange_display import parse_recommendation_display_names, to_display_name
-    from gui.layout import create_widgets as build_widgets
+    from gui.layout import create_funding_board_frame, create_widgets as build_widgets
     from gui.monitor_controller import (
         check_funding_reversal as controller_check_funding_reversal,
         start_monitoring as controller_start_monitoring,
@@ -74,7 +74,7 @@ except ImportError:
     )
     from display_formatters import build_funding_table_rows
     from exchange_display import parse_recommendation_display_names, to_display_name
-    from layout import create_widgets as build_widgets
+    from layout import create_funding_board_frame, create_widgets as build_widgets
     from monitor_controller import (
         check_funding_reversal as controller_check_funding_reversal,
         start_monitoring as controller_start_monitoring,
@@ -208,6 +208,9 @@ class FundingHunterGUI:
         self.last_monitor_advice: Optional[str] = None
         self._monitor_task = None
         self.cached_funding_rates = {}  # Cache funding rates for quick access
+        self._funding_board_window = None
+        self.funding_board_tree = None
+        self.funding_board_refresh_btn = None
         
         # Price spread waiting state (for manual open position)
         self.waiting_for_price_spread = False
@@ -583,6 +586,7 @@ class FundingHunterGUI:
         self.close_btn.config(state=tk.NORMAL)
         self.load_pos_btn.config(state=tk.NORMAL)
         self.refresh_funding_btn.config(state=tk.NORMAL)
+        self.open_funding_board_btn.config(state=tk.NORMAL)
         
         # Enable load pairs button if Binance is connected
         if "Binance" in connected:
@@ -602,13 +606,7 @@ class FundingHunterGUI:
         if Exchange.BYBIT in balances:
             self.bybit_balance_label.config(text=f"${balances[Exchange.BYBIT].available:.6f}")
 
-        # Show/hide funding table columns based on connected exchanges
-        connected_exchanges = set(self.manager.clients.keys())
-        for col_name, ex_enum in self._exchange_columns.items():
-            if ex_enum in connected_exchanges:
-                self.funding_tree.column(col_name, width=85, stretch=True)
-            else:
-                self.funding_tree.column(col_name, width=0, minwidth=0, stretch=False)
+        self._sync_funding_board_columns()
 
         # Update exchange dropdowns
         available = connected  # Use exchange names directly from connected list
@@ -633,8 +631,10 @@ class FundingHunterGUI:
         self.close_btn.config(state=tk.DISABLED)
         self.load_pos_btn.config(state=tk.DISABLED)
         self.refresh_funding_btn.config(state=tk.DISABLED)
+        self.open_funding_board_btn.config(state=tk.DISABLED)
         self.load_pairs_btn.config(state=tk.DISABLED)
         self.connected = False
+        self._clear_funding_views()
     
     def _disconnect(self):
         """Disconnect"""
@@ -937,11 +937,11 @@ class FundingHunterGUI:
             self._update_pair_info()
     
     def _refresh_funding(self):
-        """Refresh funding rates - scan ALL pairs from all exchanges"""
+        """Refresh funding rates from all connected exchanges."""
         if not self.connected:
             return
 
-        self._log("Scanning ALL funding rates from all exchanges...")
+        self._log("Scanning funding rates from all exchanges...")
 
         async def async_refresh():
             return await self.service.scan_funding_rates(top_candidates=20)
@@ -951,69 +951,147 @@ class FundingHunterGUI:
             future.add_done_callback(self._on_funding_complete)
 
     def _on_funding_complete(self, future):
-        """Handle funding refresh complete"""
+        """Handle funding refresh completion."""
         def update_ui():
             try:
                 all_rates = future.result()
                 self._update_funding_table(all_rates)
             except Exception as e:
                 self._log(f"Error: {e}")
-        
-        # Run on main thread
+
         self.root.after(0, update_ui)
-    
-    def _update_funding_table(self, all_rates):
-        """Update funding table - sorted by Best Spread (highest to lowest)
-        
-        All rates are normalized to 4h equivalent for fair comparison.
-        Rows are ranked by fee-adjusted net edge rather than raw funding spread.
-        """
-        for item in self.funding_tree.get_children():
-            self.funding_tree.delete(item)
-        
+
+    def _open_funding_board(self):
+        """Open the detachable funding board window."""
+        existing = getattr(self, "_funding_board_window", None)
+        if existing and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            self._sync_funding_board_columns()
+            self._update_funding_table(self.cached_funding_rates)
+            return
+
+        board = tk.Toplevel(self.root)
+        board.title("Funding Board")
+        board.geometry("1400x720")
+        board.transient(self.root)
+        self._funding_board_window = board
+        create_funding_board_frame(self, board)
+        board.protocol("WM_DELETE_WINDOW", self._close_funding_board)
+
+        self._sync_funding_board_columns()
+        self._update_funding_table(self.cached_funding_rates)
+
+    def _close_funding_board(self):
+        board = getattr(self, "_funding_board_window", None)
+        if board and board.winfo_exists():
+            board.destroy()
+        self._funding_board_window = None
+        self.funding_board_tree = None
+        self.funding_board_refresh_btn = None
+
+    def _clear_tree(self, tree):
+        if not tree:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+
+    def _clear_funding_views(self):
+        self.cached_funding_rates = {}
+        if hasattr(self, "market_summary_tree"):
+            self._clear_tree(self.market_summary_tree)
+        if hasattr(self, "market_summary_status"):
+            self.market_summary_status.config(text="No funding data loaded", foreground="gray")
+        if self.funding_board_tree:
+            self._clear_tree(self.funding_board_tree)
+
+    def _sync_funding_board_columns(self):
+        """Show only connected exchange columns in the funding board."""
+        if not self.funding_board_tree:
+            return
+
+        connected_exchanges = set(self.manager.clients.keys())
+        for col_name, ex_enum in self._exchange_columns.items():
+            if ex_enum in connected_exchanges:
+                self.funding_board_tree.column(col_name, width=86, minwidth=20, stretch=True)
+            else:
+                self.funding_board_tree.column(col_name, width=0, minwidth=0, stretch=False)
+
+        if self.funding_board_refresh_btn:
+            state = tk.NORMAL if self.connected else tk.DISABLED
+            self.funding_board_refresh_btn.config(state=state)
+
+    def _update_market_summary(self, all_rates):
+        if not hasattr(self, "market_summary_tree"):
+            return
+
+        self._clear_tree(self.market_summary_tree)
         if not all_rates:
+            self.market_summary_status.config(text="No funding data loaded", foreground="gray")
+            return
+
+        rows, total_pairs = build_funding_table_rows(all_rates, limit=5)
+        for row in rows:
+            self.market_summary_tree.insert("", tk.END, values=(row[0], row[9], row[10]))
+
+        self.market_summary_status.config(
+            text=f"Top 5 of {total_pairs} pairs by net edge",
+            foreground="green",
+        )
+
+    def _update_funding_board(self, all_rates):
+        if not self.funding_board_tree:
+            return
+
+        self._clear_tree(self.funding_board_tree)
+        if not all_rates:
+            return
+
+        rows, _ = build_funding_table_rows(all_rates, limit=50)
+        for row in rows:
+            self.funding_board_tree.insert("", tk.END, values=row)
+
+    def _update_funding_table(self, all_rates):
+        """Update the compact summary and detachable board."""
+        if not all_rates:
+            self._clear_funding_views()
             self._log("No funding rates available")
             return
-        
-        # Cache the funding rates for later use
+
         self.cached_funding_rates = all_rates
+        self._update_market_summary(all_rates)
+        self._sync_funding_board_columns()
+        self._update_funding_board(all_rates)
+        self._log(f"Loaded funding data for {len(all_rates)} pairs sorted by net edge after estimated costs")
 
-        rows, total_pairs = build_funding_table_rows(all_rates, limit=10)
-        for row in rows:
-            self.funding_tree.insert("", tk.END, values=row)
-
-        self._log(f"Loaded top 10 from {total_pairs} pairs sorted by net edge after estimated costs")
-    
     def _on_funding_select(self, event):
-        """Handle funding row double-click - auto select pair and exchanges in Trading Panel"""
-        selected = self.funding_tree.selection()
+        """Handle funding selection from either the summary tree or the board."""
+        tree = event.widget
+        selected = tree.selection()
         if not selected:
             return
-            
-        item = self.funding_tree.item(selected[0])
-        values = item['values']
+
+        item = tree.item(selected[0])
+        values = item["values"]
+        if not values:
+            return
+
         pair = values[0]
-        recommendation = values[-1]  # Luôn lấy từ cuối - không cần sửa khi thêm sàn mới
-        
-        # Set the pair in dropdown
+        recommendation = values[-1]
+
         self.pair_combo.set(pair)
-        self._log(f"📌 Selected pair: {pair}")
-        
-        # Parse and set exchanges from recommendation
+        self._log(f"Selected pair: {pair}")
+
         if recommendation != "-":
-            # Parse recommendation like "Long okx, Short binance"
             parts = parse_recommendation_display_names(recommendation)
             if parts:
                 long_display, short_display = parts
-                
                 self.long_exchange.set(long_display)
                 self.short_exchange.set(short_display)
-                
-                self._log(f"✅ Auto-selected: LONG on {long_display}, SHORT on {short_display}")
-        
-        # Update pair info (this will fetch funding rates and prices)
+                self._log(f"Auto-selected: LONG on {long_display}, SHORT on {short_display}")
+
         self._update_pair_info()
-    
+
     def _on_pair_changed(self, event):
         """Handle pair dropdown selection change in Trading Panel"""
         self._update_pair_info()
