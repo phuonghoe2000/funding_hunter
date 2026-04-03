@@ -5,7 +5,7 @@ Supports OKX, Binance, and BingX
 import asyncio
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, scrolledtext
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 import logging
@@ -245,7 +245,12 @@ class FundingHunterGUI:
         file_menu.add_command(label="📂 Load Config", command=self._load_config)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_closing)
-        
+
+        runtime_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Runtime", menu=runtime_menu)
+        runtime_menu.add_command(label="Session Viewer", command=self._open_runtime_viewer)
+        runtime_menu.add_command(label="Trade Journal", command=lambda: self._open_runtime_viewer(select_tab="journal"))
+
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
         help_menu.add_command(label="About", command=self._show_about)
@@ -1048,6 +1053,102 @@ class FundingHunterGUI:
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete(1.0, tk.END)
         self.log_text.configure(state=tk.DISABLED)
+
+    def _open_runtime_viewer(self, select_tab: str = "session"):
+        """Open a small runtime viewer for the active session and trade journal."""
+        existing = getattr(self, "_runtime_viewer", None)
+        if existing and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            if hasattr(self, "_runtime_notebook"):
+                tab_index = 1 if select_tab == "journal" else 0
+                self._runtime_notebook.select(tab_index)
+            self._refresh_runtime_viewer()
+            return
+
+        viewer = tk.Toplevel(self.root)
+        viewer.title("Runtime Viewer")
+        viewer.geometry("950x650")
+        viewer.transient(self.root)
+        self._runtime_viewer = viewer
+
+        toolbar = ttk.Frame(viewer, padding=(10, 10, 10, 0))
+        toolbar.pack(fill="x")
+
+        ttk.Button(toolbar, text="Refresh", command=self._refresh_runtime_viewer).pack(side="left")
+        ttk.Label(
+            toolbar,
+            text="Shows persisted active session and recent trade journal events from runtime storage.",
+        ).pack(side="left", padx=10)
+
+        notebook = ttk.Notebook(viewer)
+        notebook.pack(fill="both", expand=True, padx=10, pady=10)
+        self._runtime_notebook = notebook
+
+        session_frame = ttk.Frame(notebook)
+        notebook.add(session_frame, text="Active Session")
+        self._runtime_session_text = scrolledtext.ScrolledText(
+            session_frame,
+            wrap="none",
+            font=("Consolas", 9),
+        )
+        self._runtime_session_text.pack(fill="both", expand=True)
+
+        journal_frame = ttk.Frame(notebook)
+        notebook.add(journal_frame, text="Trade Journal")
+        self._runtime_journal_text = scrolledtext.ScrolledText(
+            journal_frame,
+            wrap="none",
+            font=("Consolas", 9),
+        )
+        self._runtime_journal_text.pack(fill="both", expand=True)
+
+        viewer.protocol("WM_DELETE_WINDOW", self._close_runtime_viewer)
+
+        tab_index = 1 if select_tab == "journal" else 0
+        notebook.select(tab_index)
+        self._refresh_runtime_viewer()
+
+    def _close_runtime_viewer(self):
+        viewer = getattr(self, "_runtime_viewer", None)
+        if viewer and viewer.winfo_exists():
+            viewer.destroy()
+        self._runtime_viewer = None
+
+    def _set_runtime_text(self, widget: tk.Text, content: str):
+        widget.configure(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", content)
+        widget.configure(state=tk.DISABLED)
+
+    def _refresh_runtime_viewer(self):
+        viewer = getattr(self, "_runtime_viewer", None)
+        if not viewer or not viewer.winfo_exists():
+            return
+
+        session = self.service.read_active_session()
+        journal = self.service.read_recent_journal(limit=100)
+
+        if session:
+            session_text = json.dumps(session, indent=2, ensure_ascii=False)
+        else:
+            session_text = "No active session persisted."
+
+        if journal:
+            journal_chunks = []
+            for event in journal:
+                journal_chunks.append(
+                    f"{event.get('timestamp', '-')}"
+                    f" | {event.get('event_type', '-')}\n"
+                    f"{json.dumps(event.get('payload', {}), indent=2, ensure_ascii=False)}"
+                )
+            journal_text = "\n\n" + ("\n" + ("-" * 80) + "\n\n").join(journal_chunks)
+            journal_text = journal_text.lstrip()
+        else:
+            journal_text = "Trade journal is empty."
+
+        self._set_runtime_text(self._runtime_session_text, session_text)
+        self._set_runtime_text(self._runtime_journal_text, journal_text)
     
     def _show_about(self):
         """Show about"""

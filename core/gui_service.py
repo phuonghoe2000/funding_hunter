@@ -127,6 +127,12 @@ class GUIWorkflowService:
     def record_trade_event(self, event_type: str, payload: Dict[str, Any]) -> None:
         self.session_store.append_journal_event(event_type, payload)
 
+    def read_active_session(self) -> Optional[Dict[str, Any]]:
+        return self.session_store.load_active_session()
+
+    def read_recent_journal(self, limit: int = 50) -> List[Dict[str, Any]]:
+        return self.session_store.read_recent_journal(limit)
+
     def _restore_position_types(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         restored = dict(payload)
         for field in ("long_exchange", "short_exchange"):

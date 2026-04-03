@@ -510,10 +510,10 @@ class TradingEngine:
                 pass
         if total_balance <= 0:
             total_balance = 1000.0
-        logger.info(f"?? Total balance for risk calc: ${total_balance:.2f}")
+        logger.info(f"[monitor] Total balance for risk calc: ${total_balance:.2f}")
         if session_matches and active_session:
             logger.info(
-                f"?? Recovered session {active_session.get('session_id')} | "
+                f"[monitor] Recovered session {active_session.get('session_id')} | "
                 f"initial edge {active_session.get('initial_net_edge_pct', 0.0):.4f}% | "
                 f"quality {active_session.get('initial_quality_score', 0.0):.1f}/100"
             )
@@ -541,7 +541,7 @@ class TradingEngine:
                 tracked_position["initial_long_rate"] = initial_rates[long_ex]
                 tracked_position["initial_short_rate"] = initial_rates[short_ex]
                 tracked_position["initial_net_funding"] = initial_net_funding
-                logger.info(f"?? Initial net funding: {initial_net_funding*100:.6f}%")
+                logger.info(f"[monitor] Initial net funding: {initial_net_funding*100:.6f}%")
                 if long_ex in initial_rate_objects and short_ex in initial_rate_objects:
                     economics = build_directional_opportunity(
                         pair=pair,
@@ -555,7 +555,7 @@ class TradingEngine:
                         f"Cost: {economics.round_trip_cost_pct:.4f}% | Net: {economics.net_edge_pct:.4f}%"
                     )
 
-        logger.info(f"?? Monitoring {pair} | LONG: {long_ex_name} | SHORT: {short_ex_name}")
+        logger.info(f"[monitor] Monitoring {pair} | LONG: {long_ex_name} | SHORT: {short_ex_name}")
         logger.info(f"   Auto-close risk: {auto_close_risk}% | Reversal: {auto_close_reversal}")
         logger.info(f"   Auto-close on monitor advice: {auto_close_on_advice}")
         logger.info("   Press Ctrl+C to stop.")
@@ -577,7 +577,7 @@ class TradingEngine:
                     losing += abs(short_pnl)
                 risk_pct = (losing / total_balance) * 100
 
-                color_tag = "??" if risk_pct < 2 else ("??" if risk_pct < 5 else "??")
+                color_tag = "GREEN" if risk_pct < 2 else ("YELLOW" if risk_pct < 5 else "RED")
                 logger.info(
                     f"{color_tag} Risk: {risk_pct:.2f}% | "
                     f"Long({long_ex_name}): ${long_pnl:+.2f} | "
@@ -616,7 +616,7 @@ class TradingEngine:
                 if advice_signature != last_advice_signature:
                     last_advice_signature = advice_signature
                     logger.info(
-                        f"?? Advice: {monitor_advice['action']} | {monitor_advice['reason']} | "
+                        f"[monitor] Advice: {monitor_advice['action']} | {monitor_advice['reason']} | "
                         f"net edge {monitor_advice['current_net_edge_pct']:.4f}% | "
                         f"next cycle ${monitor_advice['expected_next_cycle_pnl_usd']:+.2f}"
                     )
@@ -641,10 +641,10 @@ class TradingEngine:
 
                 if result.get("one_side_missing"):
                     missing_ex = result["one_side_missing"]
-                    logger.warning(f"?? ONE SIDE MISSING on {missing_ex.value}! Possible liquidation!")
+                    logger.warning(f"[monitor] ONE SIDE MISSING on {missing_ex.value}! Possible liquidation!")
 
                 if auto_close_on_advice and monitor_advice["action"] in {"EMERGENCY_CLOSE", "CLOSE_NOW"}:
-                    logger.warning(f"?? Auto-closing due to monitor advice: {monitor_advice['reason']}")
+                    logger.warning(f"[monitor] Auto-closing due to monitor advice: {monitor_advice['reason']}")
                     close_result = await self.close_position(
                         pair,
                         long_ex_name,
@@ -656,7 +656,7 @@ class TradingEngine:
                     break
 
                 if auto_close_risk is not None and risk_pct >= auto_close_risk:
-                    logger.warning(f"?? Risk {risk_pct:.2f}% >= threshold {auto_close_risk}%! Auto-closing...")
+                    logger.warning(f"[monitor] Risk {risk_pct:.2f}% >= threshold {auto_close_risk}%! Auto-closing...")
                     close_result = await self.close_position(
                         pair,
                         long_ex_name,
@@ -672,7 +672,7 @@ class TradingEngine:
                         pair, long_ex, short_ex, initial_net_funding, initial_rates, funding_spread_min
                     )
                     if should_close:
-                        logger.warning(f"?? Funding reversal: {reason}")
+                        logger.warning(f"[monitor] Funding reversal: {reason}")
                         logger.info("Auto-closing due to funding reversal...")
                         close_result = await self.close_position(
                             pair,
@@ -686,7 +686,7 @@ class TradingEngine:
 
                 await asyncio.sleep(interval)
         except KeyboardInterrupt:
-            logger.info("?? Monitoring stopped by user.")
+            logger.info("[monitor] Monitoring stopped by user.")
 
     async def _check_funding_reversal(self, pair, long_ex, short_ex,
                                        initial_net, initial_rates, min_threshold) -> tuple:
