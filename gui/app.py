@@ -222,10 +222,12 @@ class FundingHunterGUI:
         # UI update tasks (to prevent spam and manage recurring updates)
         self._pair_info_update_task = None
         self._usdt_update_pending = None
+        self._runtime_refresh_task = None
         
         # Build UI
         self._create_menu()
         self._create_widgets()
+        self._start_runtime_refresh_loop()
         self._setup_logging()
         self._start_async_loop()
         
@@ -617,6 +619,7 @@ class FundingHunterGUI:
             if len(available) > 1:
                 self.short_exchange.set(available[1])
 
+        self._refresh_runtime_views()
         if not self.active_position:
             self._attempt_recover_session()
 
@@ -928,6 +931,7 @@ class FundingHunterGUI:
         self.monitor_btn.config(text="👁 Start Monitor", state=tk.DISABLED)
         
         self.last_monitor_advice = None
+        self._refresh_runtime_views()
         # Restart pair info update loop when position is closed
         if not self._pair_info_update_task:
             self._update_pair_info()
@@ -1054,6 +1058,20 @@ class FundingHunterGUI:
         self.log_text.delete(1.0, tk.END)
         self.log_text.configure(state=tk.DISABLED)
 
+    def _start_runtime_refresh_loop(self):
+        """Keep embedded runtime widgets in sync with local runtime storage."""
+        if self._runtime_refresh_task:
+            return
+
+        def _tick():
+            self._runtime_refresh_task = None
+            if not self.root.winfo_exists():
+                return
+            self._refresh_runtime_views()
+            self._runtime_refresh_task = self.root.after(3000, _tick)
+
+        self._runtime_refresh_task = self.root.after(500, _tick)
+
     def _open_runtime_viewer(self, select_tab: str = "session"):
         """Open a small runtime viewer for the active session and trade journal."""
         existing = getattr(self, "_runtime_viewer", None)
@@ -1107,7 +1125,7 @@ class FundingHunterGUI:
 
         tab_index = 1 if select_tab == "journal" else 0
         notebook.select(tab_index)
-        self._refresh_runtime_viewer()
+        self._refresh_runtime_views()
 
     def _close_runtime_viewer(self):
         viewer = getattr(self, "_runtime_viewer", None)
@@ -1121,11 +1139,15 @@ class FundingHunterGUI:
         widget.insert("1.0", content)
         widget.configure(state=tk.DISABLED)
 
-    def _refresh_runtime_viewer(self):
-        viewer = getattr(self, "_runtime_viewer", None)
-        if not viewer or not viewer.winfo_exists():
-            return
+    def _build_runtime_summary(self, session: Optional[Dict[str, Any]], journal: List[Dict[str, Any]]) -> str:
+        if session:
+            session_id = session.get("session_id", "-")
+            pair = session.get("pair", "-")
+            advice = (session.get("latest_monitor_advice") or {}).get("action", "-")
+            return f"Session {session_id[:8]} | {pair} | advice: {advice} | journal: {len(journal)}"
+        return f"No active session | journal: {len(journal)}"
 
+    def _refresh_runtime_views(self):
         session = self.service.read_active_session()
         journal = self.service.read_recent_journal(limit=100)
 
@@ -1147,8 +1169,21 @@ class FundingHunterGUI:
         else:
             journal_text = "Trade journal is empty."
 
-        self._set_runtime_text(self._runtime_session_text, session_text)
-        self._set_runtime_text(self._runtime_journal_text, journal_text)
+        if hasattr(self, "runtime_session_text") and self.runtime_session_text.winfo_exists():
+            self._set_runtime_text(self.runtime_session_text, session_text)
+        if hasattr(self, "runtime_journal_text") and self.runtime_journal_text.winfo_exists():
+            self._set_runtime_text(self.runtime_journal_text, journal_text)
+        if hasattr(self, "runtime_summary_label") and self.runtime_summary_label.winfo_exists():
+            self.runtime_summary_label.config(text=self._build_runtime_summary(session, journal))
+
+        viewer = getattr(self, "_runtime_viewer", None)
+        if viewer and viewer.winfo_exists():
+            self._set_runtime_text(self._runtime_session_text, session_text)
+            self._set_runtime_text(self._runtime_journal_text, journal_text)
+
+    def _refresh_runtime_viewer(self):
+        """Backward-compatible wrapper for popup refresh buttons."""
+        self._refresh_runtime_views()
     
     def _show_about(self):
         """Show about"""
@@ -1166,6 +1201,10 @@ class FundingHunterGUI:
         if self.connected:
             if messagebox.askyesno("Exit", "Disconnect and exit?"):
                 self._disconnect()
+
+        if self._runtime_refresh_task:
+            self.root.after_cancel(self._runtime_refresh_task)
+            self._runtime_refresh_task = None
         
         if self.loop:
             self.loop.call_soon_threadsafe(self.loop.stop)

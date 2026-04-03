@@ -51,7 +51,31 @@ def create_widgets(app: Any) -> None:
     bottom_frame.pack(fill=tk.BOTH, expand=True)
 
     create_position_frame(app, bottom_frame)
-    create_log_frame(app, bottom_frame)
+
+    lower_pane = ttk.Panedwindow(bottom_frame, orient=tk.HORIZONTAL)
+    lower_pane.pack(fill=tk.BOTH, expand=True)
+
+    log_container = ttk.Frame(lower_pane, width=760)
+    runtime_container = ttk.Frame(lower_pane, width=430)
+    lower_pane.add(log_container, weight=3)
+    lower_pane.add(runtime_container, weight=2)
+
+    create_log_frame(app, log_container)
+    create_runtime_frame(app, runtime_container)
+
+    def _set_bottom_split() -> None:
+        try:
+            total_width = lower_pane.winfo_width()
+            if total_width <= 1:
+                app.root.after(50, _set_bottom_split)
+                return
+
+            target_width = max(560, min(860, int(total_width * 0.62)))
+            lower_pane.sashpos(0, target_width)
+        except tk.TclError:
+            return
+
+    app.root.after(50, _set_bottom_split)
 
 
 def create_exchange_frame(app: Any, parent: tk.Widget) -> None:
@@ -475,6 +499,44 @@ def create_log_frame(app: Any, parent: tk.Widget) -> None:
     app.log_text.pack(fill=tk.BOTH, expand=True)
 
     ttk.Button(frame, text="Clear", command=app._clear_logs).pack(side=tk.RIGHT, pady=5)
+
+
+def create_runtime_frame(app: Any, parent: tk.Widget) -> None:
+    """Create the embedded runtime session/journal panel."""
+    frame = ttk.LabelFrame(parent, text="Runtime", padding="10")
+    frame.pack(fill=tk.BOTH, expand=True, padx=(5, 0))
+
+    toolbar = ttk.Frame(frame)
+    toolbar.pack(fill=tk.X, pady=(0, 8))
+
+    ttk.Button(toolbar, text="Refresh", command=app._refresh_runtime_views).pack(side=tk.LEFT)
+    app.runtime_summary_label = ttk.Label(toolbar, text="No runtime data loaded", foreground="gray")
+    app.runtime_summary_label.pack(side=tk.LEFT, padx=10)
+
+    app.runtime_notebook = ttk.Notebook(frame)
+    app.runtime_notebook.pack(fill=tk.BOTH, expand=True)
+
+    session_frame = ttk.Frame(app.runtime_notebook)
+    app.runtime_notebook.add(session_frame, text="Active Session")
+    app.runtime_session_text = scrolledtext.ScrolledText(
+        session_frame,
+        height=10,
+        wrap="none",
+        font=("Consolas", 9),
+        state=tk.DISABLED,
+    )
+    app.runtime_session_text.pack(fill=tk.BOTH, expand=True)
+
+    journal_frame = ttk.Frame(app.runtime_notebook)
+    app.runtime_notebook.add(journal_frame, text="Trade Journal")
+    app.runtime_journal_text = scrolledtext.ScrolledText(
+        journal_frame,
+        height=10,
+        wrap="none",
+        font=("Consolas", 9),
+        state=tk.DISABLED,
+    )
+    app.runtime_journal_text.pack(fill=tk.BOTH, expand=True)
 
 
 def _create_exchange_tab(
