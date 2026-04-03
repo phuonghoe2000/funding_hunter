@@ -25,6 +25,11 @@ from exchanges.base import FundingRate
 
 logger = logging.getLogger(__name__)
 
+RISK_REDUCE_RATIO = 0.5
+RISK_REDUCE_SPLITS = 10
+RISK_REDUCE_INTERVAL_SECONDS = 2.0
+RISK_REDUCE_COOLDOWN_SECONDS = 60.0
+
 
 def _resolve_exchange(name: str) -> Exchange:
     """Convert a string exchange name to an Exchange enum."""
@@ -91,6 +96,39 @@ class TradingEngine:
             and session.get("long_exchange") in (long_ex, long_ex.value)
             and session.get("short_exchange") in (short_ex, short_ex.value)
         )
+
+    @staticmethod
+    def _parse_session_datetime(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _remaining_risk_reduce_cooldown(session: Optional[Dict[str, Any]]) -> float:
+        if not session:
+            return 0.0
+        last_reduce_at = TradingEngine._parse_session_datetime(session.get("last_risk_reduce_at"))
+        if not last_reduce_at:
+            return 0.0
+        elapsed = (datetime.now(timezone.utc) - last_reduce_at).total_seconds()
+        return max(0.0, RISK_REDUCE_COOLDOWN_SECONDS - elapsed)
+
+    @staticmethod
+    def _extract_position_sizes(long_pos: Any, short_pos: Any) -> Dict[str, float]:
+        long_size = float(abs(getattr(long_pos, "size", 0.0) or 0.0))
+        short_size = float(abs(getattr(short_pos, "size", 0.0) or 0.0))
+        active_candidates = [value for value in (long_size, short_size) if value > 0]
+        remaining_size = min(active_candidates) if len(active_candidates) == 2 else 0.0
+        return {
+            "long_size": long_size,
+            "short_size": short_size,
+            "remaining_size": remaining_size,
+        }
 
     async def _fetch_exchange_market_context(self, pair: str, exchange: Exchange) -> Dict[str, Any]:
         client = self.exchange_manager.clients.get(exchange)
@@ -429,6 +467,159 @@ class TradingEngine:
             )
         return close_result
 
+    async def reduce_position_on_risk(
+        self,
+        pair: str,
+        long_ex_name: str,
+        short_ex_name: str,
+        *,
+        risk_percent: Optional[float] = None,
+        threshold_percent: Optional[float] = None,
+        reason: str = "risk_threshold",
+        reduce_ratio: float = RISK_REDUCE_RATIO,
+        splits: int = RISK_REDUCE_SPLITS,
+        interval_seconds: float = RISK_REDUCE_INTERVAL_SECONDS,
+    ) -> Dict[str, Any]:
+        long_ex = _resolve_exchange(long_ex_name)
+        short_ex = _resolve_exchange(short_ex_name)
+        active_session = self.get_active_session()
+        cooldown_remaining = self._remaining_risk_reduce_cooldown(active_session)
+
+        if cooldown_remaining > 0 and self._session_matches(active_session, pair, long_ex, short_ex):
+            return {
+                "success": False,
+                "error": f"Risk reduce cooldown active for {cooldown_remaining:.1f}s",
+                "cooldown_remaining": cooldown_remaining,
+            }
+
+        check_result = await self.exchange_manager.check_positions(pair, long_ex, short_ex)
+        long_pos = check_result.get("long")
+        short_pos = check_result.get("short")
+        if not long_pos or not short_pos:
+            result = {
+                "success": False,
+                "error": "Both legs must still be open for fast risk reduce",
+                "check_result": check_result,
+            }
+            self.session_store.append_journal_event(
+                "risk_reduce_failed_cli",
+                {
+                    "session_id": active_session.get("session_id") if self._session_matches(active_session, pair, long_ex, short_ex) else None,
+                    "pair": pair,
+                    "reason": reason,
+                    "risk_percent": risk_percent,
+                    "threshold_percent": threshold_percent,
+                    "result": result,
+                },
+            )
+            return result
+
+        sizes = self._extract_position_sizes(long_pos, short_pos)
+        current_size = sizes["remaining_size"]
+        if current_size <= 0:
+            return {
+                "success": False,
+                "error": "No balanced size available to reduce",
+                "check_result": check_result,
+            }
+
+        close_size = current_size * reduce_ratio
+        if close_size <= 0:
+            return {
+                "success": False,
+                "error": f"Computed reduce size is invalid: {close_size}",
+            }
+
+        logger.warning(
+            f"[monitor] Risk reduce triggered on {pair}: close {reduce_ratio*100:.0f}% "
+            f"({close_size:.6f} tokens) in {splits} split(s), every {interval_seconds:.1f}s"
+        )
+        self.session_store.append_journal_event(
+            "risk_reduce_requested_cli",
+            {
+                "session_id": active_session.get("session_id") if self._session_matches(active_session, pair, long_ex, short_ex) else None,
+                "pair": pair,
+                "long_exchange": long_ex,
+                "short_exchange": short_ex,
+                "reason": reason,
+                "risk_percent": risk_percent,
+                "threshold_percent": threshold_percent,
+                "reduce_ratio": reduce_ratio,
+                "close_size": close_size,
+                "splits": splits,
+                "interval_seconds": interval_seconds,
+            },
+        )
+
+        result = await self.exchange_manager.close_hedged_position_split(
+            pair=pair,
+            long_exchange=long_ex,
+            short_exchange=short_ex,
+            splits=splits,
+            interval_seconds=interval_seconds,
+            price_spread_min=-100.0,
+            spread_check_interval=2.0,
+            progress_callback=lambda _s, _t, message: logger.info(f"   {message}"),
+            skip_spread_check=True,
+            close_size=close_size,
+        )
+        result.update(
+            {
+                "mode": "risk_reduce",
+                "reduce_ratio": reduce_ratio,
+                "requested_close_size": close_size,
+                "risk_percent": risk_percent,
+                "threshold_percent": threshold_percent,
+            }
+        )
+
+        post_check = await self.exchange_manager.check_positions(pair, long_ex, short_ex)
+        post_long = post_check.get("long")
+        post_short = post_check.get("short")
+        remaining_sizes = self._extract_position_sizes(post_long, post_short)
+        result["post_check"] = post_check
+        result["remaining_long_size"] = remaining_sizes["long_size"]
+        result["remaining_short_size"] = remaining_sizes["short_size"]
+        result["remaining_size_tokens"] = remaining_sizes["remaining_size"]
+
+        if self._session_matches(active_session, pair, long_ex, short_ex):
+            updated_session = dict(active_session or {})
+            if post_long and post_short:
+                updated_session["long_size"] = remaining_sizes["long_size"]
+                updated_session["short_size"] = remaining_sizes["short_size"]
+                updated_session["size"] = remaining_sizes["remaining_size"]
+                updated_session["last_risk_reduce_at"] = datetime.now(timezone.utc)
+                updated_session["last_risk_reduce_reason"] = reason
+                updated_session["risk_reduce_count"] = int(updated_session.get("risk_reduce_count", 0) or 0) + 1
+                updated_session["latest_risk_reduce"] = {
+                    "risk_percent": risk_percent,
+                    "threshold_percent": threshold_percent,
+                    "reduce_ratio": reduce_ratio,
+                    "requested_close_size": close_size,
+                    "remaining_size_tokens": remaining_sizes["remaining_size"],
+                    "result_success": result.get("success", False),
+                }
+                self.session_store.save_active_session(updated_session)
+                result["session"] = updated_session
+            elif result.get("success"):
+                self.session_store.clear_active_session()
+                result["session_cleared"] = True
+
+        event_type = "risk_reduce_completed_cli" if result.get("success") else "risk_reduce_failed_cli"
+        self.session_store.append_journal_event(
+            event_type,
+            {
+                "session_id": active_session.get("session_id") if self._session_matches(active_session, pair, long_ex, short_ex) else None,
+                "pair": pair,
+                "reason": reason,
+                "risk_percent": risk_percent,
+                "threshold_percent": threshold_percent,
+                "reduce_ratio": reduce_ratio,
+                "result": result,
+            },
+        )
+        return result
+
     # ------------------------------------------------------------------
     # 5. Load existing positions (find hedged pairs)
     # ------------------------------------------------------------------
@@ -556,7 +747,7 @@ class TradingEngine:
                     )
 
         logger.info(f"[monitor] Monitoring {pair} | LONG: {long_ex_name} | SHORT: {short_ex_name}")
-        logger.info(f"   Auto-close risk: {auto_close_risk}% | Reversal: {auto_close_reversal}")
+        logger.info(f"   Auto-reduce risk: {auto_close_risk}% | Reversal: {auto_close_reversal}")
         logger.info(f"   Auto-close on monitor advice: {auto_close_on_advice}")
         logger.info("   Press Ctrl+C to stop.")
 
@@ -656,16 +847,37 @@ class TradingEngine:
                     break
 
                 if auto_close_risk is not None and risk_pct >= auto_close_risk:
-                    logger.warning(f"[monitor] Risk {risk_pct:.2f}% >= threshold {auto_close_risk}%! Auto-closing...")
-                    close_result = await self.close_position(
-                        pair,
-                        long_ex_name,
-                        short_ex_name,
-                        splits=1,
-                        skip_spread_check=True,
-                    )
-                    logger.info(f"Close result: {close_result}")
-                    break
+                    cooldown_remaining = self._remaining_risk_reduce_cooldown(active_session or tracked_position)
+                    if cooldown_remaining > 0:
+                        logger.warning(
+                            f"[monitor] Risk reduce cooldown active for {cooldown_remaining:.1f}s "
+                            f"(risk {risk_pct:.2f}% >= threshold {auto_close_risk}%)"
+                        )
+                    else:
+                        logger.warning(
+                            f"[monitor] Risk {risk_pct:.2f}% >= threshold {auto_close_risk}%! "
+                            "Triggering fast both-legs reduce..."
+                        )
+                        reduce_result = await self.reduce_position_on_risk(
+                            pair,
+                            long_ex_name,
+                            short_ex_name,
+                            risk_percent=risk_pct,
+                            threshold_percent=auto_close_risk,
+                            reason="monitor_risk_threshold",
+                        )
+                        logger.info(f"Risk reduce result: {reduce_result}")
+                        if reduce_result.get("success"):
+                            tracked_position["size"] = reduce_result.get("remaining_size_tokens", tracked_position.get("size", 0.0))
+                            tracked_position["long_size"] = reduce_result.get("remaining_long_size", tracked_position.get("long_size", 0.0))
+                            tracked_position["short_size"] = reduce_result.get("remaining_short_size", tracked_position.get("short_size", 0.0))
+                            tracked_position["last_risk_reduce_at"] = datetime.now(timezone.utc)
+                            tracked_position["risk_reduce_count"] = int(tracked_position.get("risk_reduce_count", 0) or 0) + 1
+                            active_session = self.get_active_session()
+                            if active_session and self._session_matches(active_session, pair, long_ex, short_ex):
+                                tracked_position.update(active_session)
+                        else:
+                            logger.warning(f"[monitor] Risk reduce failed: {reduce_result.get('error')}")
 
                 if auto_close_reversal and initial_net_funding != 0:
                     should_close, reason = await self._check_funding_reversal(

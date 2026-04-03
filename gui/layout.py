@@ -329,7 +329,7 @@ def create_trading_frame(app: Any, parent: tk.Widget) -> None:
     risk_frame.pack(anchor=tk.W)
 
     app.auto_close_risk_var = tk.BooleanVar(value=False)
-    ttk.Checkbutton(risk_frame, text="Auto-close when Risk >=", variable=app.auto_close_risk_var).pack(side=tk.LEFT)
+    ttk.Checkbutton(risk_frame, text="Auto-reduce 50% when Risk >=", variable=app.auto_close_risk_var).pack(side=tk.LEFT)
     app.risk_threshold_var = tk.StringVar(value="10")
     ttk.Entry(risk_frame, textvariable=app.risk_threshold_var, width=5).pack(side=tk.LEFT, padx=2)
     ttk.Label(risk_frame, text="%").pack(side=tk.LEFT)

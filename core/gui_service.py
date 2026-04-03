@@ -650,6 +650,25 @@ class GUIWorkflowService:
         result["price_spread_min"] = threshold
         return result
 
+    async def reduce_position_on_risk(
+        self,
+        *,
+        pair: str,
+        long_exchange: Exchange,
+        short_exchange: Exchange,
+        risk_percent: Optional[float] = None,
+        threshold_percent: Optional[float] = None,
+        reason: str = "risk_threshold",
+    ) -> Dict[str, Any]:
+        return await self.engine.reduce_position_on_risk(
+            pair,
+            long_exchange.value,
+            short_exchange.value,
+            risk_percent=risk_percent,
+            threshold_percent=threshold_percent,
+            reason=reason,
+        )
+
     async def _fetch_single_funding_rate(self, client, exchange: Exchange, pair: str, symbol: str):
         try:
             rate_obj = await asyncio.wait_for(client.get_funding_rate(symbol), timeout=8.0)

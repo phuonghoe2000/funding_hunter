@@ -4,6 +4,7 @@ Monitoring workflow helpers for the GUI.
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from tkinter import messagebox
@@ -11,6 +12,17 @@ from tkinter import messagebox
 from config.constants import Exchange, get_exchange_symbol
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
 
 
 def start_monitoring(app: Any) -> None:
@@ -98,49 +110,60 @@ def start_monitoring(app: Any) -> None:
                         safe_log(f"BingX is +${bingx_pnl:.2f} -> threshold x2: {effective_threshold:.1f}%")
 
                     if risk_percent >= effective_threshold:
-                        safe_log(
-                            f"Risk {risk_percent:.2f}% >= threshold {effective_threshold:.1f}% "
-                            f"(balance ${total_balance:.2f})"
-                        )
-                        try:
-                            splits = max(1, int(app.split_count_var.get()))
-                        except Exception:
-                            splits = 1
+                        cooldown_remaining = 0.0
+                        last_reduce_at = _parse_dt(position.get("last_risk_reduce_at"))
+                        if last_reduce_at:
+                            cooldown_remaining = max(
+                                0.0,
+                                60.0 - (datetime.now(timezone.utc) - last_reduce_at).total_seconds(),
+                            )
 
-                        close_result = await app.service.close_position_with_analysis(
-                            pair=position["pair"],
-                            long_exchange=position["long_exchange"],
-                            short_exchange=position["short_exchange"],
-                            splits=splits,
-                            log_callback=safe_log,
-                            skip_spread_check=True,
-                        )
-                        if close_result.get("success"):
-                            safe_log(f"Position closed due to risk >= {effective_threshold:.1f}%")
-                            app.root.after(
-                                0,
-                                lambda risk_value=risk_percent, threshold=effective_threshold: messagebox.showwarning(
-                                    "Risk Auto-Close",
-                                    f"Position closed!\nRisk was {risk_value:.2f}% (threshold: {threshold:.1f}%)",
-                                ),
+                        if cooldown_remaining > 0:
+                            safe_log(
+                                f"Risk reduce cooldown: {cooldown_remaining:.1f}s remaining "
+                                f"(risk {risk_percent:.2f}% >= {effective_threshold:.1f}%)"
                             )
-                            app.service.record_trade_event(
-                                "auto_close_risk",
-                                {
-                                    "session_id": position.get("session_id"),
-                                    "pair": position.get("pair"),
-                                    "risk_percent": risk_percent,
-                                    "threshold": effective_threshold,
-                                    "close_result": close_result,
-                                },
-                            )
-                            app.service.clear_active_position()
-                            app.monitoring = False
-                            app.active_position = None
-                            app.root.after(0, app._clear_position_display)
-                            break
                         else:
-                            safe_log(f"Auto-close failed: {close_result.get('error')}")
+                            safe_log(
+                                f"Risk {risk_percent:.2f}% >= threshold {effective_threshold:.1f}% "
+                                f"(balance ${total_balance:.2f}) -> reducing both legs by 50%"
+                            )
+                            reduce_result = await app.service.reduce_position_on_risk(
+                                pair=position["pair"],
+                                long_exchange=position["long_exchange"],
+                                short_exchange=position["short_exchange"],
+                                risk_percent=risk_percent,
+                                threshold_percent=effective_threshold,
+                                reason="gui_monitor_risk_threshold",
+                            )
+                            if reduce_result.get("success"):
+                                remaining_size = float(reduce_result.get("remaining_size_tokens", position.get("size", 0.0)) or 0.0)
+                                position["size"] = remaining_size
+                                position["long_size"] = float(reduce_result.get("remaining_long_size", position.get("long_size", 0.0)) or 0.0)
+                                position["short_size"] = float(reduce_result.get("remaining_short_size", position.get("short_size", 0.0)) or 0.0)
+                                position["last_risk_reduce_at"] = datetime.now(timezone.utc)
+                                position["risk_reduce_count"] = int(position.get("risk_reduce_count", 0) or 0) + 1
+                                safe_log(
+                                    f"Fast risk reduce done: remaining size {remaining_size:.6f} | "
+                                    f"count {position['risk_reduce_count']}"
+                                )
+                                app.root.after(
+                                    0,
+                                    lambda risk_value=risk_percent, threshold=effective_threshold: messagebox.showwarning(
+                                        "Risk Reduce",
+                                        f"Triggered both-legs reduce 50%.\n"
+                                        f"Risk was {risk_value:.2f}% (threshold: {threshold:.1f}%).",
+                                    ),
+                                )
+                                if remaining_size <= 0:
+                                    safe_log("Position fully closed after risk reduce")
+                                    app.service.clear_active_position()
+                                    app.monitoring = False
+                                    app.active_position = None
+                                    app.root.after(0, app._clear_position_display)
+                                    break
+                            else:
+                                safe_log(f"Risk reduce failed: {reduce_result.get('error')}")
 
                 if app.auto_close_reversal_var.get() and "initial_net_funding" in position:
                     should_close, reason = await check_funding_reversal(app, position)

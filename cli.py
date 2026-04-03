@@ -66,7 +66,7 @@ Examples:
   python cli.py info --pair BTC/USDT --long binance --short bingx
   python cli.py open --pair BTC/USDT --long gate --short binance --size 100 --leverage 3
   python cli.py close --pair BTC/USDT --long gate --short binance --splits 3
-  python cli.py monitor --pair BTC/USDT --long gate --short binance --auto-close-risk 10
+  python cli.py monitor --pair BTC/USDT --long gate --short binance --auto-reduce-risk 10
   python cli.py pnl --pair BTC/USDT --long gate --short binance
   python cli.py analyze --pair BTC/USDT --long gate --short binance --duration 120
   python cli.py session
@@ -120,11 +120,18 @@ Examples:
     p.add_argument("--skip-spread-check", action="store_true", help="Skip spread analysis and execute splits immediately")
 
     # ── monitor ──
-    p = sub.add_parser("monitor", help="Live monitor position PnL, risk %%, with optional auto-close")
+    p = sub.add_parser("monitor", help="Live monitor position PnL, risk %%, with optional fast risk-reduce")
     p.add_argument("--pair", required=True, help="Trading pair")
     p.add_argument("--long", required=True, help="Long exchange")
     p.add_argument("--short", required=True, help="Short exchange")
-    p.add_argument("--auto-close-risk", type=float, default=None, help="Auto-close when risk >= X%%")
+    p.add_argument(
+        "--auto-reduce-risk",
+        "--auto-close-risk",
+        dest="auto_close_risk",
+        type=float,
+        default=None,
+        help="Reduce both legs by 50%% when risk >= X%%",
+    )
     p.add_argument("--auto-close-reversal", action="store_true", help="Auto-close on funding reversal")
     p.add_argument("--auto-close-on-advice", action="store_true", help="Auto-close on CLOSE_NOW or EMERGENCY_CLOSE advice")
     p.add_argument("--funding-spread-min", type=float, default=0.01, help="Min funding spread %% for reversal check")
