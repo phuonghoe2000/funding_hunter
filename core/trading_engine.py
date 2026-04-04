@@ -329,8 +329,8 @@ class TradingEngine:
                 log_callback=lambda m: logger.info(m), mode="open"
             )
             if result.get("success"):
-                price_spread_min = result["second_best_spread"]
-                logger.info(f"✅ Analyze done. Threshold = {price_spread_min:.4f}%")
+                price_spread_min = result["avg_spread"]
+                logger.info(f"✅ Analyze done. Threshold (avg spread) = {price_spread_min:.4f}%")
             else:
                 price_spread_min = -100.0
                 logger.warning(f"Analyze failed: {result.get('error')}. Using no threshold.")
@@ -433,8 +433,8 @@ class TradingEngine:
                 log_callback=lambda m: logger.info(m), mode="close"
             )
             if result.get("success"):
-                price_spread_min = result["second_best_spread"]
-                logger.info(f"✅ Analyze done. Threshold = {price_spread_min:.4f}%")
+                price_spread_min = result["avg_spread"]
+                logger.info(f"✅ Analyze done. Threshold (avg spread) = {price_spread_min:.4f}%")
             else:
                 price_spread_min = -100.0
                 logger.warning(f"Analyze failed. Using no threshold.")

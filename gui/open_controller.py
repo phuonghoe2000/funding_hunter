@@ -13,10 +13,6 @@ from config.constants import calculate_break_even
 
 logger = logging.getLogger(__name__)
 
-ENTRY_WAIT_CHECK_INTERVAL_MS = 1000
-ENTRY_THRESHOLD_DECAY_CHECKS = 10
-ENTRY_THRESHOLD_DECAY_STEP_PCT = 0.01
-
 
 def open_position(app: Any) -> None:
     """Open a hedged position after validation and optional spread analysis."""
@@ -251,12 +247,12 @@ def on_analyze_for_open_complete(app: Any, future: Any) -> None:
                 reset_open_button(app)
                 return
 
-            second_best = result["second_best_spread"]
-            app.price_spread_params["price_spread_min"] = second_best
+            avg_spread = result["avg_spread"]
+            app.price_spread_params["price_spread_min"] = avg_spread
             app.price_spread_threshold.delete(0, tk.END)
-            app.price_spread_threshold.insert(0, f"{second_best:.4f}")
-            app._log(f"Analyze done. Threshold = {second_best:.4f}%")
-            app._log(f"Waiting for spread >= {second_best:.4f}% before opening...")
+            app.price_spread_threshold.insert(0, f"{avg_spread:.4f}")
+            app._log(f"Analyze done. Threshold (avg spread) = {avg_spread:.4f}%")
+            app._log(f"Waiting for spread >= {avg_spread:.4f}% before opening...")
             app.open_btn.configure(text="Waiting... (Cancel)")
             app.waiting_for_price_spread = True
             app._check_price_spread_and_open()
@@ -324,27 +320,26 @@ async def service_check_and_open(app: Any, params: dict[str, Any], safe_log) -> 
     current_threshold = params.get("price_spread_min", 0)
     check_count = params.get("spread_check_count", 0) + 1
     params["spread_check_count"] = check_count
-    check_bucket = check_count % ENTRY_THRESHOLD_DECAY_CHECKS or ENTRY_THRESHOLD_DECAY_CHECKS
 
     if price_spread_pct < 0:
         safe_log(
             f"Real spread (OI): {price_spread_pct:.4f}% NEGATIVE "
-            f"(threshold: {current_threshold:.4f}%) (check {check_bucket}/{ENTRY_THRESHOLD_DECAY_CHECKS}) | "
+            f"(threshold: {current_threshold:.4f}%) (check {check_count % 30}/30) | "
             f"LONG ASK: ${long_ask_price:,.6f} | SHORT BID: ${short_bid_price:,.6f}"
         )
     else:
         safe_log(
             f"Real spread (OI): {price_spread_pct:.4f}% "
-            f"(threshold: {current_threshold:.4f}%) (check {check_bucket}/{ENTRY_THRESHOLD_DECAY_CHECKS}) | "
+            f"(threshold: {current_threshold:.4f}%) (check {check_count % 30}/30) | "
             f"LONG ASK: ${long_ask_price:,.6f} | SHORT BID: ${short_bid_price:,.6f}"
         )
 
     if price_spread_pct < current_threshold:
-        if check_count >= ENTRY_THRESHOLD_DECAY_CHECKS and check_count % ENTRY_THRESHOLD_DECAY_CHECKS == 0:
+        if check_count >= 30 and check_count % 30 == 0:
             old_threshold = current_threshold
-            params["price_spread_min"] = current_threshold - ENTRY_THRESHOLD_DECAY_STEP_PCT
+            params["price_spread_min"] = current_threshold - 0.01
             safe_log(
-                f"{ENTRY_THRESHOLD_DECAY_CHECKS} checks without meeting threshold, reducing threshold: "
+                f"30 checks without meeting threshold, reducing threshold: "
                 f"{old_threshold:.4f}% -> {params['price_spread_min']:.4f}%"
             )
         return {"success": False, "waiting": True}
@@ -374,7 +369,6 @@ async def service_check_and_open(app: Any, params: dict[str, Any], safe_log) -> 
         cancel_event=app.split_cancel_event,
         skip_leverage_set=params.get("skip_leverage", False),
         skip_spread_check=params.get("skip_spread_check", False),
-        skip_spread_recheck_after_first=not params.get("skip_spread_check", False),
     )
     app.split_cancel_event = None
     app.balance_before_open = result.get("balance_before", {})
@@ -414,10 +408,7 @@ def on_price_spread_check_complete(app: Any, future: Any) -> None:
 
             if not result.get("success") and result.get("waiting"):
                 if app.waiting_for_price_spread:
-                    app.price_spread_check_task = app.root.after(
-                        ENTRY_WAIT_CHECK_INTERVAL_MS,
-                        app._check_price_spread_and_open,
-                    )
+                    app.price_spread_check_task = app.root.after(2000, app._check_price_spread_and_open)
                 logger.debug("_on_price_spread_check_complete.update_ui: EXIT (waiting)")
                 return
 

@@ -514,7 +514,6 @@ class GUIWorkflowService:
         cancel_event=None,
         skip_leverage_set: bool = False,
         skip_spread_check: bool = False,
-        skip_spread_recheck_after_first: bool = False,
     ) -> Dict[str, Any]:
         balance_before = {}
         for exchange in [long_exchange, short_exchange]:
@@ -533,7 +532,7 @@ class GUIWorkflowService:
             size,
             leverage,
             split_count=split_count,
-            delay_between_splits=2.0,
+            delay_between_splits=5.0,
             price_spread_min=price_spread_min,
             spread_check_interval=2.0,
             max_wait_per_split=3600.0,
@@ -542,7 +541,6 @@ class GUIWorkflowService:
             skip_leverage_set=skip_leverage_set,
             cancel_event=cancel_event,
             skip_spread_check=skip_spread_check,
-            skip_spread_recheck_after_first=skip_spread_recheck_after_first,
         )
         result["balance_before"] = balance_before
         return result
@@ -639,9 +637,9 @@ class GUIWorkflowService:
                 mode="close",
             )
             if analyze_result.get("success"):
-                threshold = analyze_result["second_best_spread"]
+                threshold = analyze_result["avg_spread"]
                 if log_callback:
-                    log_callback(f"✅ Analyze done. Threshold = {threshold:.4f}%")
+                    log_callback(f"✅ Analyze done. Threshold (avg spread) = {threshold:.4f}%")
             elif log_callback:
                 log_callback(f"Analyze failed: {analyze_result.get('error')}. Falling back to immediate close threshold.")
 
