@@ -12,7 +12,12 @@ from core.opportunity import (
     build_directional_opportunity,
 )
 from core.session_store import SessionStore
-from core.trade_advisor import build_liquidation_context, build_monitor_advice, build_trade_plan
+from core.trade_advisor import (
+    build_liquidation_context,
+    build_liquidation_reduce_policy,
+    build_monitor_advice,
+    build_trade_plan,
+)
 from config.constants import Exchange, get_exchange_symbol, Side
 from config.settings import Settings
 from exchanges.okx_client import OKXClient
@@ -479,6 +484,8 @@ class TradingEngine:
         reduce_ratio: float = RISK_REDUCE_RATIO,
         splits: int = RISK_REDUCE_SPLITS,
         interval_seconds: float = RISK_REDUCE_INTERVAL_SECONDS,
+        policy_mode: str = "risk_reduce",
+        action_label: str = "REDUCE_50",
     ) -> Dict[str, Any]:
         long_ex = _resolve_exchange(long_ex_name)
         short_ex = _resolve_exchange(short_ex_name)
@@ -524,6 +531,9 @@ class TradingEngine:
             }
 
         close_size = current_size * reduce_ratio
+        close_size_param: Optional[float] = close_size
+        if reduce_ratio >= 0.999:
+            close_size_param = None
         if close_size <= 0:
             return {
                 "success": False,
@@ -531,7 +541,7 @@ class TradingEngine:
             }
 
         logger.warning(
-            f"[monitor] Risk reduce triggered on {pair}: close {reduce_ratio*100:.0f}% "
+            f"[monitor] {action_label} triggered on {pair}: close {reduce_ratio*100:.0f}% "
             f"({close_size:.6f} tokens) in {splits} split(s), every {interval_seconds:.1f}s"
         )
         self.session_store.append_journal_event(
@@ -548,6 +558,8 @@ class TradingEngine:
                 "close_size": close_size,
                 "splits": splits,
                 "interval_seconds": interval_seconds,
+                "policy_mode": policy_mode,
+                "action_label": action_label,
             },
         )
 
@@ -561,15 +573,19 @@ class TradingEngine:
             spread_check_interval=2.0,
             progress_callback=lambda _s, _t, message: logger.info(f"   {message}"),
             skip_spread_check=True,
-            close_size=close_size,
+            close_size=close_size_param,
         )
         result.update(
             {
                 "mode": "risk_reduce",
+                "policy_mode": policy_mode,
+                "action_label": action_label,
                 "reduce_ratio": reduce_ratio,
                 "requested_close_size": close_size,
                 "risk_percent": risk_percent,
                 "threshold_percent": threshold_percent,
+                "splits_used": splits,
+                "interval_seconds_used": interval_seconds,
             }
         )
 
@@ -598,6 +614,10 @@ class TradingEngine:
                     "requested_close_size": close_size,
                     "remaining_size_tokens": remaining_sizes["remaining_size"],
                     "result_success": result.get("success", False),
+                    "policy_mode": policy_mode,
+                    "action_label": action_label,
+                    "splits_used": splits,
+                    "interval_seconds_used": interval_seconds,
                 }
                 self.session_store.save_active_session(updated_session)
                 result["session"] = updated_session
@@ -615,6 +635,8 @@ class TradingEngine:
                 "risk_percent": risk_percent,
                 "threshold_percent": threshold_percent,
                 "reduce_ratio": reduce_ratio,
+                "policy_mode": policy_mode,
+                "action_label": action_label,
                 "result": result,
             },
         )
@@ -859,7 +881,11 @@ class TradingEngine:
                     logger.info(f"Close result: {close_result}")
                     break
 
-                if auto_reduce_liq_distance is not None and min_liq_distance_pct is not None and min_liq_distance_pct <= auto_reduce_liq_distance:
+                liq_policy = build_liquidation_reduce_policy(
+                    distance_pct=min_liq_distance_pct,
+                    activation_threshold_pct=auto_reduce_liq_distance,
+                )
+                if liq_policy:
                     cooldown_remaining = self._remaining_risk_reduce_cooldown(active_session or tracked_position)
                     if cooldown_remaining > 0:
                         logger.warning(
@@ -869,7 +895,8 @@ class TradingEngine:
                     else:
                         logger.warning(
                             f"[monitor] Liq distance {min_liq_distance_pct:.2f}% on {nearest_liq_exchange} "
-                            f"<= threshold {auto_reduce_liq_distance}%! Triggering fast both-legs reduce..."
+                            f"<= threshold {auto_reduce_liq_distance}%! "
+                            f"Policy {liq_policy.action_label}: {liq_policy.description}"
                         )
                         reduce_result = await self.reduce_position_on_risk(
                             pair,
@@ -878,6 +905,11 @@ class TradingEngine:
                             risk_percent=risk_pct,
                             threshold_percent=auto_reduce_liq_distance,
                             reason="monitor_liq_distance_threshold",
+                            reduce_ratio=liq_policy.reduce_ratio,
+                            splits=liq_policy.splits,
+                            interval_seconds=liq_policy.interval_seconds,
+                            policy_mode=liq_policy.mode,
+                            action_label=liq_policy.action_label,
                         )
                         logger.info(f"Risk reduce result: {reduce_result}")
                         if reduce_result.get("success"):

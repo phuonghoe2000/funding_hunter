@@ -136,7 +136,7 @@ Examples:
         "--auto-reduce-liq-distance",
         type=float,
         default=None,
-        help="Reduce both legs by 50%% when nearest liquidation distance <= X%%",
+        help="Adaptive liq ladder when nearest liquidation distance <= X%% (50%% / 75%% / flatten)",
     )
     p.add_argument("--auto-close-reversal", action="store_true", help="Auto-close on funding reversal")
     p.add_argument("--auto-close-on-advice", action="store_true", help="Auto-close on CLOSE_NOW or EMERGENCY_CLOSE advice")

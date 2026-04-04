@@ -10,6 +10,7 @@ from typing import Any
 from tkinter import messagebox
 
 from config.constants import Exchange, get_exchange_symbol
+from core.trade_advisor import build_liquidation_reduce_policy
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +112,11 @@ def start_monitoring(app: Any) -> None:
                     except Exception:
                         liq_threshold = 3.0
 
-                    if min_liq_distance is not None and min_liq_distance <= liq_threshold:
+                    liq_policy = build_liquidation_reduce_policy(
+                        distance_pct=min_liq_distance,
+                        activation_threshold_pct=liq_threshold,
+                    )
+                    if liq_policy:
                         cooldown_remaining = 0.0
                         last_reduce_at = _parse_dt(position.get("last_risk_reduce_at"))
                         if last_reduce_at:
@@ -128,7 +133,7 @@ def start_monitoring(app: Any) -> None:
                         else:
                             safe_log(
                                 f"Liq distance {min_liq_distance:.2f}% on {nearest_liq_exchange} "
-                                f"<= threshold {liq_threshold:.1f}% -> reducing both legs by 50%"
+                                f"<= threshold {liq_threshold:.1f}% -> {liq_policy.description}"
                             )
                             reduce_result = await app.service.reduce_position_on_risk(
                                 pair=position["pair"],
@@ -137,6 +142,11 @@ def start_monitoring(app: Any) -> None:
                                 risk_percent=risk_percent,
                                 threshold_percent=liq_threshold,
                                 reason="gui_monitor_liq_distance_threshold",
+                                reduce_ratio=liq_policy.reduce_ratio,
+                                splits=liq_policy.splits,
+                                interval_seconds=liq_policy.interval_seconds,
+                                policy_mode=liq_policy.mode,
+                                action_label=liq_policy.action_label,
                             )
                             if reduce_result.get("success"):
                                 remaining_size = float(reduce_result.get("remaining_size_tokens", position.get("size", 0.0)) or 0.0)
@@ -146,14 +156,14 @@ def start_monitoring(app: Any) -> None:
                                 position["last_risk_reduce_at"] = datetime.now(timezone.utc)
                                 position["risk_reduce_count"] = int(position.get("risk_reduce_count", 0) or 0) + 1
                                 safe_log(
-                                    f"Liq-distance reduce done: remaining size {remaining_size:.6f} | "
+                                    f"{liq_policy.action_label} done: remaining size {remaining_size:.6f} | "
                                     f"count {position['risk_reduce_count']}"
                                 )
                                 app.root.after(
                                     0,
-                                    lambda liq_value=min_liq_distance, threshold=liq_threshold, exchange_name=nearest_liq_exchange: messagebox.showwarning(
+                                    lambda liq_value=min_liq_distance, threshold=liq_threshold, exchange_name=nearest_liq_exchange, policy_label=liq_policy.action_label: messagebox.showwarning(
                                         "Liq Distance Reduce",
-                                        f"Triggered both-legs reduce 50%.\n"
+                                        f"Triggered {policy_label} ladder.\n"
                                         f"Liq distance was {liq_value:.2f}% on {exchange_name} (threshold: {threshold:.1f}%).",
                                     ),
                                 )

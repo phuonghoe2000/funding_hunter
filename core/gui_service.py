@@ -8,7 +8,12 @@ from config.settings import Settings
 from core.multi_exchange import MultiExchangeManager
 from core.opportunity import build_best_opportunity, build_directional_opportunity
 from core.session_store import SessionStore
-from core.trade_advisor import build_liquidation_context, build_monitor_advice, build_trade_plan
+from core.trade_advisor import (
+    build_liquidation_context,
+    build_liquidation_reduce_policy,
+    build_monitor_advice,
+    build_trade_plan,
+)
 from core.trading_engine import TradingEngine
 from exchanges.aster_client import AsterClient
 from exchanges.binance_client import BinanceClient
@@ -585,6 +590,10 @@ class GUIWorkflowService:
             check_result=result,
         )
         liquidation_context = build_liquidation_context(position=position, check_result=result)
+        liquidation_policy = build_liquidation_reduce_policy(
+            distance_pct=liquidation_context.get("min_liquidation_distance_pct"),
+            activation_threshold_pct=3.0,
+        )
 
         return {
             "total_balance": total_balance,
@@ -593,6 +602,7 @@ class GUIWorkflowService:
             "short_pnl": short_pnl,
             "risk_percent": risk_percent,
             "liquidation": liquidation_context,
+            "liquidation_policy": liquidation_policy.to_dict() if liquidation_policy else None,
             "min_liquidation_distance_pct": liquidation_context.get("min_liquidation_distance_pct"),
             "check_result": result,
             "pair_snapshot": snapshot,
@@ -662,14 +672,33 @@ class GUIWorkflowService:
         risk_percent: Optional[float] = None,
         threshold_percent: Optional[float] = None,
         reason: str = "risk_threshold",
+        reduce_ratio: Optional[float] = None,
+        splits: Optional[int] = None,
+        interval_seconds: Optional[float] = None,
+        policy_mode: Optional[str] = None,
+        action_label: Optional[str] = None,
     ) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {
+            "risk_percent": risk_percent,
+            "threshold_percent": threshold_percent,
+            "reason": reason,
+        }
+        if reduce_ratio is not None:
+            kwargs["reduce_ratio"] = reduce_ratio
+        if splits is not None:
+            kwargs["splits"] = splits
+        if interval_seconds is not None:
+            kwargs["interval_seconds"] = interval_seconds
+        if policy_mode is not None:
+            kwargs["policy_mode"] = policy_mode
+        if action_label is not None:
+            kwargs["action_label"] = action_label
+
         return await self.engine.reduce_position_on_risk(
             pair,
             long_exchange.value,
             short_exchange.value,
-            risk_percent=risk_percent,
-            threshold_percent=threshold_percent,
-            reason=reason,
+            **kwargs,
         )
 
     async def _fetch_single_funding_rate(self, client, exchange: Exchange, pair: str, symbol: str):

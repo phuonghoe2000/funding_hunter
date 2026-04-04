@@ -166,6 +166,28 @@ class MonitorAdvice:
         }
 
 
+@dataclass
+class LiquidationReducePolicy:
+    mode: str
+    reduce_ratio: float
+    splits: int
+    interval_seconds: float
+    trigger_distance_pct: float
+    action_label: str
+    description: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "reduce_ratio": self.reduce_ratio,
+            "splits": self.splits,
+            "interval_seconds": self.interval_seconds,
+            "trigger_distance_pct": self.trigger_distance_pct,
+            "action_label": self.action_label,
+            "description": self.description,
+        }
+
+
 def build_trade_plan(
     *,
     pair: str,
@@ -423,6 +445,49 @@ def build_liquidation_context(
     }
 
 
+def build_liquidation_reduce_policy(
+    *,
+    distance_pct: Optional[float],
+    activation_threshold_pct: Optional[float],
+) -> Optional[LiquidationReducePolicy]:
+    if distance_pct is None or activation_threshold_pct is None:
+        return None
+    if distance_pct > activation_threshold_pct:
+        return None
+
+    if distance_pct <= 0.8:
+        return LiquidationReducePolicy(
+            mode="flatten_all",
+            reduce_ratio=1.0,
+            splits=1,
+            interval_seconds=0.0,
+            trigger_distance_pct=distance_pct,
+            action_label="FLATTEN",
+            description="Critical liquidation proximity. Flatten both legs immediately.",
+        )
+
+    if distance_pct <= 1.5:
+        return LiquidationReducePolicy(
+            mode="reduce_75_fast",
+            reduce_ratio=0.75,
+            splits=5,
+            interval_seconds=1.0,
+            trigger_distance_pct=distance_pct,
+            action_label="REDUCE_75",
+            description="Very tight liquidation proximity. Reduce 75% with fast splits.",
+        )
+
+    return LiquidationReducePolicy(
+        mode="reduce_50_default",
+        reduce_ratio=0.5,
+        splits=10,
+        interval_seconds=2.0,
+        trigger_distance_pct=distance_pct,
+        action_label="REDUCE_50",
+        description="Near liquidation threshold. Reduce 50% with standard emergency ladder.",
+    )
+
+
 def build_monitor_advice(
     *,
     position: Dict[str, Any],
@@ -466,11 +531,24 @@ def build_monitor_advice(
         elif min_liq_distance_pct <= 10:
             warnings.insert(0, f"Nearest liquidation distance is {min_liq_distance_pct:.2f}% on {nearest_liq_exchange}.")
 
-    if min_liq_distance_pct is not None and nearest_liq_exchange and min_liq_distance_pct <= 1.0:
+    if min_liq_distance_pct is not None and nearest_liq_exchange and min_liq_distance_pct <= 0.8:
+        return MonitorAdvice(
+            action="EMERGENCY_CLOSE",
+            severity="critical",
+            reason=f"Liquidation proximity is critical at {min_liq_distance_pct:.2f}% on {nearest_liq_exchange}. Flatten immediately.",
+            current_net_edge_pct=current_net_edge_pct,
+            edge_retention_pct=edge_retention_pct,
+            expected_next_cycle_pnl_usd=expected_cycle_pnl,
+            liquidation_distance_pct=min_liq_distance_pct,
+            liquidation_exchange=nearest_liq_exchange,
+            warnings=warnings,
+        )
+
+    if min_liq_distance_pct is not None and nearest_liq_exchange and min_liq_distance_pct <= 1.5:
         return MonitorAdvice(
             action="REDUCE",
             severity="critical",
-            reason=f"Liquidation proximity is critical at {min_liq_distance_pct:.2f}% on {nearest_liq_exchange}. Reduce immediately.",
+            reason=f"Liquidation proximity is critical at {min_liq_distance_pct:.2f}% on {nearest_liq_exchange}. Reduce aggressively (75%) immediately.",
             current_net_edge_pct=current_net_edge_pct,
             edge_retention_pct=edge_retention_pct,
             expected_next_cycle_pnl_usd=expected_cycle_pnl,
@@ -483,7 +561,7 @@ def build_monitor_advice(
         return MonitorAdvice(
             action="REDUCE",
             severity="high",
-            reason=f"Liquidation proximity is tight at {min_liq_distance_pct:.2f}% on {nearest_liq_exchange}. Consider reducing now.",
+            reason=f"Liquidation proximity is tight at {min_liq_distance_pct:.2f}% on {nearest_liq_exchange}. Reduce 50% now.",
             current_net_edge_pct=current_net_edge_pct,
             edge_retention_pct=edge_retention_pct,
             expected_next_cycle_pnl_usd=expected_cycle_pnl,
