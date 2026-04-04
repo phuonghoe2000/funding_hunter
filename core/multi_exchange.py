@@ -1010,7 +1010,8 @@ class MultiExchangeManager:
         on_first_split_complete = None,
         skip_leverage_set: bool = False,
         cancel_event: Optional[threading.Event] = None,
-        skip_spread_check: bool = False
+        skip_spread_check: bool = False,
+        skip_spread_recheck_after_first: bool = False,
     ) -> Dict[str, Any]:
         """
         Open hedged position in multiple splits (DCA style)
@@ -1032,6 +1033,8 @@ class MultiExchangeManager:
             skip_leverage_set: Skip setting leverage (use if leverage already set)
             cancel_event: Optional threading.Event to signal cancellation (thread-safe)
             skip_spread_check: If True, bypass spread checks and execute immediately
+            skip_spread_recheck_after_first: If True, only rely on the initial spread trigger
+                and do not wait again between later splits
         
         Returns:
             Dict with success status and details
@@ -1173,9 +1176,10 @@ class MultiExchangeManager:
                 # Yield to event loop briefly to keep GUI responsive
                 await asyncio.sleep(0.01)
                 
-                # Check spread before each split (except first one which was already checked)
-                # Always check spread regardless of threshold being positive or negative
-                if i > 0:
+                # Check spread before each split after the first unless the caller
+                # already confirmed a live trigger and wants the remaining splits
+                # to execute on cadence without re-waiting.
+                if i > 0 and not skip_spread_recheck_after_first:
                     if skip_spread_check:
                         log_msg(f"⚡ Split {split_num}/{split_count}: Tiến hành ngay (bỏ qua check spread)", force=should_log_this_split)
                     else:
