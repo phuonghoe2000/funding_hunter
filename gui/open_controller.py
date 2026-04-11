@@ -14,6 +14,15 @@ from config.constants import calculate_break_even
 logger = logging.getLogger(__name__)
 
 
+def _parse_split_interval_seconds(raw_value: str) -> float:
+    interval = float(raw_value)
+    if interval < 0:
+        raise ValueError("Split interval cannot be negative")
+    if interval > 3600:
+        raise ValueError("Split interval cannot exceed 3600 seconds")
+    return interval
+
+
 def open_position(app: Any) -> None:
     """Open a hedged position after validation and optional spread analysis."""
     if not app.connected:
@@ -35,13 +44,14 @@ def open_position(app: Any) -> None:
         size = float(app.size_entry.get())
         leverage = int(app.leverage_var.get())
         split_count = int(app.split_count_var.get())
+        split_interval_seconds = _parse_split_interval_seconds(app.split_interval_var.get())
         if split_count < 1:
             split_count = 1
         elif split_count > 1000:
             messagebox.showerror("Error", "Split count cannot exceed 1000")
             return
     except ValueError:
-        messagebox.showerror("Error", "Invalid size, leverage, or split count")
+        messagebox.showerror("Error", "Invalid size, leverage, split count, or split interval")
         return
 
     long_exchange = app._get_exchange_enum(long_exchange_name)
@@ -55,6 +65,7 @@ def open_position(app: Any) -> None:
         "size": size,
         "leverage": leverage,
         "split_count": split_count,
+        "split_interval_seconds": split_interval_seconds,
         "skip_leverage": app.skip_leverage_var.get(),
         "skip_spread_check": app.skip_spread_check_var.get(),
     }
@@ -90,7 +101,8 @@ def _format_pretrade_message(params: dict[str, Any], trade_plan: dict[str, Any] 
         )
         return (
             f"Open {params['pair']}?\n\n"
-            f"Size: {params['size']} tokens | Leverage: {params['leverage']}x | Splits: {params['split_count']}\n"
+            f"Size: {params['size']} tokens | Leverage: {params['leverage']}x | "
+            f"Splits: {params['split_count']} | Interval: {params['split_interval_seconds']:.1f}s\n"
             f"LONG: {params['long_ex_name']} | SHORT: {params['short_ex_name']}\n\n"
             f"Fees + slippage: ~{break_even['total_cost_pct']:.3f}%\n"
             f"Est. cost: ~${break_even['total_cost_usd']:.2f}\n"
@@ -103,7 +115,7 @@ def _format_pretrade_message(params: dict[str, Any], trade_plan: dict[str, Any] 
         f"Open {params['pair']}?",
         "",
         f"Requested size: {params['size']:.6f} tokens",
-        f"Leverage: {params['leverage']}x | Splits: {params['split_count']}",
+        f"Leverage: {params['leverage']}x | Splits: {params['split_count']} | Interval: {params['split_interval_seconds']:.1f}s",
         f"LONG: {params['long_ex_name']} | SHORT: {params['short_ex_name']}",
         "",
         f"Quality score: {trade_plan['quality_score']:.1f}/100 -> {trade_plan['recommendation']}",
@@ -133,27 +145,65 @@ def _format_pretrade_message(params: dict[str, Any], trade_plan: dict[str, Any] 
 
 def _begin_open_workflow(app: Any, params: dict[str, Any]) -> None:
     app._stop_all_background_tasks()
+    app.open_btn.configure(text="Checking readiness...", state=tk.DISABLED)
+    app._log(f"Running open preflight for {params['pair']}...")
 
-    skip_spread_check = params.get("skip_spread_check", False)
-    params["price_spread_min"] = -100.0 if skip_spread_check else None
-    params.setdefault("spread_check_count", 0)
-    app.price_spread_params = params
+    async def do_preflight():
+        return await app.service.preflight_open_execution(
+            pair=params["pair"],
+            long_exchange=params["long_ex"],
+            short_exchange=params["short_ex"],
+            requested_size_tokens=params["size"],
+            leverage=params["leverage"],
+        )
 
-    if skip_spread_check:
-        app._log(f"Skip spread analysis, opening {params['pair']} immediately...")
-        app._log(f"   LONG: {params['long_ex_name']} | SHORT: {params['short_ex_name']}")
-        app.waiting_for_price_spread = True
-        app.open_btn.configure(text="Opening... (Cancel)", state=tk.NORMAL)
-        app._check_price_spread_and_open()
-        return
+    future = app._run_async(do_preflight())
+    if future:
+        future.add_done_callback(lambda completed: on_open_preflight_complete(app, completed, params))
+    else:
+        reset_open_button(app)
 
-    app.analyzing_spread = True
-    app.analyze_cancel_event = threading.Event()
-    app.open_btn.configure(text="Analyzing... (Cancel)", state=tk.NORMAL)
-    app._log(f"Starting 2-minute spread analysis for {params['pair']}...")
-    app._log(f"   LONG: {params['long_ex_name']} | SHORT: {params['short_ex_name']}")
-    app._run_async(app.manager.subscribe_market_data(params["pair"], params["long_ex"], params["short_ex"]))
-    app._start_analyze_for_open()
+
+def on_open_preflight_complete(app: Any, future: Any, params: dict[str, Any]) -> None:
+    def update_ui() -> None:
+        try:
+            preflight = future.result(timeout=1.0)
+            if not preflight.get("ready"):
+                error_message = "\n".join(preflight.get("blockers", [])) or "Open preflight failed."
+                app._log(f"Open preflight failed: {error_message}")
+                reset_open_button(app)
+                messagebox.showerror("Open Preflight Failed", error_message)
+                return
+
+            for warning in preflight.get("warnings", []):
+                app._log(f"Open preflight warning: {warning}")
+
+            skip_spread_check = params.get("skip_spread_check", False)
+            params["price_spread_min"] = -100.0 if skip_spread_check else None
+            params.setdefault("spread_check_count", 0)
+            app.price_spread_params = params
+
+            if skip_spread_check:
+                app._log(f"Skip spread analysis, opening {params['pair']} immediately...")
+                app._log(f"   LONG: {params['long_ex_name']} | SHORT: {params['short_ex_name']}")
+                app.waiting_for_price_spread = True
+                app.open_btn.configure(text="Opening... (Cancel)", state=tk.NORMAL)
+                app._check_price_spread_and_open()
+                return
+
+            app.analyzing_spread = True
+            app.analyze_cancel_event = threading.Event()
+            app.open_btn.configure(text="Analyzing... (Cancel)", state=tk.NORMAL)
+            app._log(f"Starting 2-minute spread analysis for {params['pair']}...")
+            app._log(f"   LONG: {params['long_ex_name']} | SHORT: {params['short_ex_name']}")
+            app._run_async(app.manager.subscribe_market_data(params["pair"], params["long_ex"], params["short_ex"]))
+            app._start_analyze_for_open()
+        except Exception as exc:
+            reset_open_button(app)
+            app._log(f"Open preflight error: {exc}")
+            messagebox.showerror("Open Preflight Error", str(exc))
+
+    app.root.after(0, update_ui)
 
 
 def on_open_assessment_complete(app: Any, future: Any, params: dict[str, Any]) -> None:
@@ -247,12 +297,17 @@ def on_analyze_for_open_complete(app: Any, future: Any) -> None:
                 reset_open_button(app)
                 return
 
-            avg_spread = result["avg_spread"]
-            app.price_spread_params["price_spread_min"] = avg_spread
+            threshold_spread = result.get("second_best_spread")
+            if threshold_spread is None:
+                threshold_spread = result.get("best_spread")
+            if threshold_spread is None:
+                raise ValueError("Analyze result missing second_best_spread")
+
+            app.price_spread_params["price_spread_min"] = threshold_spread
             app.price_spread_threshold.delete(0, tk.END)
-            app.price_spread_threshold.insert(0, f"{avg_spread:.4f}")
-            app._log(f"Analyze done. Threshold (avg spread) = {avg_spread:.4f}%")
-            app._log(f"Waiting for spread >= {avg_spread:.4f}% before opening...")
+            app.price_spread_threshold.insert(0, f"{threshold_spread:.4f}")
+            app._log(f"Analyze done. Threshold (second-best spread) = {threshold_spread:.4f}%")
+            app._log(f"Waiting for spread >= {threshold_spread:.4f}% before opening...")
             app.open_btn.configure(text="Waiting... (Cancel)")
             app.waiting_for_price_spread = True
             app._check_price_spread_and_open()
@@ -348,7 +403,8 @@ async def service_check_and_open(app: Any, params: dict[str, Any], safe_log) -> 
     safe_log(f"Price spread {price_spread_pct:.4f}% >= {current_threshold:.4f}%, opening position.")
     safe_log(
         f"Opening: {params['pair']} | Long {params['long_ex_name']} | "
-        f"Short {params['short_ex_name']} | Size: {params['size']} | Splits: {split_count}"
+        f"Short {params['short_ex_name']} | Size: {params['size']} | "
+        f"Splits: {split_count} | Interval: {params.get('split_interval_seconds', 2.0):.1f}s"
     )
 
     app.split_cancel_event = threading.Event()
@@ -369,6 +425,7 @@ async def service_check_and_open(app: Any, params: dict[str, Any], safe_log) -> 
         cancel_event=app.split_cancel_event,
         skip_leverage_set=params.get("skip_leverage", False),
         skip_spread_check=params.get("skip_spread_check", False),
+        split_interval_seconds=params.get("split_interval_seconds", 2.0),
     )
     app.split_cancel_event = None
     app.balance_before_open = result.get("balance_before", {})
@@ -423,8 +480,24 @@ def on_price_spread_check_complete(app: Any, future: Any) -> None:
 
                 splits_completed = result.get("splits_completed", 1)
                 splits_total = result.get("splits_total", 1)
-                app._log(f"Position opened successfully! ({splits_completed}/{splits_total} splits completed)")
                 total_size = result.get("total_long_size", params["size"])
+                execution_error = result.get("error")
+                full_success = splits_completed >= splits_total and not execution_error
+
+                if full_success:
+                    app._log(f"Position opened successfully! ({splits_completed}/{splits_total} splits completed)")
+                else:
+                    warning_message = execution_error or "Split execution stopped early."
+                    app._log(
+                        f"Open stopped after {splits_completed}/{splits_total} splits: {warning_message}"
+                    )
+                    app.root.after(
+                        10,
+                        lambda msg=warning_message, done=splits_completed, total=splits_total: messagebox.showwarning(
+                            "Partial Open",
+                            f"Position only opened {done}/{total} splits.\n\n{msg}",
+                        ),
+                    )
                 app._on_all_splits_complete(params, total_size)
                 logger.debug(
                     "_on_price_spread_check_complete.update_ui: EXIT (called _on_all_splits_complete)"

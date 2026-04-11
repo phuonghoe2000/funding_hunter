@@ -17,6 +17,15 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _parse_split_interval_seconds(raw_value: str) -> float:
+    interval = float(raw_value)
+    if interval < 0:
+        raise ValueError("Split interval cannot be negative")
+    if interval > 3600:
+        raise ValueError("Split interval cannot exceed 3600 seconds")
+    return interval
+
+
 def close_position(app: Any) -> None:
     """Close the active position, optionally after spread analysis."""
     if not app.active_position:
@@ -29,10 +38,12 @@ def close_position(app: Any) -> None:
 
     try:
         splits = int(app.split_count_var.get())
+        split_interval_seconds = _parse_split_interval_seconds(app.split_interval_var.get())
         if splits < 1:
             splits = 1
     except Exception:
-        splits = 1
+        messagebox.showerror("Error", "Invalid split count or split interval")
+        return
 
     skip_spread = app.skip_spread_check_var.get()
 
@@ -60,9 +71,15 @@ def close_position(app: Any) -> None:
         size_info = "Full close: 100% of position"
 
     if skip_spread:
-        confirm_message = f"{size_info}\nSplits: {splits}\nSkip spread check and close immediately."
+        confirm_message = (
+            f"{size_info}\nSplits: {splits} | Interval: {split_interval_seconds:.1f}s\n"
+            "Skip spread check and close immediately."
+        )
     else:
-        confirm_message = f"{size_info}\nSplits: {splits}\nAnalyze spread for 2 minutes first."
+        confirm_message = (
+            f"{size_info}\nSplits: {splits} | Interval: {split_interval_seconds:.1f}s\n"
+            "Analyze spread for 2 minutes first."
+        )
 
     if not messagebox.askyesno("Confirm Close", confirm_message):
         return
@@ -95,6 +112,7 @@ def close_position(app: Any) -> None:
         "long_exchange": position["long_exchange"],
         "short_exchange": position["short_exchange"],
         "splits": splits,
+        "split_interval_seconds": split_interval_seconds,
         "skip_spread_check": skip_spread,
         "close_size": close_size,
     }
@@ -154,6 +172,7 @@ def execute_close_workflow(app: Any) -> None:
             long_exchange=params["long_exchange"],
             short_exchange=params["short_exchange"],
             splits=params["splits"],
+            split_interval_seconds=params.get("split_interval_seconds", 2.0),
             log_callback=lambda msg: app.root.after(0, lambda m=msg: app._log(m)),
             cancel_event=app.close_cancel_event,
             skip_spread_check=params.get("skip_spread_check", False),
@@ -168,6 +187,7 @@ def execute_close_workflow(app: Any) -> None:
 def on_close_complete(app: Any, future: Any) -> None:
     """Handle close completion and refresh UI state."""
     closed_position = app.active_position.copy() if app.active_position else None
+    close_params = dict(app.close_params or {})
 
     def update_ui() -> None:
         app.split_cancel_event = None
@@ -181,24 +201,71 @@ def on_close_complete(app: Any, future: Any) -> None:
                 return
 
             if result["success"]:
-                app._log("Position closed successfully!")
-                app._stop_monitoring()
-                if closed_position:
+                remaining_state = result.get("remaining_position_state") or {}
+                refreshed_position = remaining_state.get("position")
+                fully_closed = bool(result.get("fully_closed"))
+                execution_error = result.get("error")
+
+                if fully_closed:
+                    app._log("Position closed successfully!")
+                    app._stop_monitoring()
+                    if closed_position:
+                        app.service.record_trade_event(
+                            "position_closed",
+                            {
+                                "session_id": closed_position.get("session_id"),
+                                "position": closed_position,
+                                "close_result": result,
+                            },
+                        )
+                        calculate_and_show_final_pnl(app, closed_position)
+                    app.service.clear_active_position()
+                    app.active_position = None
+                    app._clear_position_display()
+
+                    if getattr(app, "auto_trading_active", False):
+                        app._log("Auto Trading: resuming signal scan...")
+                    return
+
+                if refreshed_position:
+                    app.active_position = refreshed_position
+                    app.service.persist_active_position(app.active_position)
+                    app._update_position_display()
+
+                closed_splits = result.get("closed_splits", 0)
+                total_splits = result.get("splits_total", close_params.get("splits", 1))
+                remaining_size = (refreshed_position or {}).get("size", "?")
+
+                if close_params.get("close_size") is not None and not execution_error:
+                    app._log(f"Partial close completed. Remaining size: {remaining_size}")
                     app.service.record_trade_event(
-                        "position_closed",
+                        "position_partially_closed",
                         {
-                            "session_id": closed_position.get("session_id"),
-                            "position": closed_position,
+                            "session_id": (refreshed_position or closed_position or {}).get("session_id"),
+                            "position": refreshed_position or closed_position,
                             "close_result": result,
                         },
                     )
-                    calculate_and_show_final_pnl(app, closed_position)
-                app.service.clear_active_position()
-                app.active_position = None
-                app._clear_position_display()
-
-                if getattr(app, "auto_trading_active", False):
-                    app._log("Auto Trading: resuming signal scan...")
+                else:
+                    warning_message = execution_error or "Split close stopped before completing all splits."
+                    app._log(
+                        f"Close stopped after {closed_splits}/{total_splits} splits: {warning_message} | Remaining size: {remaining_size}"
+                    )
+                    app.service.record_trade_event(
+                        "position_close_interrupted",
+                        {
+                            "session_id": (refreshed_position or closed_position or {}).get("session_id"),
+                            "position": refreshed_position or closed_position,
+                            "close_result": result,
+                        },
+                    )
+                    app.root.after(
+                        10,
+                        lambda msg=warning_message, done=closed_splits, total=total_splits: messagebox.showwarning(
+                            "Partial Close",
+                            f"Only closed {done}/{total} splits.\n\n{msg}",
+                        ),
+                    )
             else:
                 app._log(f"Close failed: {result.get('error', 'Unknown error')}")
         except Exception as exc:

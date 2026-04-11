@@ -405,6 +405,149 @@ class GUIWorkflowService:
             "balances": live_balances,
         }
 
+    async def preflight_open_execution(
+        self,
+        *,
+        pair: str,
+        long_exchange: Exchange,
+        short_exchange: Exchange,
+        requested_size_tokens: float,
+        leverage: int,
+    ) -> Dict[str, Any]:
+        blockers: List[str] = []
+        warnings: List[str] = []
+        details: Dict[str, Any] = {
+            "pair": pair,
+            "long_exchange": long_exchange,
+            "short_exchange": short_exchange,
+            "requested_size_tokens": requested_size_tokens,
+            "leverage": leverage,
+        }
+
+        if requested_size_tokens <= 0:
+            blockers.append("Requested size must be greater than zero.")
+
+        long_client = self.manager.clients.get(long_exchange)
+        short_client = self.manager.clients.get(short_exchange)
+        if not long_client:
+            blockers.append(f"{long_exchange.value} is not connected.")
+        if not short_client:
+            blockers.append(f"{short_exchange.value} is not connected.")
+
+        if not blockers:
+            try:
+                spread_snapshot = await self.check_open_spread(pair, long_exchange, short_exchange)
+                details["spread_snapshot"] = spread_snapshot
+            except Exception as exc:
+                blockers.append(f"Order book preflight failed: {exc}")
+
+            try:
+                balances = await self.get_balances_subset(long_exchange, short_exchange)
+                details["balances"] = balances
+                missing_balances = [exchange.value for exchange in [long_exchange, short_exchange] if exchange not in balances]
+                if missing_balances:
+                    blockers.append(f"Balance check failed for: {', '.join(missing_balances)}")
+            except Exception as exc:
+                blockers.append(f"Balance preflight failed: {exc}")
+
+        return {
+            "ready": not blockers,
+            "blockers": blockers,
+            "warnings": warnings,
+            "details": details,
+        }
+
+    async def preflight_close_execution(
+        self,
+        *,
+        pair: str,
+        long_exchange: Exchange,
+        short_exchange: Exchange,
+        close_size: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        blockers: List[str] = []
+        warnings: List[str] = []
+        details: Dict[str, Any] = {
+            "pair": pair,
+            "long_exchange": long_exchange,
+            "short_exchange": short_exchange,
+            "close_size": close_size,
+        }
+
+        long_client = self.manager.clients.get(long_exchange)
+        short_client = self.manager.clients.get(short_exchange)
+        if not long_client:
+            blockers.append(f"{long_exchange.value} is not connected.")
+        if not short_client:
+            blockers.append(f"{short_exchange.value} is not connected.")
+
+        if not blockers:
+            check_result = await self.manager.check_positions(pair, long_exchange, short_exchange)
+            details["check_result"] = check_result
+            long_position = check_result.get("long")
+            short_position = check_result.get("short")
+            long_size = float(getattr(long_position, "size", 0.0) or 0.0)
+            short_size = float(getattr(short_position, "size", 0.0) or 0.0)
+
+            if long_size <= 0 and short_size <= 0:
+                blockers.append("No active positions found to close.")
+            elif close_size is not None:
+                max_closeable = max(long_size, short_size)
+                if max_closeable > 0 and close_size > max_closeable:
+                    warnings.append(
+                        f"Requested close size {close_size:.6f} exceeds current size {max_closeable:.6f}; close will be capped."
+                    )
+
+            try:
+                long_symbol = get_exchange_symbol(pair, long_exchange)
+                short_symbol = get_exchange_symbol(pair, short_exchange)
+                long_book, short_book = await asyncio.wait_for(
+                    asyncio.gather(
+                        long_client.get_order_book(long_symbol, limit=10),
+                        short_client.get_order_book(short_symbol, limit=10),
+                    ),
+                    timeout=10.0,
+                )
+                if not long_book.get("bids"):
+                    blockers.append(f"{long_exchange.value} order book has no bids for close.")
+                if not short_book.get("asks"):
+                    blockers.append(f"{short_exchange.value} order book has no asks for close.")
+                details["order_books_ok"] = not blockers
+            except Exception as exc:
+                blockers.append(f"Order book preflight failed: {exc}")
+
+        return {
+            "ready": not blockers,
+            "blockers": blockers,
+            "warnings": warnings,
+            "details": details,
+        }
+
+    async def refresh_position_state(self, position: Dict[str, Any]) -> Dict[str, Any]:
+        check_result = await self.manager.check_positions(
+            position["pair"],
+            position["long_exchange"],
+            position["short_exchange"],
+        )
+        long_position = check_result.get("long")
+        short_position = check_result.get("short")
+        long_size = float(getattr(long_position, "size", 0.0) or 0.0)
+        short_size = float(getattr(short_position, "size", 0.0) or 0.0)
+        nonzero_sizes = [size for size in [long_size, short_size] if size > 0]
+
+        refreshed = dict(position)
+        refreshed["long_size"] = long_size
+        refreshed["short_size"] = short_size
+        refreshed["size"] = min(nonzero_sizes) if len(nonzero_sizes) >= 2 else (nonzero_sizes[0] if nonzero_sizes else 0.0)
+        refreshed["one_side_missing"] = check_result.get("one_side_missing")
+        refreshed["last_position_refresh"] = datetime.now(timezone.utc)
+
+        return {
+            "has_position": bool(nonzero_sizes),
+            "position": refreshed,
+            "check_result": check_result,
+        }
+
     async def get_initial_position_state(
         self,
         pair: str,
@@ -514,6 +657,7 @@ class GUIWorkflowService:
         cancel_event=None,
         skip_leverage_set: bool = False,
         skip_spread_check: bool = False,
+        split_interval_seconds: float = 2.0,
     ) -> Dict[str, Any]:
         balance_before = {}
         for exchange in [long_exchange, short_exchange]:
@@ -532,7 +676,7 @@ class GUIWorkflowService:
             size,
             leverage,
             split_count=split_count,
-            delay_between_splits=5.0,
+            delay_between_splits=split_interval_seconds,
             price_spread_min=price_spread_min,
             spread_check_interval=2.0,
             max_wait_per_split=3600.0,
@@ -621,9 +765,41 @@ class GUIWorkflowService:
         cancel_event=None,
         skip_spread_check: bool = False,
         close_size: Optional[float] = None,
+        split_interval_seconds: float = 2.0,
     ) -> Dict[str, Any]:
         threshold = -100.0
         analyze_result = None
+        preflight_result = None
+
+        if log_callback:
+            log_callback("Running close preflight checks...")
+        preflight_result = await self.preflight_close_execution(
+            pair=pair,
+            long_exchange=long_exchange,
+            short_exchange=short_exchange,
+            close_size=close_size,
+        )
+        if not preflight_result.get("ready"):
+            error_message = " | ".join(preflight_result.get("blockers", [])) or "Close preflight failed."
+            if log_callback:
+                log_callback(f"Close preflight failed: {error_message}")
+            return {
+                "success": False,
+                "error": error_message,
+                "preflight_result": preflight_result,
+                "fully_closed": False,
+                "remaining_position_state": await self.refresh_position_state(
+                    {
+                        "pair": pair,
+                        "long_exchange": long_exchange,
+                        "short_exchange": short_exchange,
+                    }
+                ),
+            }
+
+        if log_callback:
+            for warning in preflight_result.get("warnings", []):
+                log_callback(f"Close preflight warning: {warning}")
 
         if not skip_spread_check:
             analyze_result = await self.manager.analyze_spread(
@@ -651,7 +827,7 @@ class GUIWorkflowService:
             long_exchange,
             short_exchange,
             splits=splits,
-            interval_seconds=2.0,
+            interval_seconds=split_interval_seconds,
             price_spread_min=threshold,
             spread_check_interval=2.0,
             progress_callback=(lambda split_num, total_splits, message: log_callback(f"   {message}")) if log_callback else None,
@@ -661,6 +837,27 @@ class GUIWorkflowService:
         )
         result["analyze_result"] = analyze_result
         result["price_spread_min"] = threshold
+        result["preflight_result"] = preflight_result
+        try:
+            remaining_position_state = await self.refresh_position_state(
+                {
+                    "pair": pair,
+                    "long_exchange": long_exchange,
+                    "short_exchange": short_exchange,
+                }
+            )
+        except Exception as exc:
+            remaining_position_state = {
+                "has_position": True,
+                "position": {
+                    "pair": pair,
+                    "long_exchange": long_exchange,
+                    "short_exchange": short_exchange,
+                },
+                "check_result": {"error": str(exc)},
+            }
+        result["remaining_position_state"] = remaining_position_state
+        result["fully_closed"] = not remaining_position_state.get("has_position", True)
         return result
 
     async def reduce_position_on_risk(

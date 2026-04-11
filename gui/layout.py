@@ -247,6 +247,11 @@ def create_trading_frame(app: Any, parent: tk.Widget) -> None:
     app.split_count_entry = ttk.Entry(settings_frame, textvariable=app.split_count_var, width=5)
     app.split_count_entry.pack(side=tk.LEFT, padx=5)
 
+    ttk.Label(settings_frame, text="Split Interval (s):").pack(side=tk.LEFT, padx=10)
+    app.split_interval_var = tk.StringVar(value="2.0")
+    app.split_interval_entry = ttk.Entry(settings_frame, textvariable=app.split_interval_var, width=6)
+    app.split_interval_entry.pack(side=tk.LEFT, padx=5)
+
     ex_frame = ttk.LabelFrame(frame, text="Select Exchanges for Arbitrage", padding="10")
     ex_frame.pack(fill=tk.X, pady=10)
 
