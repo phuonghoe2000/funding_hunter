@@ -19,6 +19,10 @@ DISPLAY_NAME_BY_EXCHANGE = {
 EXCHANGE_BY_DISPLAY_NAME = {name: exchange for exchange, name in DISPLAY_NAME_BY_EXCHANGE.items()}
 DISPLAY_NAME_BY_VALUE = {exchange.value: name for exchange, name in DISPLAY_NAME_BY_EXCHANGE.items()}
 TRADING_EXCHANGE_OPTIONS = list(DISPLAY_NAME_BY_EXCHANGE.values())
+CASH_CARRY_EXCHANGE_OPTIONS = [
+    DISPLAY_NAME_BY_EXCHANGE[Exchange.BINANCE],
+    DISPLAY_NAME_BY_EXCHANGE[Exchange.ASTERDEX],
+]
 
 
 def to_display_name(exchange: Exchange) -> str:

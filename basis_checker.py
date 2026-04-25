@@ -14,11 +14,6 @@ import json
 import os
 import logging
 
-from config.settings import BinanceConfig, AsterdexConfig
-from config.constants import Side
-from exchanges.binance_client import BinanceClient
-from exchanges.aster_client import AsterClient
-
 logger = logging.getLogger(__name__)
 
 # Public API endpoints (no auth needed)
@@ -37,6 +32,14 @@ CONFIG_FILE = os.path.join(os.path.dirname(__file__), "basis_config.json")
 
 # Default alert threshold
 DEFAULT_ALERT_THRESHOLD = 0.3  # 0.3% basis diff triggers alert
+
+# Auto signal requires funding support with at least this configurable minimum diff
+DEFAULT_MIN_FUNDING_DIFF = 0.0
+MIN_EXEC_BASIS_SIGNAL = 0.5
+AUTO_SIGNAL_COOLDOWN_SECONDS = 300
+MAX_AUTO_SIGNALS_PER_SCAN = 3
+MAX_EXECUTABLE_BASIS_CANDIDATES = 60
+EXECUTABLE_BASIS_CONCURRENCY = 8
 
 
 def load_config():
@@ -209,6 +212,70 @@ async def fetch_order_books(symbol, limit=10):
     return bn_book, as_book
 
 
+async def fetch_order_books_for_symbols(symbols, limit=10, concurrency=8):
+    """Fetch Binance/Aster order books for many symbols with bounded concurrency."""
+    async with aiohttp.ClientSession() as session:
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def fetch_one(symbol, base_url):
+            url = f"{base_url}?symbol={symbol}&limit={limit}"
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    data = await resp.json()
+                    return {
+                        "bids": [(float(p), float(q)) for p, q in data.get("bids", [])],
+                        "asks": [(float(p), float(q)) for p, q in data.get("asks", [])],
+                    }
+            except Exception as e:
+                print(f"Error fetching depth from {base_url} for {symbol}: {e}")
+                return {"bids": [], "asks": []}
+
+        async def fetch_pair(symbol):
+            async with semaphore:
+                bn_book, as_book = await asyncio.gather(
+                    fetch_one(symbol, BINANCE_DEPTH_URL),
+                    fetch_one(symbol, ASTER_DEPTH_URL),
+                )
+                return symbol, bn_book, as_book
+
+        results = await asyncio.gather(*(fetch_pair(symbol) for symbol in symbols), return_exceptions=True)
+
+    books = {}
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        symbol, bn_book, as_book = result
+        books[symbol] = (bn_book, as_book)
+    return books
+
+
+def compute_executable_basis(mark_basis, bn_book, as_book):
+    """Return executable basis details for the direction implied by mark basis."""
+    bn_ask = bn_book["asks"][0][0] if bn_book.get("asks") else 0
+    as_bid = as_book["bids"][0][0] if as_book.get("bids") else 0
+    bn_bid = bn_book["bids"][0][0] if bn_book.get("bids") else 0
+    as_ask = as_book["asks"][0][0] if as_book.get("asks") else 0
+
+    if mark_basis >= 0:
+        exec_basis = ((as_bid - bn_ask) / bn_ask * 100) if bn_ask > 0 else 0
+        directional_exec_basis = exec_basis
+        rec_long, rec_short = "binance", "aster"
+        reference_price = (bn_ask + as_bid) / 2 if bn_ask > 0 and as_bid > 0 else 0
+    else:
+        exec_basis = ((bn_bid - as_ask) / as_ask * 100) if as_ask > 0 else 0
+        directional_exec_basis = -exec_basis
+        rec_long, rec_short = "aster", "binance"
+        reference_price = (as_ask + bn_bid) / 2 if as_ask > 0 and bn_bid > 0 else 0
+
+    return {
+        "exec_basis": exec_basis,
+        "directional_exec_basis": directional_exec_basis,
+        "rec_long": rec_long,
+        "rec_short": rec_short,
+        "reference_price": reference_price,
+    }
+
+
 async def send_telegram_message(bot_token, chat_id, message):
     """Send message via Telegram bot"""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -247,6 +314,8 @@ class BasisCheckerApp:
         self.running = True
         self.sort_col = None
         self.sort_reverse = False
+        self.executable_basis_rows = []
+        self.executable_basis_scan_running = False
 
         # Telegram state
         cfg = load_config()
@@ -256,21 +325,15 @@ class BasisCheckerApp:
         self.alert_threshold = cfg.get("alert_threshold", DEFAULT_ALERT_THRESHOLD)
         self.alerted_symbols = {}  # symbol -> last_alert_time (cooldown 5min)
         self.alert_hit_count = {}  # symbol -> consecutive hit count (alert on 2nd hit)
+        self.alert_scan_running = False
 
-        # Auto trade state
-        self.bn_api_key = cfg.get("bn_api_key", "")
-        self.bn_secret = cfg.get("bn_secret", "")
-        self.as_api_key = cfg.get("as_api_key", "")
-        self.as_secret = cfg.get("as_secret", "")
-        self.max_trade_volume = cfg.get("max_trade_volume", 100)
-        self.per_trade_usdt = cfg.get("per_trade_usdt", 10)
-        self.trade_leverage = cfg.get("trade_leverage", 3)
+        # Auto signal state
         self.min_basis = cfg.get("min_basis", 1.0)
+        self.min_funding_diff = cfg.get("min_funding_diff", DEFAULT_MIN_FUNDING_DIFF)
         self.auto_trade_enabled = False
-        self.auto_trade_exposure = 0.0  # Current open notional exposure
-        self.auto_trade_positions = {}  # symbol -> {entry_basis, rec_long, rec_short, total_notional, layers, entry_time}
-        self.bn_client = None
-        self.as_client = None
+        self.auto_signal_count = 0
+        self.auto_signal_last_sent = {}  # (symbol, long, short) -> last_sent_time
+        self.auto_signal_scan_running = False
 
         self._build_ui()
         self._start_async_loop()
@@ -322,7 +385,7 @@ class BasisCheckerApp:
         table_frame = ttk.LabelFrame(right_frame, text="Top 10 Basis (auto-refresh 10s)")
         table_frame.pack(fill="both", expand=True)
 
-        cols = ("symbol", "binance_price", "aster_price", "diff_pct",
+        cols = ("symbol", "binance_price", "aster_price", "diff_pct", "exec_basis",
                 "bn_funding", "as_funding", "funding_diff")
         self.basis_tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=20)
 
@@ -330,7 +393,8 @@ class BasisCheckerApp:
             "symbol": ("Symbol", 100),
             "binance_price": ("Binance Price", 120),
             "aster_price": ("Aster Price", 120),
-            "diff_pct": ("Diff %", 80),
+            "diff_pct": ("Mark Basis", 90),
+            "exec_basis": ("Exec Basis", 90),
             "bn_funding": ("BN FR/4h", 90),
             "as_funding": ("AS FR/4h", 90),
             "funding_diff": ("FR Diff/4h", 90),
@@ -377,54 +441,39 @@ class BasisCheckerApp:
         self.tg_status = ttk.Label(row2, text="", foreground="gray")
         self.tg_status.pack(side="left", padx=5)
 
-        # Auto Trade config frame
-        trade_frame = ttk.LabelFrame(right_frame, text="Auto Trade (Hedged)")
+        # Auto signal config frame
+        trade_frame = ttk.LabelFrame(right_frame, text="Auto Signal (Hedged)")
         trade_frame.pack(fill="x", padx=0, pady=(5, 0))
 
         tr1 = ttk.Frame(trade_frame)
         tr1.pack(fill="x", padx=5, pady=2)
-        ttk.Label(tr1, text="BN Key:").pack(side="left")
-        self.bn_key_var = tk.StringVar(value=self.bn_api_key)
-        ttk.Entry(tr1, textvariable=self.bn_key_var, width=20, show="*").pack(side="left", padx=2)
-        ttk.Label(tr1, text="Secret:").pack(side="left")
-        self.bn_secret_var = tk.StringVar(value=self.bn_secret)
-        ttk.Entry(tr1, textvariable=self.bn_secret_var, width=20, show="*").pack(side="left", padx=2)
-        ttk.Label(tr1, text="  |  AS Key:").pack(side="left")
-        self.as_key_var = tk.StringVar(value=self.as_api_key)
-        ttk.Entry(tr1, textvariable=self.as_key_var, width=20, show="*").pack(side="left", padx=2)
-        ttk.Label(tr1, text="Secret:").pack(side="left")
-        self.as_secret_var = tk.StringVar(value=self.as_secret)
-        ttk.Entry(tr1, textvariable=self.as_secret_var, width=20, show="*").pack(side="left", padx=2)
+        ttk.Label(
+            tr1,
+            text="Signal only. No order execution. Telegram will receive LONG/SHORT guidance.",
+            foreground="gray",
+        ).pack(side="left")
 
         tr2 = ttk.Frame(trade_frame)
         tr2.pack(fill="x", padx=5, pady=2)
-        ttk.Label(tr2, text="Max Volume:").pack(side="left")
-        self.max_vol_var = tk.StringVar(value=str(self.max_trade_volume))
-        ttk.Entry(tr2, textvariable=self.max_vol_var, width=8).pack(side="left", padx=2)
-        ttk.Label(tr2, text="USDT").pack(side="left")
-        ttk.Label(tr2, text="  Per Trade:").pack(side="left", padx=(10, 0))
-        self.per_trade_var = tk.StringVar(value=str(self.per_trade_usdt))
-        ttk.Entry(tr2, textvariable=self.per_trade_var, width=6).pack(side="left", padx=2)
-        ttk.Label(tr2, text="USDT/side").pack(side="left")
-        ttk.Label(tr2, text="  Lev:").pack(side="left", padx=(5, 0))
-        self.leverage_var = tk.StringVar(value=str(self.trade_leverage))
-        ttk.Entry(tr2, textvariable=self.leverage_var, width=4).pack(side="left", padx=2)
-        ttk.Label(tr2, text="x").pack(side="left")
-        ttk.Label(tr2, text="  Min Basis:").pack(side="left", padx=(5, 0))
+        ttk.Label(tr2, text="Min Basis:").pack(side="left")
         self.min_basis_var = tk.StringVar(value=str(self.min_basis))
         ttk.Entry(tr2, textvariable=self.min_basis_var, width=5).pack(side="left", padx=2)
         ttk.Label(tr2, text="%").pack(side="left")
+        ttk.Label(tr2, text="  Min Funding Diff:").pack(side="left", padx=(10, 0))
+        self.min_funding_diff_var = tk.StringVar(value=str(self.min_funding_diff))
+        ttk.Entry(tr2, textvariable=self.min_funding_diff_var, width=6).pack(side="left", padx=2)
+        ttk.Label(tr2, text="% / 4h").pack(side="left")
         ttk.Button(tr2, text="Save", command=self._save_trade_config).pack(side="left", padx=5)
-        self.auto_trade_btn = ttk.Button(tr2, text="Enable Auto Trade", command=self._toggle_auto_trade)
+        self.auto_trade_btn = ttk.Button(tr2, text="Enable Auto Signal", command=self._toggle_auto_trade)
         self.auto_trade_btn.pack(side="left", padx=5)
 
         tr3 = ttk.Frame(trade_frame)
         tr3.pack(fill="x", padx=5, pady=2)
-        self.trade_status_label = ttk.Label(tr3, text="Status: OFF | Traded: 0 USDT | Positions: 0",
+        self.trade_status_label = ttk.Label(tr3, text="Status: OFF | Signals Sent: 0 | Min Basis: 1.0% | Min Funding Diff: 0.0%",
                                              foreground="gray")
         self.trade_status_label.pack(side="left")
 
-        # Trade log
+        # Signal log
         self.trade_log_text = tk.Text(trade_frame, height=3, font=("Consolas", 9),
                                        wrap="word", state="disabled", bg="#fafafa")
         self.trade_log_text.pack(fill="x", padx=5, pady=(0, 5))
@@ -460,7 +509,7 @@ class BasisCheckerApp:
             self.common_symbols = sorted(binance_set & aster_set)
 
             self._populate_pairs_list()
-            self._update_basis_table()
+            self._refresh_executable_basis_table()
             self._check_alerts()
             self._check_auto_trade()
 
@@ -519,10 +568,7 @@ class BasisCheckerApp:
         as_fr = ast["last_funding"] * 100 * (4 / as_interval)
         return bn_fr, as_fr, as_fr - bn_fr
 
-    def _update_basis_table(self):
-        for item in self.basis_tree.get_children():
-            self.basis_tree.delete(item)
-
+    def _build_funding_aligned_candidates(self):
         rows = []
         for sym in self.common_symbols:
             bn = self.binance_data.get(sym)
@@ -543,6 +589,8 @@ class BasisCheckerApp:
                 continue
 
             bn_fr, as_fr, fr_diff = self._get_normalized_fr(sym)
+            if diff_pct * fr_diff <= 0:
+                continue
 
             ticker = self.tickers_24h.get(sym)
             change_24h = ticker["price_change_pct"] if ticker else 0.0
@@ -559,14 +607,78 @@ class BasisCheckerApp:
                 "funding_diff": fr_diff,
             })
 
+        rows.sort(key=lambda r: abs(r["diff_pct"]), reverse=True)
+        return rows[:MAX_EXECUTABLE_BASIS_CANDIDATES]
+
+    def _refresh_executable_basis_table(self):
+        if self.executable_basis_scan_running:
+            return
+
+        candidates = self._build_funding_aligned_candidates()
+        if not candidates:
+            self.executable_basis_rows = []
+            self._update_basis_table()
+            return
+
+        self.executable_basis_scan_running = True
+        future = self._run_async(self._build_executable_basis_rows(candidates))
+        if future:
+            future.add_done_callback(lambda f: self.root.after(0, lambda: self._on_executable_basis_rows_ready(f)))
+        else:
+            self.executable_basis_scan_running = False
+
+    async def _build_executable_basis_rows(self, candidates):
+        symbols = [row["symbol"] for row in candidates]
+        books_by_symbol = await fetch_order_books_for_symbols(
+            symbols,
+            limit=10,
+            concurrency=EXECUTABLE_BASIS_CONCURRENCY,
+        )
+
+        rows = []
+        for row in candidates:
+            books = books_by_symbol.get(row["symbol"])
+            if not books:
+                continue
+
+            bn_book, as_book = books
+            exec_info = compute_executable_basis(row["diff_pct"], bn_book, as_book)
+            if row["diff_pct"] * exec_info["directional_exec_basis"] <= 0:
+                continue
+
+            enriched = dict(row)
+            enriched.update(exec_info)
+            rows.append(enriched)
+
+        rows.sort(key=lambda r: abs(r["exec_basis"]), reverse=True)
+        return rows
+
+    def _on_executable_basis_rows_ready(self, future):
+        self.executable_basis_scan_running = False
+        try:
+            self.executable_basis_rows = future.result()
+        except Exception as e:
+            self._trade_log(f"Executable basis scan failed: {e}")
+            self.executable_basis_rows = []
+        self._update_basis_table()
+
+    def _update_basis_table(self):
+        for item in self.basis_tree.get_children():
+            self.basis_tree.delete(item)
+
+        rows = list(self.executable_basis_rows)
+
         # Sort
         if self.sort_col:
             try:
-                rows.sort(key=lambda r: r.get(self.sort_col, 0), reverse=self.sort_reverse)
+                if self.sort_col == "exec_basis":
+                    rows.sort(key=lambda r: abs(r.get("exec_basis", 0)), reverse=self.sort_reverse)
+                else:
+                    rows.sort(key=lambda r: r.get(self.sort_col, 0), reverse=self.sort_reverse)
             except TypeError:
                 pass
         else:
-            rows.sort(key=lambda r: abs(r["diff_pct"]), reverse=True)
+            rows.sort(key=lambda r: abs(r["exec_basis"]), reverse=True)
 
         # Show only top 10
         for row in rows[:10]:
@@ -579,20 +691,15 @@ class BasisCheckerApp:
                 fmt = ".6f"
 
             diff_pct = row["diff_pct"]
-            fr_diff = row["funding_diff"]
-            # Same sign = funding supports basis (green), opposite = red
-            if diff_pct * fr_diff > 0:
-                tag = "positive"  # aligned - green
-            elif diff_pct * fr_diff < 0:
-                tag = "negative"  # opposed - red
-            else:
-                tag = "neutral"
+            exec_basis = row["exec_basis"]
+            tag = "positive" if exec_basis > 0 else ("negative" if exec_basis < 0 else "neutral")
 
             values = (
                 row["symbol"],
                 f"{bp:{fmt}}",
                 f"{row['aster_price']:{fmt}}",
                 f"{diff_pct:+.4f}%",
+                f"{exec_basis:+.4f}%",
                 f"{row['bn_funding']:.4f}%",
                 f"{row['as_funding']:.4f}%",
                 f"{row['funding_diff']:+.4f}%",
@@ -609,12 +716,14 @@ class BasisCheckerApp:
         except ValueError:
             self.alert_threshold = DEFAULT_ALERT_THRESHOLD
 
-        save_config({
+        cfg = load_config()
+        cfg.update({
             "telegram_bot_token": self.tg_token,
             "telegram_chat_id": self.tg_chat_id,
             "telegram_enabled": self.tg_enabled,
             "alert_threshold": self.alert_threshold,
         })
+        save_config(cfg)
         self.tg_status.config(text="Saved!", foreground="green")
         self.root.after(3000, lambda: self.tg_status.config(text=""))
 
@@ -648,9 +757,11 @@ class BasisCheckerApp:
         """Check basis diff against threshold and send Telegram alerts"""
         if not self.tg_enabled or not self.tg_token or not self.tg_chat_id:
             return
+        if self.alert_scan_running:
+            return
 
         now = time.time()
-        alerts = []
+        candidates = []
 
         for sym in self.common_symbols:
             bn = self.binance_data.get(sym)
@@ -679,154 +790,137 @@ class BasisCheckerApp:
                 last = self.alerted_symbols.get(sym, 0)
                 if now - last < 300:
                     continue
-                self.alerted_symbols[sym] = now
-                self.alert_hit_count[sym] = 0  # Reset after alert
-
-                direction = "Aster > Binance" if diff_pct > 0 else "Binance > Aster"
-                ticker = self.tickers_24h.get(sym)
-                change_str = f"  24h: {ticker['price_change_pct']:+.1f}%" if ticker else ""
-
-                alerts.append(
-                    f"<b>{sym}</b>  Basis: {diff_pct:+.4f}%\n"
-                    f"  BN: {bn_price}  AS: {as_price}\n"
-                    f"  {direction}{change_str}"
-                )
+                candidates.append((sym, diff_pct, bn_price, as_price))
             else:
                 # Below threshold -> reset hit count
                 self.alert_hit_count.pop(sym, None)
 
+        if candidates:
+            self.alert_scan_running = True
+            future = self._run_async(self._process_alert_candidates(candidates))
+            if future:
+                future.add_done_callback(lambda f: self.root.after(0, lambda: self._on_alert_cycle_done(f)))
+            else:
+                self.alert_scan_running = False
+
+    async def _process_alert_candidates(self, candidates):
+        alerts = []
+        now = time.time()
+
+        for sym, mark_basis, bn_price, as_price in candidates:
+            try:
+                bn_book, as_book = await fetch_order_books(sym)
+                bn_ask = bn_book["asks"][0][0] if bn_book["asks"] else 0
+                as_bid = as_book["bids"][0][0] if as_book["bids"] else 0
+                bn_bid = bn_book["bids"][0][0] if bn_book["bids"] else 0
+                as_ask = as_book["asks"][0][0] if as_book["asks"] else 0
+
+                if mark_basis >= 0:
+                    exec_basis = ((as_bid - bn_ask) / bn_ask * 100) if bn_ask > 0 else 0
+                    directional_exec_basis = exec_basis
+                    direction = "Aster > Binance"
+                else:
+                    exec_basis = ((bn_bid - as_ask) / as_ask * 100) if as_ask > 0 else 0
+                    directional_exec_basis = -exec_basis
+                    direction = "Binance > Aster"
+
+                if mark_basis * directional_exec_basis <= 0:
+                    continue
+                if abs(exec_basis) <= MIN_EXEC_BASIS_SIGNAL:
+                    continue
+
+                self.alerted_symbols[sym] = now
+                self.alert_hit_count[sym] = 0
+
+                ticker = self.tickers_24h.get(sym)
+                change_str = f"  24h: {ticker['price_change_pct']:+.1f}%" if ticker else ""
+                alerts.append(
+                    f"<b>{sym}</b>  Mark basis: {mark_basis:+.4f}%\n"
+                    f"  Exec basis: {exec_basis:+.4f}%\n"
+                    f"  BN: {bn_price}  AS: {as_price}\n"
+                    f"  {direction}{change_str}"
+                )
+            except Exception as e:
+                self._trade_log(f"Alert check error {sym}: {e}")
+
         if alerts:
             header = f"<b>Basis Alert (threshold {self.alert_threshold}%)</b>\n"
-            header += f"Time: {time.strftime('%H:%M:%S')}\n\n"
+            header += f"Exec basis > {MIN_EXEC_BASIS_SIGNAL:.2f}% | Time: {time.strftime('%H:%M:%S')}\n\n"
             msg = header + "\n\n".join(alerts)
-            self._run_async(send_telegram_message(self.tg_token, self.tg_chat_id, msg))
+            await send_telegram_message(self.tg_token, self.tg_chat_id, msg)
+
+    def _on_alert_cycle_done(self, future):
+        self.alert_scan_running = False
+        try:
+            future.result()
+        except Exception as e:
+            self._trade_log(f"Alert cycle failed: {e}")
 
     # ── Auto Trade ─────────────────────────────────────────────
     def _save_trade_config(self):
-        self.bn_api_key = self.bn_key_var.get().strip()
-        self.bn_secret = self.bn_secret_var.get().strip()
-        self.as_api_key = self.as_key_var.get().strip()
-        self.as_secret = self.as_secret_var.get().strip()
-        try:
-            self.max_trade_volume = float(self.max_vol_var.get())
-        except ValueError:
-            self.max_trade_volume = 100
-        try:
-            self.per_trade_usdt = float(self.per_trade_var.get())
-        except ValueError:
-            self.per_trade_usdt = 10
-        try:
-            self.trade_leverage = int(self.leverage_var.get())
-        except ValueError:
-            self.trade_leverage = 3
         try:
             self.min_basis = float(self.min_basis_var.get())
         except ValueError:
             self.min_basis = 1.0
+        try:
+            self.min_funding_diff = abs(float(self.min_funding_diff_var.get()))
+        except ValueError:
+            self.min_funding_diff = DEFAULT_MIN_FUNDING_DIFF
 
         cfg = load_config()
-        cfg.update({
-            "bn_api_key": self.bn_api_key,
-            "bn_secret": self.bn_secret,
-            "as_api_key": self.as_api_key,
-            "as_secret": self.as_secret,
-            "max_trade_volume": self.max_trade_volume,
-            "per_trade_usdt": self.per_trade_usdt,
-            "trade_leverage": self.trade_leverage,
-            "min_basis": self.min_basis,
-        })
+        for legacy_key in [
+            "bn_api_key",
+            "bn_secret",
+            "as_api_key",
+            "as_secret",
+            "max_trade_volume",
+            "per_trade_usdt",
+            "trade_leverage",
+        ]:
+            cfg.pop(legacy_key, None)
+        cfg["min_basis"] = self.min_basis
+        cfg["min_funding_diff"] = self.min_funding_diff
         save_config(cfg)
-        self._trade_log("Config saved")
+        self._trade_log("Signal config saved")
+        self._update_trade_status()
 
     def _toggle_auto_trade(self):
         if self.auto_trade_enabled:
-            # Disable
             self.auto_trade_enabled = False
-            self.auto_trade_btn.config(text="Enable Auto Trade")
-            self._trade_log("Auto trade DISABLED")
+            self.auto_trade_btn.config(text="Enable Auto Signal")
+            self._trade_log("Auto signal DISABLED")
             self._update_trade_status()
-            # Disconnect clients
-            if self.bn_client or self.as_client:
-                self._run_async(self._disconnect_clients())
         else:
-            # Validate keys
-            bn_key = self.bn_key_var.get().strip()
-            bn_sec = self.bn_secret_var.get().strip()
-            as_key = self.as_key_var.get().strip()
-            as_sec = self.as_secret_var.get().strip()
-            if not bn_key or not bn_sec or not as_key or not as_sec:
-                messagebox.showerror("Error", "Fill all API keys before enabling auto trade")
+            if not self.tg_token_var.get().strip() or not self.tg_chatid_var.get().strip():
+                messagebox.showerror("Error", "Fill Telegram bot token and chat ID first.")
                 return
-            try:
-                self.max_trade_volume = float(self.max_vol_var.get())
-            except ValueError:
-                self.max_trade_volume = 100
-            try:
-                self.per_trade_usdt = float(self.per_trade_var.get())
-            except ValueError:
-                self.per_trade_usdt = 10
-            try:
-                self.trade_leverage = int(self.leverage_var.get())
-            except ValueError:
-                self.trade_leverage = 3
             try:
                 self.min_basis = float(self.min_basis_var.get())
             except ValueError:
                 self.min_basis = 1.0
+            try:
+                self.min_funding_diff = abs(float(self.min_funding_diff_var.get()))
+            except ValueError:
+                self.min_funding_diff = DEFAULT_MIN_FUNDING_DIFF
 
-            self.bn_api_key = bn_key
-            self.bn_secret = bn_sec
-            self.as_api_key = as_key
-            self.as_secret = as_sec
-
-            self._trade_log("Connecting to exchanges...")
-            self.auto_trade_btn.config(state=tk.DISABLED)
-            future = self._run_async(self._connect_clients())
-            if future:
-                self.root.after(200, lambda: self._check_connect_result(future))
-
-    async def _connect_clients(self):
-        bn_config = BinanceConfig(api_key=self.bn_api_key, secret_key=self.bn_secret, testnet=False)
-        as_config = AsterdexConfig(api_key=self.as_api_key, secret_key=self.as_secret)
-        self.bn_client = BinanceClient(bn_config)
-        self.as_client = AsterClient(as_config)
-
-        # Create sessions and test connectivity (skip WS)
-        self.bn_client._session = aiohttp.ClientSession()
-        self.as_client._session = aiohttp.ClientSession()
-        bn_bal = await self.bn_client.get_balance()
-        as_bal = await self.as_client.get_balance()
-        return bn_bal, as_bal
-
-    async def _disconnect_clients(self):
-        if self.bn_client and self.bn_client._session:
-            await self.bn_client._session.close()
-            self.bn_client = None
-        if self.as_client and self.as_client._session:
-            await self.as_client._session.close()
-            self.as_client = None
-
-    def _check_connect_result(self, future):
-        if not future.done():
-            self.root.after(200, lambda: self._check_connect_result(future))
-            return
-        self.auto_trade_btn.config(state=tk.NORMAL)
-        try:
-            bn_bal, as_bal = future.result()
+            self._save_tg_config()
+            cfg = load_config()
+            cfg["min_basis"] = self.min_basis
+            cfg["min_funding_diff"] = self.min_funding_diff
+            save_config(cfg)
             self.auto_trade_enabled = True
-            self.auto_trade_btn.config(text="Disable Auto Trade")
-            self._trade_log(f"Connected! BN: {bn_bal.available:.2f} USDT | AS: {as_bal.available:.2f} USDT")
+            self.auto_trade_btn.config(text="Disable Auto Signal")
+            self._trade_log("Auto signal ENABLED")
             self._update_trade_status()
-        except Exception as e:
-            self._trade_log(f"Connection FAILED: {e}")
-            self._run_async(self._disconnect_clients())
 
     def _update_trade_status(self):
         status = "ON" if self.auto_trade_enabled else "OFF"
         color = "#00aa00" if self.auto_trade_enabled else "gray"
-        total_layers = sum(p["layers"] for p in self.auto_trade_positions.values())
         self.trade_status_label.config(
-            text=f"Status: {status} | Exposure: {self.auto_trade_exposure:.0f}/{self.max_trade_volume:.0f} USDT | Pairs: {len(self.auto_trade_positions)} | Layers: {total_layers}",
+            text=(
+                f"Status: {status} | Signals Sent: {self.auto_signal_count} | "
+                f"Min Basis: {self.min_basis:.2f}% | Min Funding Diff: {self.min_funding_diff:.4f}%"
+            ),
             foreground=color
         )
 
@@ -842,13 +936,12 @@ class BasisCheckerApp:
             self.root.after(0, update)
 
     def _check_auto_trade(self):
-        """Check and execute auto trades if conditions are met"""
+        """Check and send Telegram signals if conditions are met."""
         if not self.auto_trade_enabled:
             return
-        if self.auto_trade_exposure >= self.max_trade_volume:
+        if self.auto_signal_scan_running:
             return
 
-        # Find candidates: mark basis > 0.8% AND funding alignment
         candidates = []
         for sym in self.common_symbols:
             bn = self.binance_data.get(sym)
@@ -865,40 +958,33 @@ class BasisCheckerApp:
             if abs(mark_basis) > 10:
                 continue
 
-            # Funding alignment check (normalized to 4h)
             _, _, fr_diff = self._get_normalized_fr(sym)
-            if mark_basis * fr_diff <= 0:
+            funding_aligned = mark_basis * fr_diff > 0
+
+            if not funding_aligned:
+                continue
+            if abs(fr_diff) < self.min_funding_diff:
                 continue
 
-            if abs(mark_basis) < self.min_basis * 0.8:
+            if abs(mark_basis) < self.min_basis:
                 continue
-
-            # If already have position in this symbol, only add if basis is still strong (> 1.2%)
-            if sym in self.auto_trade_positions:
-                existing = self.auto_trade_positions[sym]
-                # Don't add if direction changed
-                if (mark_basis >= 0 and existing["rec_long"] != "binance") or \
-                   (mark_basis < 0 and existing["rec_long"] != "aster"):
-                    continue
-                # Only DCA if basis is still strong
-                if abs(mark_basis) < self.min_basis * 1:
-                    continue
 
             candidates.append((sym, mark_basis, fr_diff))
 
         if not candidates:
             return
 
-        # Sort by mark basis (strongest first)
         candidates.sort(key=lambda x: abs(x[1]), reverse=True)
+        self.auto_signal_scan_running = True
         future = self._run_async(self._process_auto_trade_candidates(candidates))
         if future:
-            future.add_done_callback(lambda f: self.root.after(0, self._update_trade_status))
+            future.add_done_callback(lambda f: self.root.after(0, lambda: self._on_auto_signal_cycle_done(f)))
 
     async def _process_auto_trade_candidates(self, candidates):
-        """Fetch order books and trade if executable basis > 1%"""
+        """Fetch order books and send signal if executable basis is good enough."""
+        signals_sent = 0
         for sym, mark_basis, fr_diff in candidates:
-            if self.auto_trade_exposure >= self.max_trade_volume:
+            if signals_sent >= MAX_AUTO_SIGNALS_PER_SCAN:
                 break
 
             try:
@@ -911,92 +997,88 @@ class BasisCheckerApp:
 
                 if mark_basis >= 0:
                     exec_basis = ((as_bid - bn_ask) / bn_ask * 100) if bn_ask > 0 else 0
+                    directional_exec_basis = exec_basis
                     rec_long, rec_short = "binance", "aster"
                     ref_price = (bn_ask + as_bid) / 2
                 else:
                     exec_basis = ((bn_bid - as_ask) / as_ask * 100) if as_ask > 0 else 0
+                    directional_exec_basis = -exec_basis
                     rec_long, rec_short = "aster", "binance"
                     ref_price = (as_ask + bn_bid) / 2
 
-                if exec_basis < self.min_basis:
+                if mark_basis * directional_exec_basis <= 0:
                     continue
 
-                self._trade_log(f"Signal: {sym} exec_basis={exec_basis:+.4f}% fr_diff={fr_diff*100:+.4f}%")
-                await self._execute_auto_trade(sym, rec_long, rec_short, ref_price, exec_basis)
+                if abs(exec_basis) <= MIN_EXEC_BASIS_SIGNAL:
+                    continue
+
+                sent = await self._send_auto_trade_signal(
+                    symbol=sym,
+                    rec_long=rec_long,
+                    rec_short=rec_short,
+                    mark_basis=mark_basis,
+                    exec_basis=exec_basis,
+                    fr_diff=fr_diff,
+                    reference_price=ref_price,
+                )
+                if sent:
+                    signals_sent += 1
 
             except Exception as e:
                 self._trade_log(f"Error checking {sym}: {e}")
+        return signals_sent
 
-    async def _execute_auto_trade(self, symbol, rec_long, rec_short, price, exec_basis):
-        """Execute hedged auto trade"""
-        per_side = self.per_trade_usdt
-        leverage = self.trade_leverage
-        quantity = per_side / price
+    async def _send_auto_trade_signal(self, symbol, rec_long, rec_short, mark_basis, exec_basis, fr_diff, reference_price):
+        """Send a signal-only Telegram alert for a hedged basis opportunity."""
+        now = time.time()
+        signal_key = (symbol, rec_long, rec_short)
+        last_sent = self.auto_signal_last_sent.get(signal_key, 0)
+        if now - last_sent < AUTO_SIGNAL_COOLDOWN_SECONDS:
+            return False
 
-        # Round quantity using exchange precision
-        precision = self.qty_precisions.get(symbol, 0)
-        quantity = round(quantity, precision)
-        if precision == 0:
-            quantity = int(quantity)
+        venue_bias = "AsterDEX richer than Binance" if mark_basis >= 0 else "Binance richer than AsterDEX"
+        funding_note = (
+            "Funding supports the basis direction and passes the minimum funding diff filter."
+        )
 
-        if quantity <= 0:
-            self._trade_log(f"Skip {symbol}: quantity too small")
-            return
+        self._trade_log(
+            f"Signal {symbol}: LONG {rec_long.upper()} / SHORT {rec_short.upper()} | "
+            f"mark_basis={mark_basis:+.4f}% | exec_basis={exec_basis:+.4f}% | fr_diff={fr_diff:+.4f}%"
+        )
 
-        long_client = self.bn_client if rec_long == "binance" else self.as_client
-        short_client = self.bn_client if rec_short == "binance" else self.as_client
+        msg = (
+            "<b>Basis + Funding Opportunity</b>\n"
+            f"<b>{symbol}</b>\n"
+            f"Long: <b>{rec_long.upper()}</b>\n"
+            f"Short: <b>{rec_short.upper()}</b>\n"
+            f"Mark basis: {mark_basis:+.4f}%\n"
+            f"Executable basis: {exec_basis:+.4f}%\n"
+            f"Min executable basis: {MIN_EXEC_BASIS_SIGNAL:.2f}%\n"
+            f"Funding diff (4h): {fr_diff:+.4f}%\n"
+            f"Min funding diff (4h): {self.min_funding_diff:.4f}%\n"
+            f"Reference price: {reference_price:.6f}\n"
+            f"Min basis: {self.min_basis:.2f}%\n"
+            f"Bias: {venue_bias}\n"
+            f"{funding_note}"
+        )
 
-        is_add = symbol in self.auto_trade_positions
-        action = "ADD" if is_add else "OPEN"
-        self._trade_log(f"{action} {symbol}: LONG {rec_long.upper()} / SHORT {rec_short.upper()} | qty={quantity} | ~{per_side} USDT/side")
+        ok = await send_telegram_message(self.tg_token, self.tg_chat_id, msg)
+        if not ok:
+            self._trade_log(f"Telegram FAILED for {symbol}")
+            return False
 
+        self.auto_signal_last_sent[signal_key] = now
+        self.auto_signal_count += 1
+        self._trade_log(f"Telegram sent for {symbol}")
+        return True
+
+    def _on_auto_signal_cycle_done(self, future):
+        self.auto_signal_scan_running = False
         try:
-            # Set leverage
-            await asyncio.gather(
-                long_client.set_leverage(symbol, leverage),
-                short_client.set_leverage(symbol, leverage)
-            )
-
-            # Place orders concurrently
-            long_order, short_order = await asyncio.gather(
-                long_client.place_market_order(symbol, Side.LONG, quantity),
-                short_client.place_market_order(symbol, Side.SHORT, quantity)
-            )
-
-            added_notional = per_side * 2  # 10 x 2 sides = 20 USDT
-
-            if is_add:
-                # DCA: update existing position
-                info = self.auto_trade_positions[symbol]
-                old_notional = info["total_notional"]
-                info["entry_basis"] = (info["entry_basis"] * old_notional + exec_basis * added_notional) / (old_notional + added_notional)
-                info["total_notional"] += added_notional
-                info["layers"] += 1
-            else:
-                # New position
-                self.auto_trade_positions[symbol] = {
-                    "entry_basis": exec_basis,
-                    "rec_long": rec_long,
-                    "rec_short": rec_short,
-                    "total_notional": added_notional,
-                    "layers": 1,
-                    "entry_time": time.time(),
-                }
-
-            self.auto_trade_exposure += added_notional
-            layers = self.auto_trade_positions[symbol]["layers"]
-            self._trade_log(f"OK {symbol} [L{layers}] | Long: {long_order.filled_size} @ {long_order.avg_price} | Short: {short_order.filled_size} @ {short_order.avg_price}")
-
-            # Telegram notification
-            if self.tg_enabled and self.tg_token and self.tg_chat_id:
-                msg = (f"<b>Auto Trade {action}</b>\n"
-                       f"{symbol} [Layer {layers}]: LONG {rec_long.upper()} / SHORT {rec_short.upper()}\n"
-                       f"Qty: {quantity} | ~{per_side} USDT/side | Lev: x{leverage}\n"
-                       f"Basis: {exec_basis:+.4f}%")
-                await send_telegram_message(self.tg_token, self.tg_chat_id, msg)
-
+            future.result()
         except Exception as e:
-            self._trade_log(f"FAILED {symbol}: {e}")
+            self._trade_log(f"Auto signal cycle failed: {e}")
+        self._update_trade_status()
 
     # ── Auto Close ─────────────────────────────────────────────
     # ── Order Book Detail ─────────────────────────────────────
@@ -1219,8 +1301,6 @@ class BasisCheckerApp:
     def _on_close(self):
         self.running = False
         self.auto_trade_enabled = False
-        if self.bn_client or self.as_client:
-            self._run_async(self._disconnect_clients())
         if self.loop:
             self.loop.call_soon_threadsafe(self.loop.stop)
         self.root.destroy()

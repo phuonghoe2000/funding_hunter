@@ -10,9 +10,9 @@ from tkinter import scrolledtext, ttk
 from config.constants import POPULAR_PAIRS, Exchange
 
 try:
-    from gui.exchange_display import TRADING_EXCHANGE_OPTIONS
+    from gui.exchange_display import CASH_CARRY_EXCHANGE_OPTIONS, TRADING_EXCHANGE_OPTIONS
 except ImportError:
-    from exchange_display import TRADING_EXCHANGE_OPTIONS
+    from exchange_display import CASH_CARRY_EXCHANGE_OPTIONS, TRADING_EXCHANGE_OPTIONS
 
 
 FUNDING_EXCHANGE_COLUMNS = {
@@ -41,31 +41,7 @@ def create_widgets(app: Any) -> None:
     bottom_frame.pack(fill=tk.BOTH, expand=True)
 
     create_position_frame(app, bottom_frame)
-
-    lower_pane = ttk.Panedwindow(bottom_frame, orient=tk.HORIZONTAL)
-    lower_pane.pack(fill=tk.BOTH, expand=True)
-
-    log_container = ttk.Frame(lower_pane, width=760)
-    runtime_container = ttk.Frame(lower_pane, width=430)
-    lower_pane.add(log_container, weight=3)
-    lower_pane.add(runtime_container, weight=2)
-
-    create_log_frame(app, log_container)
-    create_runtime_frame(app, runtime_container)
-
-    def _set_bottom_split() -> None:
-        try:
-            total_width = lower_pane.winfo_width()
-            if total_width <= 1:
-                app.root.after(50, _set_bottom_split)
-                return
-
-            target_width = max(560, min(860, int(total_width * 0.62)))
-            lower_pane.sashpos(0, target_width)
-        except tk.TclError:
-            return
-
-    app.root.after(50, _set_bottom_split)
+    create_log_frame(app, bottom_frame)
 
 
 def create_exchange_frame(app: Any, parent: tk.Widget) -> None:
@@ -214,6 +190,18 @@ def create_trading_frame(app: Any, parent: tk.Widget) -> None:
     app.pair_combo.pack(side=tk.LEFT, padx=5)
     app.pair_combo.bind("<<ComboboxSelected>>", app._on_pair_changed)
 
+    ttk.Label(pair_frame, text="Mode:").pack(side=tk.LEFT, padx=(10, 5))
+    app.trade_mode_var = tk.StringVar(value="Futures Hedge")
+    app.trade_mode_combo = ttk.Combobox(
+        pair_frame,
+        textvariable=app.trade_mode_var,
+        values=["Futures Hedge", "Spot/Future Carry"],
+        width=18,
+        state="readonly",
+    )
+    app.trade_mode_combo.pack(side=tk.LEFT, padx=5)
+    app.trade_mode_combo.bind("<<ComboboxSelected>>", app._on_trade_mode_changed)
+
     app.current_price_label = ttk.Label(pair_frame, text="", foreground="blue")
     app.current_price_label.pack(side=tk.LEFT, padx=10)
 
@@ -255,21 +243,20 @@ def create_trading_frame(app: Any, parent: tk.Widget) -> None:
     ex_frame = ttk.LabelFrame(frame, text="Select Exchanges for Arbitrage", padding="10")
     ex_frame.pack(fill=tk.X, pady=10)
 
-    ttk.Label(ex_frame, text="LONG Exchange:", style="Header.TLabel").grid(
-        row=0, column=0, padx=5, pady=5, sticky="e"
-    )
+    app.long_exchange_label = ttk.Label(ex_frame, text="LONG Exchange:", style="Header.TLabel")
+    app.long_exchange_label.grid(row=0, column=0, padx=5, pady=5, sticky="e")
     app.long_exchange = ttk.Combobox(ex_frame, values=TRADING_EXCHANGE_OPTIONS, width=12, state="readonly")
     app.long_exchange.set("OKX")
     app.long_exchange.grid(row=0, column=1, padx=5, pady=5)
     app.long_exchange.bind("<<ComboboxSelected>>", app._on_exchange_changed)
 
-    ttk.Label(ex_frame, text="SHORT Exchange:", style="Header.TLabel").grid(
-        row=0, column=2, padx=15, pady=5, sticky="e"
-    )
+    app.short_exchange_label = ttk.Label(ex_frame, text="SHORT Exchange:", style="Header.TLabel")
+    app.short_exchange_label.grid(row=0, column=2, padx=15, pady=5, sticky="e")
     app.short_exchange = ttk.Combobox(ex_frame, values=TRADING_EXCHANGE_OPTIONS, width=12, state="readonly")
     app.short_exchange.set("Binance")
     app.short_exchange.grid(row=0, column=3, padx=5, pady=5)
     app.short_exchange.bind("<<ComboboxSelected>>", app._on_exchange_changed)
+    app.cash_carry_exchange_options = list(CASH_CARRY_EXCHANGE_OPTIONS)
 
     funding_info_frame = ttk.LabelFrame(frame, text="📊 Selected Pair Info", padding="10")
     funding_info_frame.pack(fill=tk.X, pady=10)
@@ -364,16 +351,18 @@ def create_trading_frame(app: Any, parent: tk.Widget) -> None:
     )
 
     app.skip_spread_check_var = tk.BooleanVar(value=False)
-    ttk.Checkbutton(
+    app.skip_spread_check_checkbox = ttk.Checkbutton(
         option_frame,
         text="Skip spread check (execute splits immediately)",
         variable=app.skip_spread_check_var,
-    ).pack(anchor=tk.W, pady=2)
+    )
+    app.skip_spread_check_checkbox.pack(anchor=tk.W, pady=2)
 
     threshold_frame = ttk.Frame(option_frame)
     threshold_frame.pack(fill=tk.X, pady=5)
 
-    ttk.Label(threshold_frame, text="Price Spread Min:").pack(side=tk.LEFT)
+    app.price_spread_label = ttk.Label(threshold_frame, text="Price Spread Min:")
+    app.price_spread_label.pack(side=tk.LEFT)
     app.price_spread_threshold = ttk.Entry(threshold_frame, width=8)
     app.price_spread_threshold.insert(0, "0.05")
     app.price_spread_threshold.pack(side=tk.LEFT, padx=3)
@@ -552,44 +541,6 @@ def create_log_frame(app: Any, parent: tk.Widget) -> None:
     app.log_text.pack(fill=tk.BOTH, expand=True)
 
     ttk.Button(frame, text="Clear", command=app._clear_logs).pack(side=tk.RIGHT, pady=5)
-
-
-def create_runtime_frame(app: Any, parent: tk.Widget) -> None:
-    """Create the embedded runtime session/journal panel."""
-    frame = ttk.LabelFrame(parent, text="Runtime", padding="10")
-    frame.pack(fill=tk.BOTH, expand=True, padx=(5, 0))
-
-    toolbar = ttk.Frame(frame)
-    toolbar.pack(fill=tk.X, pady=(0, 8))
-
-    ttk.Button(toolbar, text="Refresh", command=app._refresh_runtime_views).pack(side=tk.LEFT)
-    app.runtime_summary_label = ttk.Label(toolbar, text="No runtime data loaded", foreground="gray")
-    app.runtime_summary_label.pack(side=tk.LEFT, padx=10)
-
-    app.runtime_notebook = ttk.Notebook(frame)
-    app.runtime_notebook.pack(fill=tk.BOTH, expand=True)
-
-    session_frame = ttk.Frame(app.runtime_notebook)
-    app.runtime_notebook.add(session_frame, text="Active Session")
-    app.runtime_session_text = scrolledtext.ScrolledText(
-        session_frame,
-        height=10,
-        wrap="none",
-        font=("Consolas", 9),
-        state=tk.DISABLED,
-    )
-    app.runtime_session_text.pack(fill=tk.BOTH, expand=True)
-
-    journal_frame = ttk.Frame(app.runtime_notebook)
-    app.runtime_notebook.add(journal_frame, text="Trade Journal")
-    app.runtime_journal_text = scrolledtext.ScrolledText(
-        journal_frame,
-        height=10,
-        wrap="none",
-        font=("Consolas", 9),
-        state=tk.DISABLED,
-    )
-    app.runtime_journal_text.pack(fill=tk.BOTH, expand=True)
 
 
 def _create_exchange_tab(

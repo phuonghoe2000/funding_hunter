@@ -27,7 +27,7 @@ class BybitClient(BaseExchangeClient):
         self.base_url = config.base_url
         self._session: Optional[aiohttp.ClientSession] = None
         self.debug = debug
-        self.recv_window = "5000"
+        self.recv_window = "15000"
 
     # ── Connection ────────────────────────────────────────────
 

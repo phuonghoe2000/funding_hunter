@@ -42,7 +42,17 @@ def do_update_usdt_volume(app: Any) -> None:
         app.usdt_vol_label.config(text="≈ $?.?? USDT")
         return
 
+    strategy_mode = app._get_strategy_mode() if hasattr(app, "_get_strategy_mode") else "futures_hedge"
+    preferred_exchange = from_display_name(app.long_exchange.get())
+
     async def get_price():
+        if strategy_mode == "cash_carry" and preferred_exchange:
+            try:
+                spot_client = app.service.cash_carry_engine._get_spot_client(preferred_exchange)
+                symbol = get_exchange_symbol(pair, preferred_exchange)
+                return await spot_client.get_mark_price(symbol)
+            except Exception:
+                pass
         for exchange, client in app.manager.clients.items():
             try:
                 symbol = get_exchange_symbol(pair, exchange)
@@ -84,7 +94,11 @@ def update_pair_info(app: Any) -> None:
     short_display = app.short_exchange.get()
 
     if not long_display or not short_display:
-        app.selected_pair_info.config(text="Please select both LONG and SHORT exchanges", foreground="gray")
+        if hasattr(app, "_get_strategy_mode") and app._get_strategy_mode() == "cash_carry":
+            message = "Please select both SPOT and FUTURE exchanges"
+        else:
+            message = "Please select both LONG and SHORT exchanges"
+        app.selected_pair_info.config(text=message, foreground="gray")
         return
 
     long_exchange = from_display_name(long_display)
@@ -92,7 +106,16 @@ def update_pair_info(app: Any) -> None:
     if not long_exchange or not short_exchange:
         return
 
-    fetch_pair_prices_for_display(app, pair, long_exchange, short_exchange, long_display, short_display)
+    strategy_mode = app._get_strategy_mode() if hasattr(app, "_get_strategy_mode") else "futures_hedge"
+    fetch_pair_prices_for_display(
+        app,
+        pair,
+        long_exchange,
+        short_exchange,
+        long_display,
+        short_display,
+        strategy_mode=strategy_mode,
+    )
 
 
 def fetch_pair_prices_for_display(
@@ -102,18 +125,25 @@ def fetch_pair_prices_for_display(
     short_exchange: Exchange,
     long_display: str,
     short_display: str,
+    *,
+    strategy_mode: str = "futures_hedge",
 ) -> None:
     """Fetch and render snapshot data for the selected pair."""
 
     async def async_get_snapshot():
-        return await app.service.get_pair_snapshot(pair, long_exchange, short_exchange)
+        return await app.service.get_pair_snapshot(
+            pair,
+            long_exchange,
+            short_exchange,
+            strategy_mode=strategy_mode,
+        )
 
     def on_snapshot_complete(future: Any) -> None:
         try:
             snapshot = future.result(timeout=0.1)
             result_data = snapshot.get("result_data", {})
 
-            if len(result_data) < 2:
+            if strategy_mode != "cash_carry" and len(result_data) < 2:
                 app.root.after(
                     0,
                     lambda: app.selected_pair_info.config(

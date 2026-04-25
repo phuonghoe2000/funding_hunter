@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone, timedelta
 
 from core.multi_exchange import MultiExchangeManager
+from core.cash_carry_engine import CashCarryEngine
 from core.opportunity import (
     DEFAULT_SLIPPAGE_PCT,
     DEFAULT_TARGET_HOURS,
@@ -51,12 +52,18 @@ class TradingEngine:
         self.settings = settings
         self.exchange_manager = MultiExchangeManager()
         self.session_store = SessionStore()
+        self.cash_carry_engine = CashCarryEngine(
+            settings,
+            session_store=self.session_store,
+            futures_manager=self.exchange_manager,
+        )
 
     # ------------------------------------------------------------------
     # Connection
     # ------------------------------------------------------------------
     async def initialize(self) -> bool:
         """Connects the enabled exchanges (only those with API keys configured)."""
+        self.cash_carry_engine.attach_future_manager(self.exchange_manager)
         tasks = []
         if self.settings.okx and self.settings.okx.api_key:
             tasks.append(self.exchange_manager.connect_exchange(Exchange.OKX, OKXClient(self.settings.okx)))
@@ -76,10 +83,12 @@ class TradingEngine:
             logger.warning("No exchanges enabled in settings.")
             return False
         results = await asyncio.gather(*tasks)
+        await self.cash_carry_engine.connect_enabled_spot_clients()
         return any(results)
 
     async def shutdown(self):
         await self.exchange_manager.disconnect_all()
+        await self.cash_carry_engine.disconnect_all()
 
     def get_active_session(self) -> Optional[Dict[str, Any]]:
         return self.session_store.load_active_session()
@@ -100,6 +109,22 @@ class TradingEngine:
             session.get("pair") == pair
             and session.get("long_exchange") in (long_ex, long_ex.value)
             and session.get("short_exchange") in (short_ex, short_ex.value)
+        )
+
+    def _carry_session_matches(
+        self,
+        session: Optional[Dict[str, Any]],
+        pair: str,
+        spot_ex: Exchange,
+        future_ex: Exchange,
+    ) -> bool:
+        if not session:
+            return False
+        return (
+            session.get("strategy_type") == "cash_carry"
+            and session.get("pair") == pair
+            and session.get("spot_exchange") in (spot_ex, spot_ex.value)
+            and session.get("future_exchange") in (future_ex, future_ex.value)
         )
 
     @staticmethod
@@ -257,7 +282,224 @@ class TradingEngine:
         active_session = self.get_active_session()
         if active_session:
             status["active_session"] = active_session
+        if self.cash_carry_engine.spot_clients:
+            spot_balances: Dict[str, Dict[str, Any]] = {}
+            for exchange, client in self.cash_carry_engine.spot_clients.items():
+                try:
+                    usdt_balance = await client.get_balance("USDT")
+                    spot_balances[exchange.value] = {
+                        "asset": "USDT",
+                        "available": usdt_balance.available,
+                        "total": usdt_balance.total,
+                    }
+                except Exception as exc:
+                    spot_balances[exchange.value] = {"error": str(exc)}
+            status["spot_balances"] = spot_balances
         return status
+
+    async def get_cash_carry_info(
+        self,
+        pair: str,
+        spot_ex_name: str,
+        future_ex_name: str,
+        *,
+        requested_size_tokens: float = 0.0,
+        leverage: int = 1,
+    ) -> Dict[str, Any]:
+        spot_ex = _resolve_exchange(spot_ex_name)
+        future_ex = _resolve_exchange(future_ex_name)
+        snapshot = await self.cash_carry_engine.get_pair_snapshot(pair, spot_ex, future_ex)
+        trade_plan = self.cash_carry_engine.build_trade_plan_from_snapshot(
+            snapshot,
+            requested_size_tokens=requested_size_tokens,
+            leverage=leverage,
+        )
+        snapshot["trade_plan"] = trade_plan.to_dict()
+        return snapshot
+
+    async def open_cash_carry(
+        self,
+        *,
+        pair: str,
+        spot_ex_name: str,
+        future_ex_name: str,
+        size: float,
+        leverage: int = 3,
+        splits: int = 1,
+        basis_threshold_pct: Optional[float] = None,
+        analyze_duration: float = 120.0,
+        skip_leverage: bool = False,
+        skip_basis_check: bool = False,
+    ) -> Dict[str, Any]:
+        spot_ex = _resolve_exchange(spot_ex_name)
+        future_ex = _resolve_exchange(future_ex_name)
+        session_id = self.session_store.new_session_id()
+        assessment = await self.cash_carry_engine.build_open_assessment(
+            pair=pair,
+            spot_exchange=spot_ex,
+            future_exchange=future_ex,
+            requested_size_tokens=size,
+            leverage=leverage,
+        )
+        trade_plan = assessment.get("trade_plan")
+
+        self.session_store.append_journal_event(
+            "cash_carry_open_requested_cli",
+            {
+                "session_id": session_id,
+                "pair": pair,
+                "spot_exchange": spot_ex,
+                "future_exchange": future_ex,
+                "size": size,
+                "leverage": leverage,
+                "splits": splits,
+                "skip_basis_check": skip_basis_check,
+            },
+        )
+
+        if basis_threshold_pct is None and not skip_basis_check:
+            analyze_result = await self.cash_carry_engine.analyze_basis(
+                pair=pair,
+                spot_exchange=spot_ex,
+                future_exchange=future_ex,
+                duration_seconds=analyze_duration,
+                check_interval=2.0,
+                mode="open",
+                log_callback=lambda m: logger.info(m),
+            )
+            if analyze_result.get("success"):
+                basis_threshold_pct = analyze_result["second_best_basis"]
+                logger.info("Carry analyze done. Threshold (second-best basis) = %.4f%%", basis_threshold_pct)
+            else:
+                basis_threshold_pct = -100.0
+        elif basis_threshold_pct is None:
+            basis_threshold_pct = -100.0
+
+        open_result = await self.cash_carry_engine.execute_open_splits(
+            pair=pair,
+            spot_exchange=spot_ex,
+            future_exchange=future_ex,
+            size=size,
+            leverage=leverage,
+            split_count=splits,
+            basis_threshold_pct=basis_threshold_pct,
+            log_callback=lambda m: logger.info(m),
+            skip_leverage_set=skip_leverage,
+            skip_basis_check=skip_basis_check,
+            split_interval_seconds=2.0,
+        )
+        open_result["trade_plan"] = trade_plan
+        open_result["basis_threshold_pct"] = basis_threshold_pct
+
+        if open_result.get("success") and open_result.get("splits_completed", 0) > 0:
+            opened_size = open_result.get("total_size") or size
+            state = await self.cash_carry_engine.get_initial_position_state(
+                pair=pair,
+                spot_exchange=spot_ex,
+                future_exchange=future_ex,
+                size=opened_size,
+                leverage=leverage,
+                pretrade_assessment=trade_plan,
+                session_id=session_id,
+            )
+            state["entry_result"] = open_result
+            self.session_store.save_active_session(state)
+            self.session_store.append_journal_event("cash_carry_opened_cli", state)
+            open_result["session"] = state
+        else:
+            self.session_store.append_journal_event(
+                "cash_carry_open_failed_cli",
+                {
+                    "session_id": session_id,
+                    "pair": pair,
+                    "spot_exchange": spot_ex,
+                    "future_exchange": future_ex,
+                    "result": open_result,
+                },
+            )
+
+        return open_result
+
+    async def close_cash_carry(
+        self,
+        *,
+        pair: str,
+        spot_ex_name: str,
+        future_ex_name: str,
+        splits: int = 1,
+        basis_threshold_pct: Optional[float] = None,
+        analyze_duration: float = 120.0,
+        skip_basis_check: bool = False,
+        close_size: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        spot_ex = _resolve_exchange(spot_ex_name)
+        future_ex = _resolve_exchange(future_ex_name)
+        active_session = self.get_active_session()
+
+        self.session_store.append_journal_event(
+            "cash_carry_close_requested_cli",
+            {
+                "session_id": active_session.get("session_id") if self._carry_session_matches(active_session, pair, spot_ex, future_ex) else None,
+                "pair": pair,
+                "spot_exchange": spot_ex,
+                "future_exchange": future_ex,
+                "splits": splits,
+                "skip_basis_check": skip_basis_check,
+                "close_size": close_size,
+            },
+        )
+
+        if basis_threshold_pct is None and not skip_basis_check:
+            analyze_result = await self.cash_carry_engine.analyze_basis(
+                pair=pair,
+                spot_exchange=spot_ex,
+                future_exchange=future_ex,
+                duration_seconds=analyze_duration,
+                check_interval=2.0,
+                mode="close",
+                log_callback=lambda m: logger.info(m),
+            )
+            if analyze_result.get("success"):
+                basis_threshold_pct = analyze_result["second_best_basis"]
+                logger.info("Carry analyze done. Threshold (second-best basis) = %.4f%%", basis_threshold_pct)
+            else:
+                basis_threshold_pct = -100.0
+        elif basis_threshold_pct is None:
+            basis_threshold_pct = -100.0
+
+        close_result = await self.cash_carry_engine.close_position_with_analysis(
+            pair=pair,
+            spot_exchange=spot_ex,
+            future_exchange=future_ex,
+            splits=splits,
+            skip_basis_check=skip_basis_check,
+            close_size=close_size,
+            log_callback=lambda m: logger.info(m),
+        )
+        close_result["basis_threshold_pct"] = basis_threshold_pct
+
+        if close_result.get("success") and close_result.get("fully_closed"):
+            if self._carry_session_matches(active_session, pair, spot_ex, future_ex):
+                self.session_store.append_journal_event(
+                    "cash_carry_closed_cli",
+                    {
+                        "session_id": active_session.get("session_id"),
+                        "pair": pair,
+                        "result": close_result,
+                    },
+                )
+                self.session_store.clear_active_session()
+        elif not close_result.get("success"):
+            self.session_store.append_journal_event(
+                "cash_carry_close_failed_cli",
+                {
+                    "session_id": active_session.get("session_id") if self._carry_session_matches(active_session, pair, spot_ex, future_ex) else None,
+                    "pair": pair,
+                    "result": close_result,
+                },
+            )
+
+        return close_result
 
     # ------------------------------------------------------------------
     # 3. Open hedged position (analyze + split entry)
@@ -976,6 +1218,9 @@ class TradingEngine:
                         break
 
                 await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            logger.info("[monitor] Monitoring cancelled.")
+            raise
         except KeyboardInterrupt:
             logger.info("[monitor] Monitoring stopped by user.")
 

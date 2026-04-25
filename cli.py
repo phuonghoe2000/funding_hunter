@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Funding Hunter CLI - Full Feature Parity with GUI
-Commands: scan, status, positions, info, open, close, monitor, pnl, analyze, session, journal
+Commands: scan, status, positions, info, open, close, monitor, pnl, analyze, carry-info, carry-open, carry-close, session, journal
 """
 import asyncio
 import argparse
@@ -67,6 +67,9 @@ Examples:
   python cli.py open --pair BTC/USDT --long gate --short binance --size 100 --leverage 3
   python cli.py close --pair BTC/USDT --long gate --short binance --splits 3
   python cli.py monitor --pair BTC/USDT --long gate --short binance --auto-reduce-risk 10 --auto-reduce-liq-distance 3
+  python cli.py carry-info --pair BTC/USDT --spot binance --future asterdex --size 0.01 --leverage 3
+  python cli.py carry-open --pair BTC/USDT --spot binance --future asterdex --size 0.01 --leverage 3
+  python cli.py carry-close --pair BTC/USDT --spot binance --future asterdex --splits 3
   python cli.py pnl --pair BTC/USDT --long gate --short binance
   python cli.py analyze --pair BTC/USDT --long gate --short binance --duration 120
   python cli.py session
@@ -159,6 +162,35 @@ Examples:
     p.add_argument("--short", required=True, help="Short exchange")
     p.add_argument("--duration", type=float, default=120.0, help="Analysis duration in seconds (default: 120)")
     p.add_argument("--mode", choices=["open", "close"], default="open", help="Analysis mode")
+
+    p = sub.add_parser("carry-info", help="Show spot/futures cash-carry snapshot for Binance/Aster")
+    p.add_argument("--pair", required=True, help="Trading pair (e.g. BTC/USDT)")
+    p.add_argument("--spot", required=True, choices=["binance", "asterdex"], help="Spot exchange")
+    p.add_argument("--future", required=True, choices=["binance", "asterdex"], help="Futures exchange")
+    p.add_argument("--size", type=float, default=0.0, help="Requested token size to evaluate")
+    p.add_argument("--leverage", type=int, default=1, help="Futures leverage for sizing")
+
+    p = sub.add_parser("carry-open", help="Open LONG spot + SHORT futures cash-carry position")
+    p.add_argument("--pair", required=True, help="Trading pair")
+    p.add_argument("--spot", required=True, choices=["binance", "asterdex"], help="Spot exchange")
+    p.add_argument("--future", required=True, choices=["binance", "asterdex"], help="Futures exchange")
+    p.add_argument("--size", type=float, required=True, help="Position size in base asset")
+    p.add_argument("--leverage", type=int, default=3, help="Futures leverage (default: 3)")
+    p.add_argument("--splits", type=int, default=1, help="Number of DCA splits (default: 1)")
+    p.add_argument("--basis-threshold-pct", type=float, default=None, help="Skip analyze and use this entry basis threshold")
+    p.add_argument("--skip-leverage", action="store_true", help="Skip futures leverage setup")
+    p.add_argument("--analyze-duration", type=float, default=120.0, help="Basis analysis duration in seconds")
+    p.add_argument("--skip-basis-check", action="store_true", help="Skip basis analysis and execute splits immediately")
+
+    p = sub.add_parser("carry-close", help="Close LONG spot + SHORT futures cash-carry position")
+    p.add_argument("--pair", required=True, help="Trading pair")
+    p.add_argument("--spot", required=True, choices=["binance", "asterdex"], help="Spot exchange")
+    p.add_argument("--future", required=True, choices=["binance", "asterdex"], help="Futures exchange")
+    p.add_argument("--splits", type=int, default=1, help="Number of close splits (default: 1)")
+    p.add_argument("--basis-threshold-pct", type=float, default=None, help="Skip analyze and use this exit basis threshold")
+    p.add_argument("--analyze-duration", type=float, default=120.0, help="Basis analysis duration in seconds")
+    p.add_argument("--skip-basis-check", action="store_true", help="Skip basis analysis and execute splits immediately")
+    p.add_argument("--close-size", type=float, default=None, help="Optional partial close size in tokens")
 
     sub.add_parser("session", help="Show the currently persisted active session")
 
@@ -363,6 +395,69 @@ async def cmd_analyze(engine, args):
     _json(result)
 
 
+async def cmd_carry_info(engine, args):
+    info = await engine.get_cash_carry_info(
+        args.pair,
+        args.spot,
+        args.future,
+        requested_size_tokens=args.size,
+        leverage=args.leverage,
+    )
+    logger.info(f"\nCash Carry Snapshot: {args.pair}\n{'='*50}")
+    logger.info(f"Spot:   {args.spot}")
+    logger.info(f"Future: {args.future}")
+    logger.info(f"Entry basis: {info.get('open_basis_pct', 0.0):+.4f}%")
+    logger.info(f"Exit basis:  {info.get('close_basis_pct', 0.0):+.4f}%")
+    logger.info(f"Funding:     {info['future']['funding'].funding_rate*100:+.6f}% ({getattr(info['future']['funding'], 'funding_interval_hours', 8)}h)")
+    logger.info(f"Next funding: {info.get('time_until_funding_text', 'N/A')}")
+    trade_plan = info.get("trade_plan") or {}
+    if trade_plan:
+        logger.info("\nTrade Plan:")
+        logger.info(f"  Recommendation:      {trade_plan['recommendation']}")
+        logger.info(f"  Quality Score:       {trade_plan['quality_score']:.1f}/100")
+        logger.info(f"  Entry Basis:         {trade_plan['entry_basis_pct']:+.4f}%")
+        logger.info(f"  Funding Edge (4H):   {trade_plan['funding_edge_pct']:+.4f}%")
+        logger.info(f"  Round-trip Cost:     {trade_plan['round_trip_cost_pct']:.4f}%")
+        logger.info(f"  Net Carry Edge:      {trade_plan['net_carry_edge_pct']:+.4f}%")
+        logger.info(f"  Requested Size:      {trade_plan['requested_size_tokens']:.6f}")
+        logger.info(f"  Suggested Size:      {trade_plan['recommended_size_tokens']:.6f}")
+        logger.info(f"  Expected Next Cycle: ${trade_plan['expected_edge_pnl_next_cycle_usd']:+.2f}")
+        for blocker in trade_plan.get("blockers", []):
+            logger.info(f"  Blocker:             {blocker}")
+        for warning in trade_plan.get("warnings", [])[:3]:
+            logger.info(f"  Warning:             {warning}")
+
+
+async def cmd_carry_open(engine, args):
+    result = await engine.open_cash_carry(
+        pair=args.pair,
+        spot_ex_name=args.spot,
+        future_ex_name=args.future,
+        size=args.size,
+        leverage=args.leverage,
+        splits=args.splits,
+        basis_threshold_pct=args.basis_threshold_pct,
+        analyze_duration=args.analyze_duration,
+        skip_leverage=args.skip_leverage,
+        skip_basis_check=args.skip_basis_check,
+    )
+    _json(result)
+
+
+async def cmd_carry_close(engine, args):
+    result = await engine.close_cash_carry(
+        pair=args.pair,
+        spot_ex_name=args.spot,
+        future_ex_name=args.future,
+        splits=args.splits,
+        basis_threshold_pct=args.basis_threshold_pct,
+        analyze_duration=args.analyze_duration,
+        skip_basis_check=args.skip_basis_check,
+        close_size=args.close_size,
+    )
+    _json(result)
+
+
 async def cmd_session(engine, args):
     session = engine.get_active_session()
     if not session:
@@ -402,6 +497,9 @@ COMMAND_MAP = {
     "monitor": cmd_monitor,
     "pnl": cmd_pnl,
     "analyze": cmd_analyze,
+    "carry-info": cmd_carry_info,
+    "carry-open": cmd_carry_open,
+    "carry-close": cmd_carry_close,
     "session": cmd_session,
     "journal": cmd_journal,
 }

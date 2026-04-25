@@ -60,6 +60,7 @@ def close_position(app: Any) -> None:
             return
 
     position = app.active_position
+    strategy_mode = position.get("strategy_type", app._get_strategy_mode() if hasattr(app, "_get_strategy_mode") else "futures_hedge")
     if close_size is not None:
         total_size = position.get("size", 0) or position.get("long_size", 0) or position.get("short_size", 0)
         if total_size > 0:
@@ -73,12 +74,12 @@ def close_position(app: Any) -> None:
     if skip_spread:
         confirm_message = (
             f"{size_info}\nSplits: {splits} | Interval: {split_interval_seconds:.1f}s\n"
-            "Skip spread check and close immediately."
+            f"Skip {'basis' if strategy_mode == 'cash_carry' else 'spread'} check and close immediately."
         )
     else:
         confirm_message = (
             f"{size_info}\nSplits: {splits} | Interval: {split_interval_seconds:.1f}s\n"
-            "Analyze spread for 2 minutes first."
+            f"Analyze {'basis' if strategy_mode == 'cash_carry' else 'spread'} for 2 minutes first."
         )
 
     if not messagebox.askyesno("Confirm Close", confirm_message):
@@ -115,20 +116,22 @@ def close_position(app: Any) -> None:
         "split_interval_seconds": split_interval_seconds,
         "skip_spread_check": skip_spread,
         "close_size": close_size,
+        "strategy_mode": strategy_mode,
     }
 
-    app._run_async(
-        app.manager.subscribe_market_data(
-            position["pair"],
-            position["long_exchange"],
-            position["short_exchange"],
+    if strategy_mode != "cash_carry":
+        app._run_async(
+            app.manager.subscribe_market_data(
+                position["pair"],
+                position["long_exchange"],
+                position["short_exchange"],
+            )
         )
-    )
 
     if skip_spread:
-        app._log(f"Skipping spread analysis and closing {position['pair']} immediately...")
+        app._log(f"Skipping {'basis' if strategy_mode == 'cash_carry' else 'spread'} analysis and closing {position['pair']} immediately...")
     else:
-        app._log("Starting 2-minute spread analysis for close...")
+        app._log(f"Starting 2-minute {'basis' if strategy_mode == 'cash_carry' else 'spread'} analysis for close...")
 
     execute_close_workflow(app)
 
@@ -177,6 +180,7 @@ def execute_close_workflow(app: Any) -> None:
             cancel_event=app.close_cancel_event,
             skip_spread_check=params.get("skip_spread_check", False),
             close_size=params.get("close_size"),
+            strategy_mode=params.get("strategy_mode", "futures_hedge"),
         )
 
     future = app._run_async(async_close())
@@ -218,7 +222,8 @@ def on_close_complete(app: Any, future: Any) -> None:
                                 "close_result": result,
                             },
                         )
-                        calculate_and_show_final_pnl(app, closed_position)
+                        if closed_position.get("strategy_type") != "cash_carry":
+                            calculate_and_show_final_pnl(app, closed_position)
                     app.service.clear_active_position()
                     app.active_position = None
                     app._clear_position_display()

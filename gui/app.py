@@ -28,7 +28,7 @@ try:
         reset_close_button as controller_reset_close_button,
     )
     from gui.display_formatters import build_funding_table_rows
-    from gui.exchange_display import parse_recommendation_display_names, to_display_name
+    from gui.exchange_display import CASH_CARRY_EXCHANGE_OPTIONS, parse_recommendation_display_names, to_display_name
     from gui.layout import create_funding_board_frame, create_widgets as build_widgets
     from gui.monitor_controller import (
         check_funding_reversal as controller_check_funding_reversal,
@@ -73,7 +73,7 @@ except ImportError:
         reset_close_button as controller_reset_close_button,
     )
     from display_formatters import build_funding_table_rows
-    from exchange_display import parse_recommendation_display_names, to_display_name
+    from exchange_display import CASH_CARRY_EXCHANGE_OPTIONS, parse_recommendation_display_names, to_display_name
     from layout import create_funding_board_frame, create_widgets as build_widgets
     from monitor_controller import (
         check_funding_reversal as controller_check_funding_reversal,
@@ -201,6 +201,7 @@ class FundingHunterGUI:
         
         # State
         self.connected = False
+        self.connected_exchanges: List[str] = []
         self.monitoring = False
         self.active_position = None  # Store active position info
         self.balance_before_open = {}  # Balance of 2 exchanges before opening position
@@ -230,12 +231,12 @@ class FundingHunterGUI:
         # Build UI
         self._create_menu()
         self._create_widgets()
-        self._start_runtime_refresh_loop()
         self._setup_logging()
         self._start_async_loop()
         
         # Load saved config
         self._load_config()
+        self._on_trade_mode_changed()
         
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
     
@@ -250,11 +251,6 @@ class FundingHunterGUI:
         file_menu.add_command(label="📂 Load Config", command=self._load_config)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_closing)
-
-        runtime_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Runtime", menu=runtime_menu)
-        runtime_menu.add_command(label="Session Viewer", command=self._open_runtime_viewer)
-        runtime_menu.add_command(label="Trade Journal", command=lambda: self._open_runtime_viewer(select_tab="journal"))
 
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -502,6 +498,59 @@ class FundingHunterGUI:
             "Bybit": Exchange.BYBIT
         }
         return mapping.get(name, Exchange.OKX)
+
+    def _get_strategy_mode(self) -> str:
+        if getattr(self, "trade_mode_var", None) and self.trade_mode_var.get() == "Spot/Future Carry":
+            return "cash_carry"
+        return "futures_hedge"
+
+    def _get_available_exchange_options(self, strategy_mode: Optional[str] = None) -> List[str]:
+        mode = strategy_mode or self._get_strategy_mode()
+        if mode == "cash_carry":
+            allowed = set(CASH_CARRY_EXCHANGE_OPTIONS)
+            source = self.connected_exchanges or list(CASH_CARRY_EXCHANGE_OPTIONS)
+            filtered = [name for name in source if name in allowed]
+            return filtered or list(CASH_CARRY_EXCHANGE_OPTIONS)
+        return list(self.connected_exchanges or getattr(self.long_exchange, "cget", lambda *_: [])("values") or [])
+
+    def _on_trade_mode_changed(self, event=None):
+        strategy_mode = self._get_strategy_mode()
+        is_carry = strategy_mode == "cash_carry"
+        available = self._get_available_exchange_options(strategy_mode)
+
+        self.long_exchange_label.config(text="Spot Exchange:" if is_carry else "LONG Exchange:")
+        self.short_exchange_label.config(text="Future Exchange:" if is_carry else "SHORT Exchange:")
+        self.open_btn.config(text="Open Spot/Future Carry" if is_carry else "Open Hedged Position")
+        self.close_btn.config(text="Close Carry" if is_carry else "Close Position")
+        self.skip_spread_check_checkbox.config(
+            text="Skip basis check (execute splits immediately)" if is_carry else "Skip spread check (execute splits immediately)"
+        )
+        self.price_spread_label.config(text="Basis Min:" if is_carry else "Price Spread Min:")
+
+        if self.connected:
+            self.long_exchange["values"] = available
+            self.short_exchange["values"] = available
+
+        current_long = self.long_exchange.get()
+        current_short = self.short_exchange.get()
+        if current_long not in available and available:
+            self.long_exchange.set(available[0])
+        if current_short not in available:
+            if len(available) > 1 and not is_carry:
+                self.short_exchange.set(available[1])
+            elif available:
+                self.short_exchange.set(available[0])
+
+        if hasattr(self, "load_pos_btn"):
+            load_state = tk.DISABLED if is_carry or not self.connected else tk.NORMAL
+            self.load_pos_btn.config(state=load_state)
+        if hasattr(self, "load_pairs_btn"):
+            can_load_pairs = self.connected and not is_carry and "Binance" in self.connected_exchanges
+            self.load_pairs_btn.config(state=tk.NORMAL if can_load_pairs else tk.DISABLED)
+
+        if self.connected and not self.active_position:
+            self._update_pair_info()
+            self._update_usdt_volume()
     
     def _connect(self):
         """Connect to exchanges"""
@@ -562,16 +611,23 @@ class FundingHunterGUI:
         """Handle connection complete"""
         try:
             connected, balances = future.result()
-            
-            if len(connected) >= 2:
+            strategy_mode = self._get_strategy_mode()
+            min_required = 1 if strategy_mode == "cash_carry" else 2
+
+            if len(connected) >= min_required:
                 self.connected = True
                 # Use root.after to ensure UI update happens on main thread
                 self.root.after(0, lambda: self._update_ui_connected(connected, balances))
                 self.root.after(0, lambda: self._log(f"Connected to: {', '.join(connected)}"))
             else:
                 self.root.after(0, self._update_ui_disconnected)
-                self.root.after(0, lambda: self._log(f"Need at least 2 exchanges. Connected: {connected}"))
-                self.root.after(0, lambda: messagebox.showerror("Error", "Need at least 2 exchanges connected for arbitrage"))
+                requirement_text = (
+                    "Need at least 1 supported exchange connected for spot/future carry"
+                    if strategy_mode == "cash_carry"
+                    else "Need at least 2 exchanges connected for arbitrage"
+                )
+                self.root.after(0, lambda: self._log(f"{requirement_text}. Connected: {connected}"))
+                self.root.after(0, lambda: messagebox.showerror("Error", requirement_text))
         except Exception as e:
             self.root.after(0, self._update_ui_disconnected)
             self.root.after(0, lambda: self._log(f"Connection error: {e}"))
@@ -579,18 +635,14 @@ class FundingHunterGUI:
     def _update_ui_connected(self, connected, balances):
         """Update UI after connection"""
         self.latest_balances = dict(balances)
+        self.connected_exchanges = list(connected)
         self.status_label.config(text=f"🟢 Connected: {', '.join(connected)}")
         self.connect_btn.config(state=tk.DISABLED)
         self.disconnect_btn.config(state=tk.NORMAL)
         self.open_btn.config(state=tk.NORMAL)
         self.close_btn.config(state=tk.NORMAL)
-        self.load_pos_btn.config(state=tk.NORMAL)
         self.refresh_funding_btn.config(state=tk.NORMAL)
         self.open_funding_board_btn.config(state=tk.NORMAL)
-        
-        # Enable load pairs button if Binance is connected
-        if "Binance" in connected:
-            self.load_pairs_btn.config(state=tk.NORMAL)
         
         # Update balances
         if Exchange.OKX in balances:
@@ -609,15 +661,15 @@ class FundingHunterGUI:
         self._sync_funding_board_columns()
 
         # Update exchange dropdowns
-        available = connected  # Use exchange names directly from connected list
-        self.long_exchange['values'] = available
-        self.short_exchange['values'] = available
+        available = list(connected)
+        self.long_exchange["values"] = available
+        self.short_exchange["values"] = available
         if available:
             self.long_exchange.set(available[0])
-            if len(available) > 1:
-                self.short_exchange.set(available[1])
+            self.short_exchange.set(available[1] if len(available) > 1 else available[0])
 
-        self._refresh_runtime_views()
+        self._on_trade_mode_changed()
+
         if not self.active_position:
             self._attempt_recover_session()
 
@@ -634,6 +686,7 @@ class FundingHunterGUI:
         self.open_funding_board_btn.config(state=tk.DISABLED)
         self.load_pairs_btn.config(state=tk.DISABLED)
         self.connected = False
+        self.connected_exchanges = []
         self._clear_funding_views()
     
     def _disconnect(self):
@@ -751,14 +804,25 @@ class FundingHunterGUI:
                     return
 
                 self.active_position = recovered
+                if recovered.get("strategy_type") == "cash_carry":
+                    self.trade_mode_var.set("Spot/Future Carry")
+                else:
+                    self.trade_mode_var.set("Futures Hedge")
+                self._on_trade_mode_changed()
                 self.pair_combo.set(recovered["pair"])
                 self.long_exchange.set(to_display_name(recovered["long_exchange"]))
                 self.short_exchange.set(to_display_name(recovered["short_exchange"]))
                 self._update_position_display()
-                self._log(
-                    f"Recovered active session: {recovered['pair']} | "
-                    f"LONG {recovered['long_exchange'].value} | SHORT {recovered['short_exchange'].value}"
-                )
+                if recovered.get("strategy_type") == "cash_carry":
+                    self._log(
+                        f"Recovered active carry session: {recovered['pair']} | "
+                        f"SPOT {recovered['spot_exchange'].value} | FUTURE {recovered['future_exchange'].value}"
+                    )
+                else:
+                    self._log(
+                        f"Recovered active session: {recovered['pair']} | "
+                        f"LONG {recovered['long_exchange'].value} | SHORT {recovered['short_exchange'].value}"
+                    )
                 self.service.persist_active_position(self.active_position)
                 self.service.record_trade_event("session_recovered", self.active_position)
                 self._update_pair_info()
@@ -809,7 +873,7 @@ class FundingHunterGUI:
         """Called after ALL splits complete"""
         return controller_on_all_splits_complete(self, params, total_size)
 
-    def _setup_position_tracking(self, pair, long_ex, short_ex, size, *, leverage=1, pretrade_assessment=None, open_time=None):
+    def _setup_position_tracking(self, pair, long_ex, short_ex, size, *, leverage=1, pretrade_assessment=None, open_time=None, strategy_mode="futures_hedge"):
         """Setup position tracking after successful open"""
         async def get_initial_state():
             return await self.service.get_initial_position_state(
@@ -820,6 +884,7 @@ class FundingHunterGUI:
                 leverage=leverage,
                 pretrade_assessment=pretrade_assessment,
                 open_time=open_time,
+                strategy_mode=strategy_mode,
             )
 
         def on_state_ready(fut):
@@ -828,11 +893,18 @@ class FundingHunterGUI:
                     self.active_position = fut.result(timeout=0.1)
                     self.service.persist_active_position(self.active_position)
                     self.service.record_trade_event("position_opened", self.active_position)
-                    self._log(
-                        f"Initial Funding - LONG: {self.active_position['initial_long_rate']*100:.6f}%, "
-                        f"SHORT: {self.active_position['initial_short_rate']*100:.6f}%, "
-                        f"Net: {self.active_position['initial_net_funding']*100:.6f}%"
-                    )
+                    if self.active_position.get("strategy_type") == "cash_carry":
+                        self._log(
+                            f"Initial Carry Funding - SPOT: {self.active_position['spot_exchange'].value}, "
+                            f"FUTURE: {self.active_position['future_exchange'].value}, "
+                            f"Short funding: {self.active_position['initial_short_rate']*100:.6f}%"
+                        )
+                    else:
+                        self._log(
+                            f"Initial Funding - LONG: {self.active_position['initial_long_rate']*100:.6f}%, "
+                            f"SHORT: {self.active_position['initial_short_rate']*100:.6f}%, "
+                            f"Net: {self.active_position['initial_net_funding']*100:.6f}%"
+                        )
                     self._update_position_display()
                 except Exception as e:
                     logger.error(f"Error fetching initial funding: {e}")
@@ -904,9 +976,16 @@ class FundingHunterGUI:
         if self.active_position:
             pos = self.active_position
             self.pos_pair_label.config(text=f"Pair: {pos['pair']}")
-            self.pos_long_label.config(text=f"Long: {pos['long_exchange'].value}")
-            self.pos_short_label.config(text=f"Short: {pos['short_exchange'].value}")
-            self.pos_size_label.config(text=f"Size: {pos['size']}")
+            if pos.get("strategy_type") == "cash_carry":
+                self.pos_long_label.config(text=f"Spot: {pos['spot_exchange'].value}")
+                self.pos_short_label.config(text=f"Future: {pos['future_exchange'].value}")
+                self.pos_size_label.config(
+                    text=f"Size: {pos.get('size', 0):.6f} | Spot {pos.get('spot_size', 0):.6f} | Future {pos.get('future_size', 0):.6f}"
+                )
+            else:
+                self.pos_long_label.config(text=f"Long: {pos['long_exchange'].value}")
+                self.pos_short_label.config(text=f"Short: {pos['short_exchange'].value}")
+                self.pos_size_label.config(text=f"Size: {pos['size']}")
             status_text = "Status: OPEN"
             if pos.get("latest_monitor_advice", {}).get("action"):
                 status_text = f"Status: {pos['latest_monitor_advice']['action']}"
@@ -922,8 +1001,12 @@ class FundingHunterGUI:
     def _clear_position_display(self):
         """Clear position display"""
         self.pos_pair_label.config(text="Pair: -")
-        self.pos_long_label.config(text="Long: -")
-        self.pos_short_label.config(text="Short: -")
+        if self._get_strategy_mode() == "cash_carry":
+            self.pos_long_label.config(text="Spot: -")
+            self.pos_short_label.config(text="Future: -")
+        else:
+            self.pos_long_label.config(text="Long: -")
+            self.pos_short_label.config(text="Short: -")
         self.pos_size_label.config(text="Size: -")
         self.pos_pnl_label.config(text="Risk: 0% | Long: $0 | Short: $0", foreground='black')
         self.pos_status_label.config(text="Status: No Position", foreground='black')
@@ -931,7 +1014,6 @@ class FundingHunterGUI:
         self.monitor_btn.config(text="👁 Start Monitor", state=tk.DISABLED)
         
         self.last_monitor_advice = None
-        self._refresh_runtime_views()
         # Restart pair info update loop when position is closed
         if not self._pair_info_update_task:
             self._update_pair_info()
@@ -1086,9 +1168,16 @@ class FundingHunterGUI:
             parts = parse_recommendation_display_names(recommendation)
             if parts:
                 long_display, short_display = parts
-                self.long_exchange.set(long_display)
-                self.short_exchange.set(short_display)
-                self._log(f"Auto-selected: LONG on {long_display}, SHORT on {short_display}")
+                available = set(self._get_available_exchange_options())
+                if self._get_strategy_mode() == "cash_carry":
+                    if long_display in available and short_display in available:
+                        self.long_exchange.set(long_display)
+                        self.short_exchange.set(short_display)
+                        self._log(f"Auto-selected carry legs: SPOT {long_display}, FUTURE {short_display}")
+                else:
+                    self.long_exchange.set(long_display)
+                    self.short_exchange.set(short_display)
+                    self._log(f"Auto-selected: LONG on {long_display}, SHORT on {short_display}")
 
         self._update_pair_info()
 
@@ -1114,9 +1203,25 @@ class FundingHunterGUI:
         """Update pair information display with real-time prices and timing."""
         return controller_update_pair_info(self)
 
-    def _fetch_pair_prices_for_display(self, pair: str, long_ex: Exchange, short_ex: Exchange, long_display: str, short_display: str):
+    def _fetch_pair_prices_for_display(
+        self,
+        pair: str,
+        long_ex: Exchange,
+        short_ex: Exchange,
+        long_display: str,
+        short_display: str,
+        strategy_mode: Optional[str] = None,
+    ):
         """Fetch real-time prices for the two selected exchanges and update display."""
-        return controller_fetch_pair_prices_for_display(self, pair, long_ex, short_ex, long_display, short_display)
+        return controller_fetch_pair_prices_for_display(
+            self,
+            pair,
+            long_ex,
+            short_ex,
+            long_display,
+            short_display,
+            strategy_mode=strategy_mode or self._get_strategy_mode(),
+        )
 
     def _update_pair_price_info(self, pair: str, recommendation: str = ""):
         """Fetch and display current price information for the selected pair."""

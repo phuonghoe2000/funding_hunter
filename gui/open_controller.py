@@ -35,8 +35,9 @@ def open_position(app: Any) -> None:
     pair = app.pair_combo.get()
     long_exchange_name = app.long_exchange.get()
     short_exchange_name = app.short_exchange.get()
+    strategy_mode = app._get_strategy_mode() if hasattr(app, "_get_strategy_mode") else "futures_hedge"
 
-    if long_exchange_name == short_exchange_name:
+    if strategy_mode != "cash_carry" and long_exchange_name == short_exchange_name:
         messagebox.showerror("Error", "Long and Short exchanges must be different")
         return
 
@@ -68,6 +69,7 @@ def open_position(app: Any) -> None:
         "split_interval_seconds": split_interval_seconds,
         "skip_leverage": app.skip_leverage_var.get(),
         "skip_spread_check": app.skip_spread_check_var.get(),
+        "strategy_mode": strategy_mode,
     }
 
     app.open_btn.configure(text="Assessing...", state=tk.DISABLED)
@@ -80,6 +82,7 @@ def open_position(app: Any) -> None:
             requested_size_tokens=size,
             leverage=leverage,
             balances=app.latest_balances,
+            strategy_mode=strategy_mode,
         )
 
     future = app._run_async(assess_open())
@@ -90,6 +93,7 @@ def open_position(app: Any) -> None:
 
 
 def _format_pretrade_message(params: dict[str, Any], trade_plan: dict[str, Any] | None) -> str:
+    strategy_mode = params.get("strategy_mode", "futures_hedge")
     if not trade_plan:
         break_even = calculate_break_even(
             long_exchange=params["long_ex"],
@@ -111,6 +115,39 @@ def _format_pretrade_message(params: dict[str, Any], trade_plan: dict[str, Any] 
 
     warnings = trade_plan.get("warnings", [])[:3]
     blockers = trade_plan.get("blockers", [])[:2]
+    if strategy_mode == "cash_carry":
+        lines = [
+            f"Open {params['pair']} carry?",
+            "",
+            f"Requested size: {params['size']:.6f} tokens",
+            f"Leverage: {params['leverage']}x | Splits: {params['split_count']} | Interval: {params['split_interval_seconds']:.1f}s",
+            f"SPOT: {params['long_ex_name']} | FUTURE: {params['short_ex_name']}",
+            "",
+            f"Quality score: {trade_plan['quality_score']:.1f}/100 -> {trade_plan['recommendation']}",
+            f"Entry basis: {trade_plan['entry_basis_pct']:.4f}%",
+            f"Funding edge: {trade_plan['funding_edge_pct']:.4f}%",
+            f"Cost (fees+slippage): {trade_plan['round_trip_cost_pct']:.4f}%",
+            f"Net carry edge: {trade_plan['net_carry_edge_pct']:.4f}%",
+            f"Expected next-cycle PnL: ${trade_plan['expected_edge_pnl_next_cycle_usd']:+.2f}",
+            f"Depth ratio: {trade_plan['depth_ratio']:.2f}x",
+            f"Suggested size: {trade_plan['recommended_size_tokens']:.6f} tokens (~${trade_plan['recommended_notional_usd']:.2f})",
+        ]
+
+        funding_window_hours = trade_plan.get("funding_window_hours")
+        if funding_window_hours is not None:
+            lines.append(f"Next funding in: {funding_window_hours:.2f}h")
+
+        if blockers:
+            lines.extend(["", "Blockers:"])
+            lines.extend([f"  - {item}" for item in blockers])
+
+        if warnings:
+            lines.extend(["", "Warnings:"])
+            lines.extend([f"  - {item}" for item in warnings])
+
+        lines.extend(["", "Proceed with basis analysis?"])
+        return "\n".join(lines)
+
     lines = [
         f"Open {params['pair']}?",
         "",
@@ -155,6 +192,7 @@ def _begin_open_workflow(app: Any, params: dict[str, Any]) -> None:
             short_exchange=params["short_ex"],
             requested_size_tokens=params["size"],
             leverage=params["leverage"],
+            strategy_mode=params.get("strategy_mode", "futures_hedge"),
         )
 
     future = app._run_async(do_preflight())
@@ -182,10 +220,14 @@ def on_open_preflight_complete(app: Any, future: Any, params: dict[str, Any]) ->
             params["price_spread_min"] = -100.0 if skip_spread_check else None
             params.setdefault("spread_check_count", 0)
             app.price_spread_params = params
+            metric_name = "basis" if params.get("strategy_mode") == "cash_carry" else "spread"
 
             if skip_spread_check:
-                app._log(f"Skip spread analysis, opening {params['pair']} immediately...")
-                app._log(f"   LONG: {params['long_ex_name']} | SHORT: {params['short_ex_name']}")
+                app._log(f"Skip {metric_name} analysis, opening {params['pair']} immediately...")
+                if params.get("strategy_mode") == "cash_carry":
+                    app._log(f"   SPOT: {params['long_ex_name']} | FUTURE: {params['short_ex_name']}")
+                else:
+                    app._log(f"   LONG: {params['long_ex_name']} | SHORT: {params['short_ex_name']}")
                 app.waiting_for_price_spread = True
                 app.open_btn.configure(text="Opening... (Cancel)", state=tk.NORMAL)
                 app._check_price_spread_and_open()
@@ -194,9 +236,12 @@ def on_open_preflight_complete(app: Any, future: Any, params: dict[str, Any]) ->
             app.analyzing_spread = True
             app.analyze_cancel_event = threading.Event()
             app.open_btn.configure(text="Analyzing... (Cancel)", state=tk.NORMAL)
-            app._log(f"Starting 2-minute spread analysis for {params['pair']}...")
-            app._log(f"   LONG: {params['long_ex_name']} | SHORT: {params['short_ex_name']}")
-            app._run_async(app.manager.subscribe_market_data(params["pair"], params["long_ex"], params["short_ex"]))
+            app._log(f"Starting 2-minute {metric_name} analysis for {params['pair']}...")
+            if params.get("strategy_mode") == "cash_carry":
+                app._log(f"   SPOT: {params['long_ex_name']} | FUTURE: {params['short_ex_name']}")
+            else:
+                app._log(f"   LONG: {params['long_ex_name']} | SHORT: {params['short_ex_name']}")
+                app._run_async(app.manager.subscribe_market_data(params["pair"], params["long_ex"], params["short_ex"]))
             app._start_analyze_for_open()
         except Exception as exc:
             reset_open_button(app)
@@ -268,6 +313,17 @@ def start_analyze_for_open(app: Any) -> None:
         app.root.after(0, lambda text=message: app._log(text))
 
     async def do_analyze():
+        if params.get("strategy_mode") == "cash_carry":
+            return await app.service.cash_carry_engine.analyze_basis(
+                pair=params["pair"],
+                spot_exchange=params["long_ex"],
+                future_exchange=params["short_ex"],
+                duration_seconds=120.0,
+                check_interval=2.0,
+                log_callback=safe_log,
+                cancel_event=app.analyze_cancel_event,
+                mode="open",
+            )
         return await app.manager.analyze_spread(
             params["pair"],
             params["long_ex"],
@@ -297,17 +353,28 @@ def on_analyze_for_open_complete(app: Any, future: Any) -> None:
                 reset_open_button(app)
                 return
 
-            threshold_spread = result.get("second_best_spread")
-            if threshold_spread is None:
-                threshold_spread = result.get("best_spread")
-            if threshold_spread is None:
-                raise ValueError("Analyze result missing second_best_spread")
+            if app.price_spread_params and app.price_spread_params.get("strategy_mode") == "cash_carry":
+                threshold_spread = result.get("second_best_basis")
+                if threshold_spread is None:
+                    threshold_spread = result.get("best_basis")
+                if threshold_spread is None:
+                    raise ValueError("Analyze result missing second_best_basis")
+                metric_name = "basis"
+                threshold_label = "second-best basis"
+            else:
+                threshold_spread = result.get("second_best_spread")
+                if threshold_spread is None:
+                    threshold_spread = result.get("best_spread")
+                if threshold_spread is None:
+                    raise ValueError("Analyze result missing second_best_spread")
+                metric_name = "spread"
+                threshold_label = "second-best spread"
 
             app.price_spread_params["price_spread_min"] = threshold_spread
             app.price_spread_threshold.delete(0, tk.END)
             app.price_spread_threshold.insert(0, f"{threshold_spread:.4f}")
-            app._log(f"Analyze done. Threshold (second-best spread) = {threshold_spread:.4f}%")
-            app._log(f"Waiting for spread >= {threshold_spread:.4f}% before opening...")
+            app._log(f"Analyze done. Threshold ({threshold_label}) = {threshold_spread:.4f}%")
+            app._log(f"Waiting for {metric_name} >= {threshold_spread:.4f}% before opening...")
             app.open_btn.configure(text="Waiting... (Cancel)")
             app.waiting_for_price_spread = True
             app._check_price_spread_and_open()
@@ -360,6 +427,7 @@ async def service_check_and_open(app: Any, params: dict[str, Any], safe_log) -> 
             params["pair"],
             params["long_ex"],
             params["short_ex"],
+            strategy_mode=params.get("strategy_mode", "futures_hedge"),
         )
     except asyncio.TimeoutError:
         safe_log("Timeout fetching order books, retrying...")
@@ -368,9 +436,21 @@ async def service_check_and_open(app: Any, params: dict[str, Any], safe_log) -> 
         safe_log(f"{exc}, retrying...")
         return {"success": False, "waiting": True}
 
-    long_ask_price = spread_data["long_ask_price"]
-    short_bid_price = spread_data["short_bid_price"]
-    price_spread_pct = spread_data["price_spread_pct"]
+    strategy_mode = params.get("strategy_mode", "futures_hedge")
+    if strategy_mode == "cash_carry":
+        long_ask_price = spread_data["spot_ask_price"]
+        short_bid_price = spread_data["future_bid_price"]
+        price_spread_pct = spread_data["entry_basis_pct"]
+        metric_name = "basis"
+        left_label = "SPOT ASK"
+        right_label = "FUTURE BID"
+    else:
+        long_ask_price = spread_data["long_ask_price"]
+        short_bid_price = spread_data["short_bid_price"]
+        price_spread_pct = spread_data["price_spread_pct"]
+        metric_name = "spread"
+        left_label = "LONG ASK"
+        right_label = "SHORT BID"
 
     current_threshold = params.get("price_spread_min", 0)
     check_count = params.get("spread_check_count", 0) + 1
@@ -378,15 +458,15 @@ async def service_check_and_open(app: Any, params: dict[str, Any], safe_log) -> 
 
     if price_spread_pct < 0:
         safe_log(
-            f"Real spread (OI): {price_spread_pct:.4f}% NEGATIVE "
+            f"Real {metric_name} (OI): {price_spread_pct:.4f}% NEGATIVE "
             f"(threshold: {current_threshold:.4f}%) (check {check_count % 30}/30) | "
-            f"LONG ASK: ${long_ask_price:,.6f} | SHORT BID: ${short_bid_price:,.6f}"
+            f"{left_label}: ${long_ask_price:,.6f} | {right_label}: ${short_bid_price:,.6f}"
         )
     else:
         safe_log(
-            f"Real spread (OI): {price_spread_pct:.4f}% "
+            f"Real {metric_name} (OI): {price_spread_pct:.4f}% "
             f"(threshold: {current_threshold:.4f}%) (check {check_count % 30}/30) | "
-            f"LONG ASK: ${long_ask_price:,.6f} | SHORT BID: ${short_bid_price:,.6f}"
+            f"{left_label}: ${long_ask_price:,.6f} | {right_label}: ${short_bid_price:,.6f}"
         )
 
     if price_spread_pct < current_threshold:
@@ -400,12 +480,19 @@ async def service_check_and_open(app: Any, params: dict[str, Any], safe_log) -> 
         return {"success": False, "waiting": True}
 
     split_count = params.get("split_count", 1)
-    safe_log(f"Price spread {price_spread_pct:.4f}% >= {current_threshold:.4f}%, opening position.")
-    safe_log(
-        f"Opening: {params['pair']} | Long {params['long_ex_name']} | "
-        f"Short {params['short_ex_name']} | Size: {params['size']} | "
-        f"Splits: {split_count} | Interval: {params.get('split_interval_seconds', 2.0):.1f}s"
-    )
+    safe_log(f"{metric_name.capitalize()} {price_spread_pct:.4f}% >= {current_threshold:.4f}%, opening position.")
+    if strategy_mode == "cash_carry":
+        safe_log(
+            f"Opening carry: {params['pair']} | Spot {params['long_ex_name']} | "
+            f"Future {params['short_ex_name']} | Size: {params['size']} | "
+            f"Splits: {split_count} | Interval: {params.get('split_interval_seconds', 2.0):.1f}s"
+        )
+    else:
+        safe_log(
+            f"Opening: {params['pair']} | Long {params['long_ex_name']} | "
+            f"Short {params['short_ex_name']} | Size: {params['size']} | "
+            f"Splits: {split_count} | Interval: {params.get('split_interval_seconds', 2.0):.1f}s"
+        )
 
     app.split_cancel_event = threading.Event()
 
@@ -426,6 +513,7 @@ async def service_check_and_open(app: Any, params: dict[str, Any], safe_log) -> 
         skip_leverage_set=params.get("skip_leverage", False),
         skip_spread_check=params.get("skip_spread_check", False),
         split_interval_seconds=params.get("split_interval_seconds", 2.0),
+        strategy_mode=params.get("strategy_mode", "futures_hedge"),
     )
     app.split_cancel_event = None
     app.balance_before_open = result.get("balance_before", {})
@@ -535,6 +623,7 @@ def on_first_split_complete(app: Any, params: dict[str, Any], size_opened: float
             size_opened,
             leverage=params.get("leverage", 1),
             pretrade_assessment=params.get("pretrade_assessment"),
+            strategy_mode=params.get("strategy_mode", "futures_hedge"),
         )
         logger.debug("_on_first_split_complete: EXIT")
     except Exception as exc:

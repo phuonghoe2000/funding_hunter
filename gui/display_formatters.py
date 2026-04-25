@@ -69,6 +69,16 @@ def build_pair_snapshot_display(
     short_display: str,
 ) -> tuple[str, str]:
     """Build the pair snapshot text and status color for the selection panel."""
+    if snapshot.get("strategy_type") == "cash_carry":
+        return build_cash_carry_snapshot_display(
+            pair=pair,
+            snapshot=snapshot,
+            spot_ex=long_ex,
+            future_ex=short_ex,
+            spot_display=long_display,
+            future_display=short_display,
+        )
+
     result_data = snapshot.get("result_data", {})
     funding_rates = snapshot.get("funding_rates", {})
 
@@ -179,6 +189,92 @@ def build_pair_snapshot_display(
                 info_lines.append(f"  - {blocker}")
 
     return "\n".join(info_lines), entry_color
+
+
+def build_cash_carry_snapshot_display(
+    *,
+    pair: str,
+    snapshot: dict[str, Any],
+    spot_ex: Exchange,
+    future_ex: Exchange,
+    spot_display: str,
+    future_display: str,
+) -> tuple[str, str]:
+    spot_data = snapshot.get("spot", {})
+    future_data = snapshot.get("future", {})
+    spot_book = spot_data.get("order_book") or {}
+    future_book = future_data.get("order_book") or {}
+
+    spot_entry = snapshot.get("spot_entry_price", spot_data.get("price", 0.0))
+    future_entry = snapshot.get("future_entry_price", future_data.get("mark_price", 0.0))
+    spot_exit = snapshot.get("spot_exit_price", spot_data.get("price", 0.0))
+    future_exit = snapshot.get("future_exit_price", future_data.get("mark_price", 0.0))
+
+    open_basis_pct = snapshot.get("open_basis_pct", 0.0) or 0.0
+    close_basis_pct = snapshot.get("close_basis_pct", 0.0) or 0.0
+    funding = future_data.get("funding")
+    funding_rate_str = f"{funding.funding_rate * 100:+.6f}%" if funding else "N/A"
+    interval_text = f"{getattr(funding, 'funding_interval_hours', 8)}h" if funding else "N/A"
+
+    if open_basis_pct > 0 and (funding and funding.funding_rate > 0):
+        entry_status = "GOOD - basis and funding support short future"
+        color = "green"
+    elif open_basis_pct > 0:
+        entry_status = "OK - basis supports entry, funding is weak"
+        color = "orange"
+    else:
+        entry_status = "WAIT - futures bid is not above spot ask"
+        color = "red"
+
+    lines = [
+        f"=== {pair} Cash Carry ===",
+        "",
+        f"SPOT   ({spot_display}) BUY  @ ${spot_entry:,.6f}",
+        f"FUTURE ({future_display}) SHORT @ ${future_entry:,.6f}",
+    ]
+    if spot_book.get("asks"):
+        for index, (price, qty) in enumerate(spot_book["asks"][:3], start=1):
+            lines.append(f"  SPOT ASK{index}:   ${price:,.6f} x {qty:.4f}")
+    if future_book.get("bids"):
+        for index, (price, qty) in enumerate(future_book["bids"][:3], start=1):
+            lines.append(f"  FUT BID{index}:    ${price:,.6f} x {qty:.4f}")
+
+    lines.extend(
+        [
+            "",
+            f"Open Basis:  {open_basis_pct:+.4f}% (future bid vs spot ask)",
+            f"Close Basis: {close_basis_pct:+.4f}% (spot bid vs future ask)",
+            f"Funding on {future_display}: {funding_rate_str} ({interval_text})",
+            f"Next Funding: {snapshot.get('time_until_funding_text', 'N/A')}",
+            f"Entry Signal: {entry_status}",
+            "",
+            f"Exit Reference -> Sell spot @ ${spot_exit:,.6f} | Cover future @ ${future_exit:,.6f}",
+        ]
+    )
+
+    trade_plan = snapshot.get("trade_plan")
+    if trade_plan:
+        lines.extend(
+            [
+                "-------------------------",
+                f"Plan: {trade_plan['recommendation']} | Score: {trade_plan['quality_score']:.1f}/100",
+                f"Funding Edge (4H): {trade_plan['funding_edge_pct']:+.4f}%",
+                f"Round-trip Cost:   {trade_plan['round_trip_cost_pct']:.4f}%",
+                f"Net Carry Edge:    {trade_plan['net_carry_edge_pct']:+.4f}%",
+                f"Suggested Size: {trade_plan['recommended_size_tokens']:.6f} (~${trade_plan['recommended_notional_usd']:.2f})",
+                f"Depth Ratio: {trade_plan['depth_ratio']:.2f}x",
+            ]
+        )
+        if trade_plan.get("warnings"):
+            lines.append("Warnings:")
+            for warning in trade_plan["warnings"][:3]:
+                lines.append(f"  - {warning}")
+        if trade_plan.get("blockers"):
+            lines.append("Blockers:")
+            for blocker in trade_plan["blockers"][:2]:
+                lines.append(f"  - {blocker}")
+
+    return "\n".join(lines), color
 
 
 def build_final_pnl_report_lines(result: dict[str, Any]) -> list[str]:

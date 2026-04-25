@@ -14,6 +14,12 @@ class Exchange(Enum):
     BYBIT = "bybit"
 
 
+CASH_CARRY_SUPPORTED_EXCHANGES = (
+    Exchange.BINANCE,
+    Exchange.ASTERDEX,
+)
+
+
 class Side(Enum):
     """Order side"""
     LONG = "long"
@@ -193,6 +199,17 @@ EXCHANGE_FEES = {
     },
 }
 
+SPOT_EXCHANGE_FEES = {
+    Exchange.BINANCE: {
+        "maker": 0.10,
+        "taker": 0.10,
+    },
+    Exchange.ASTERDEX: {
+        "maker": 0.10,
+        "taker": 0.10,
+    },
+}
+
 
 def get_exchange_fee(exchange: Exchange, order_type: str = "taker") -> float:
     """Get trading fee for an exchange
@@ -207,6 +224,16 @@ def get_exchange_fee(exchange: Exchange, order_type: str = "taker") -> float:
     if exchange in EXCHANGE_FEES:
         return EXCHANGE_FEES[exchange].get(order_type, 0.05)
     return 0.05  # Default to 0.05% if unknown
+
+
+def get_spot_exchange_fee(exchange: Exchange, order_type: str = "taker") -> float:
+    """Get spot trading fee for an exchange.
+
+    Values are conservative defaults used for carry planning.
+    """
+    if exchange in SPOT_EXCHANGE_FEES:
+        return SPOT_EXCHANGE_FEES[exchange].get(order_type, 0.10)
+    return 0.10
 
 
 def calculate_break_even(

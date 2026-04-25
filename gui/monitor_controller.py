@@ -43,6 +43,7 @@ def start_monitoring(app: Any) -> None:
         while app.monitoring and app.active_position:
             try:
                 position = app.active_position
+                strategy_type = position.get("strategy_type", "futures_hedge")
                 snapshot = await app.service.build_monitor_snapshot(position)
                 long_pnl = snapshot["long_pnl"]
                 short_pnl = snapshot["short_pnl"]
@@ -60,8 +61,16 @@ def start_monitoring(app: Any) -> None:
                 position["latest_monitor_advice"] = monitor_advice
                 position["latest_liquidation"] = liquidation
 
-                long_exchange_name = position["long_exchange"].value.capitalize()
-                short_exchange_name = position["short_exchange"].value.capitalize()
+                if strategy_type == "cash_carry":
+                    long_exchange_name = position["spot_exchange"].value.capitalize()
+                    short_exchange_name = position["future_exchange"].value.capitalize()
+                    long_label = "Spot"
+                    short_label = "Future"
+                else:
+                    long_exchange_name = position["long_exchange"].value.capitalize()
+                    short_exchange_name = position["short_exchange"].value.capitalize()
+                    long_label = "Long"
+                    short_label = "Short"
 
                 def update_label(
                     risk=risk_percent,
@@ -78,6 +87,11 @@ def start_monitoring(app: Any) -> None:
                         f"Risk: {risk:.2f}% | Long({long_name}): ${long_value:+.2f} | "
                         f"Short({short_name}): ${short_value:+.2f}"
                     )
+                    if strategy_type == "cash_carry":
+                        label_text = (
+                            f"Risk: {risk:.2f}% | {long_label}({long_name}): ${long_value:+.2f} | "
+                            f"{short_label}({short_name}): ${short_value:+.2f}"
+                        )
                     if liq_distance is not None and liq_exchange:
                         label_text += f" | LiqDist({liq_exchange}): {liq_distance:.2f}%"
                     app.pos_pnl_label.config(
@@ -147,12 +161,16 @@ def start_monitoring(app: Any) -> None:
                                 interval_seconds=liq_policy.interval_seconds,
                                 policy_mode=liq_policy.mode,
                                 action_label=liq_policy.action_label,
+                                strategy_type=strategy_type,
                             )
                             if reduce_result.get("success"):
                                 remaining_size = float(reduce_result.get("remaining_size_tokens", position.get("size", 0.0)) or 0.0)
                                 position["size"] = remaining_size
                                 position["long_size"] = float(reduce_result.get("remaining_long_size", position.get("long_size", 0.0)) or 0.0)
                                 position["short_size"] = float(reduce_result.get("remaining_short_size", position.get("short_size", 0.0)) or 0.0)
+                                if strategy_type == "cash_carry":
+                                    position["spot_size"] = position["long_size"]
+                                    position["future_size"] = position["short_size"]
                                 position["last_risk_reduce_at"] = datetime.now(timezone.utc)
                                 position["risk_reduce_count"] = int(position.get("risk_reduce_count", 0) or 0) + 1
                                 safe_log(
@@ -219,12 +237,16 @@ def start_monitoring(app: Any) -> None:
                                 risk_percent=risk_percent,
                                 threshold_percent=effective_threshold,
                                 reason="gui_monitor_risk_threshold",
+                                strategy_type=strategy_type,
                             )
                             if reduce_result.get("success"):
                                 remaining_size = float(reduce_result.get("remaining_size_tokens", position.get("size", 0.0)) or 0.0)
                                 position["size"] = remaining_size
                                 position["long_size"] = float(reduce_result.get("remaining_long_size", position.get("long_size", 0.0)) or 0.0)
                                 position["short_size"] = float(reduce_result.get("remaining_short_size", position.get("short_size", 0.0)) or 0.0)
+                                if strategy_type == "cash_carry":
+                                    position["spot_size"] = position["long_size"]
+                                    position["future_size"] = position["short_size"]
                                 position["last_risk_reduce_at"] = datetime.now(timezone.utc)
                                 position["risk_reduce_count"] = int(position.get("risk_reduce_count", 0) or 0) + 1
                                 safe_log(
@@ -266,6 +288,7 @@ def start_monitoring(app: Any) -> None:
                             splits=splits,
                             log_callback=safe_log,
                             skip_spread_check=True,
+                            strategy_mode=strategy_type,
                         )
                         if close_result.get("success"):
                             safe_log(f"Position auto-closed due to: {reason}")
@@ -336,9 +359,52 @@ async def check_funding_reversal(app: Any, position: dict[str, Any]) -> tuple[bo
         initial_long_rate = position.get("initial_long_rate", 0)
         initial_short_rate = position.get("initial_short_rate", 0)
 
+        pair = position["pair"]
+
+        if position.get("strategy_type") == "cash_carry":
+            future_exchange = position["future_exchange"]
+            future_client = app.manager.clients.get(future_exchange)
+            if not future_client:
+                return False, ""
+
+            symbol = get_exchange_symbol(pair, future_exchange)
+            funding_rate_obj = await future_client.get_funding_rate(symbol)
+            current_short_rate = funding_rate_obj.funding_rate
+            current_net_funding = current_short_rate
+
+            logger.debug(
+                "Carry funding check - Initial short: %.6f%%, Current short: %.6f%%",
+                initial_short_rate * 100,
+                current_short_rate * 100,
+            )
+
+            if current_short_rate <= 0:
+                return True, (
+                    f"Short futures funding no longer favorable\n"
+                    f"Initial short funding: {initial_short_rate*100:.6f}%\n"
+                    f"Current short funding: {current_short_rate*100:.6f}%"
+                )
+
+            if abs(current_net_funding) < min_threshold:
+                return True, (
+                    f"Carry funding dropped below threshold\n"
+                    f"Current short funding: {current_short_rate*100:.6f}%\n"
+                    f"Threshold: {min_threshold*100:.6f}%\n"
+                    f"Initial short funding: {initial_short_rate*100:.6f}%"
+                )
+
+            if abs(initial_short_rate) > 0:
+                funding_reduction = 1 - (abs(current_short_rate) / abs(initial_short_rate))
+                if funding_reduction > 0.97:
+                    return True, (
+                        f"Short funding dropped by {funding_reduction*100:.1f}%\n"
+                        f"Initial: {abs(initial_short_rate)*100:.6f}%\n"
+                        f"Current: {abs(current_short_rate)*100:.6f}%"
+                    )
+            return False, ""
+
         long_exchange = position["long_exchange"]
         short_exchange = position["short_exchange"]
-        pair = position["pair"]
 
         current_rates = {}
         for exchange in [long_exchange, short_exchange]:

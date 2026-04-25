@@ -1,39 +1,71 @@
 import urllib.request
 import json
 
-pairs = ['KATUSDT', 'ONTUSDT', 'ENJUSDT', 'SIRENUSDT', 'PIPPINUSDT', 'TOSHIUSDT']
+pairs = [
+    'KATUSDT', 'ONTUSDT', 'ENJUSDT', 'SIRENUSDT', 'PIPPINUSDT', 'TOSHIUSDT',
+    'STOUSDT', 'EDGEUSDT', 'XRPUSDT', 'SOLUSDT', 'ETHUSDT', 'BTCUSDT'
+]
 
-print(f"{'Pair':<14} {'Binance FR':>10} {'Aster FR':>10} {'Diff (B-A)':>10} {'Direction':<30}")
-print("-" * 80)
+print(f"{'Pair':<12} {'Binance':>9} {'Asterdex':>9} {'BingX':>9} {'B-A':>9} {'BingX-Aster':>12} Direction")
+print("-" * 85)
+
 for sym in pairs:
-    try:
-        b_url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym}"
-        req = urllib.request.Request(b_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            b_data = json.loads(resp.read())
-        b_fr = float(b_data.get('lastFundingRate', 0)) * 100
-    except Exception as e:
-        b_fr = None
+    results = {}
     
+    # Binance
     try:
-        a_url = f"https://fapi.asterdex.com/fapi/v1/premiumIndex?symbol={sym.lower()}"
-        req = urllib.request.Request(a_url, headers={'User-Agent': 'Mozilla/5.0'})
+        url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=8) as resp:
-            a_data = json.loads(resp.read())
-        a_fr = float(a_data.get('lastFundingRate', 0)) * 100
-    except Exception as e:
-        a_fr = None
+            data = json.loads(resp.read())
+        results['binance'] = float(data.get('lastFundingRate', 0)) * 100
+    except:
+        results['binance'] = None
     
-    if b_fr is not None and a_fr is not None:
-        diff = b_fr - a_fr
-        direction = "LONG Aster / SHORT Binance" if diff > 0 else "LONG Binance / SHORT Aster"
-        diff_str = f"{diff:+.4f}%"
-        b_str = f"{b_fr:+.4f}%"
-        a_str = f"{a_fr:+.4f}%"
+    # Asterdex
+    try:
+        url = f"https://fapi.asterdex.com/fapi/v1/premiumIndex?symbol={sym.lower()}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+        results['aster'] = float(data.get('lastFundingRate', 0)) * 100
+    except:
+        results['aster'] = None
+    
+    # BingX - correct endpoint
+    try:
+        bingx_sym = sym.replace('USDT', '-USDT')
+        url = f"https://open-api.bingx.com/openApi/swap/v2/quote/fundingRate?symbol={bingx_sym}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+        if data.get('code') == 0:
+            results['bingx'] = float(data['data'][0].get('lastFundingRate', 0)) * 100
+        else:
+            results['bingx'] = None
+    except:
+        results['bingx'] = None
+    
+    b = results.get('binance')
+    a = results.get('aster')
+    bx = results.get('bingx')
+    
+    b_str = f"{b:+.4f}%" if b is not None else "N/A"
+    a_str = f"{a:+.4f}%" if a is not None else "N/A"
+    bx_str = f"{bx:+.4f}%" if bx is not None else "N/A"
+    
+    if b is not None and a is not None:
+        diff_ba_str = f"{b-a:+.4f}%"
     else:
-        direction = "N/A"
-        diff_str = "N/A"
-        b_str = f"{b_fr}" if b_fr is not None else "N/A"
-        a_str = f"{a_fr}" if a_fr is not None else "N/A"
+        diff_ba_str = "N/A"
     
-    print(f"{sym:<14} {b_str:>10} {a_str:>10} {diff_str:>10}   {direction}")
+    if bx is not None and a is not None:
+        diff_bxa_str = f"{bx-a:+.4f}%"
+    elif bx is not None and b is not None:
+        diff_bxa_str = f"{bx-b:+.4f}%"
+    else:
+        diff_bxa_str = "N/A"
+    
+    direction = "LONG Aster / SHORT Binance" if (b and a and b > a) else "LONG Binance / SHORT Aster" if (b and a) else "N/A"
+    
+    print(f"{sym:<12} {b_str:>9} {a_str:>9} {bx_str:>9} {diff_ba_str:>9} {diff_bxa_str:>12} {direction}")

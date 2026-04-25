@@ -33,6 +33,8 @@ class GUIWorkflowService:
         self.manager = MultiExchangeManager()
         self.engine = TradingEngine(settings)
         self.engine.exchange_manager = self.manager
+        self.engine.cash_carry_engine.attach_future_manager(self.manager)
+        self.cash_carry_engine = self.engine.cash_carry_engine
         self.session_store = SessionStore()
 
     async def connect_exchanges(
@@ -96,6 +98,7 @@ class GUIWorkflowService:
         ]
 
         connected: List[str] = []
+        enabled_exchanges = {exchange for exchange, config in exchange_config.items() if config.get("enabled")}
 
         for exchange, display_name, settings_obj, client_cls, required_fields in exchange_specs:
             config = exchange_config.get(exchange, {})
@@ -118,6 +121,14 @@ class GUIWorkflowService:
                 connected.append(display_name)
 
         balances = await self.manager.get_all_balances()
+        try:
+            await self.cash_carry_engine.connect_enabled_spot_clients(
+                enabled_exchanges=enabled_exchanges,
+                debug=debug,
+            )
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"Spot client connection warning: {exc}")
         return connected, balances
 
     def new_session_id(self) -> str:
@@ -157,6 +168,9 @@ class GUIWorkflowService:
         payload = self.session_store.load_active_session()
         if not payload:
             return None
+
+        if payload.get("strategy_type") == "cash_carry":
+            return await self.cash_carry_engine.recover_active_session(payload)
 
         restored = self._restore_position_types(payload)
         pair = restored.get("pair")
@@ -246,7 +260,12 @@ class GUIWorkflowService:
         pair: str,
         long_exchange: Exchange,
         short_exchange: Exchange,
+        *,
+        strategy_mode: str = "futures_hedge",
     ) -> Dict[str, Any]:
+        if strategy_mode == "cash_carry":
+            return await self.cash_carry_engine.get_pair_snapshot(pair, long_exchange, short_exchange)
+
         result_data = {}
         funding_rates = {}
 
@@ -348,6 +367,13 @@ class GUIWorkflowService:
         leverage: int,
         balances: Optional[Dict[Exchange, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
+        if snapshot.get("strategy_type") == "cash_carry":
+            return self.cash_carry_engine.build_trade_plan_from_snapshot(
+                snapshot,
+                requested_size_tokens=requested_size_tokens,
+                leverage=leverage,
+            ).to_dict()
+
         funding_rates = snapshot.get("funding_rates", {})
         long_exchange = snapshot.get("long_exchange")
         short_exchange = snapshot.get("short_exchange")
@@ -388,7 +414,17 @@ class GUIWorkflowService:
         requested_size_tokens: float,
         leverage: int,
         balances: Optional[Dict[Exchange, Any]] = None,
+        strategy_mode: str = "futures_hedge",
     ) -> Dict[str, Any]:
+        if strategy_mode == "cash_carry":
+            return await self.cash_carry_engine.build_open_assessment(
+                pair=pair,
+                spot_exchange=long_exchange,
+                future_exchange=short_exchange,
+                requested_size_tokens=requested_size_tokens,
+                leverage=leverage,
+            )
+
         snapshot = await self.get_pair_snapshot(pair, long_exchange, short_exchange)
         live_balances = balances or await self.get_balances_subset(long_exchange, short_exchange)
         trade_plan = self.build_trade_plan_from_snapshot(
@@ -413,7 +449,17 @@ class GUIWorkflowService:
         short_exchange: Exchange,
         requested_size_tokens: float,
         leverage: int,
+        strategy_mode: str = "futures_hedge",
     ) -> Dict[str, Any]:
+        if strategy_mode == "cash_carry":
+            return await self.cash_carry_engine.preflight_open_execution(
+                pair=pair,
+                spot_exchange=long_exchange,
+                future_exchange=short_exchange,
+                requested_size_tokens=requested_size_tokens,
+                leverage=leverage,
+            )
+
         blockers: List[str] = []
         warnings: List[str] = []
         details: Dict[str, Any] = {
@@ -559,7 +605,20 @@ class GUIWorkflowService:
         pretrade_assessment: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
         open_time: Optional[datetime] = None,
+        strategy_mode: str = "futures_hedge",
     ) -> Dict[str, Any]:
+        if strategy_mode == "cash_carry":
+            return await self.cash_carry_engine.get_initial_position_state(
+                pair=pair,
+                spot_exchange=long_exchange,
+                future_exchange=short_exchange,
+                size=size,
+                leverage=leverage,
+                pretrade_assessment=pretrade_assessment,
+                session_id=session_id,
+                open_time=open_time,
+            )
+
         rates = {}
         for exchange in [long_exchange, short_exchange]:
             client = self.manager.clients.get(exchange)
@@ -612,7 +671,12 @@ class GUIWorkflowService:
         pair: str,
         long_exchange: Exchange,
         short_exchange: Exchange,
+        *,
+        strategy_mode: str = "futures_hedge",
     ) -> Dict[str, float]:
+        if strategy_mode == "cash_carry":
+            return await self.cash_carry_engine.check_open_basis(pair, long_exchange, short_exchange)
+
         long_client = self.manager.clients.get(long_exchange)
         short_client = self.manager.clients.get(short_exchange)
         if not long_client or not short_client:
@@ -658,7 +722,24 @@ class GUIWorkflowService:
         skip_leverage_set: bool = False,
         skip_spread_check: bool = False,
         split_interval_seconds: float = 2.0,
+        strategy_mode: str = "futures_hedge",
     ) -> Dict[str, Any]:
+        if strategy_mode == "cash_carry":
+            return await self.cash_carry_engine.execute_open_splits(
+                pair=pair,
+                spot_exchange=long_exchange,
+                future_exchange=short_exchange,
+                size=size,
+                leverage=leverage,
+                split_count=split_count,
+                basis_threshold_pct=price_spread_min,
+                log_callback=log_callback,
+                cancel_event=cancel_event,
+                skip_leverage_set=skip_leverage_set,
+                skip_basis_check=skip_spread_check,
+                split_interval_seconds=split_interval_seconds,
+            )
+
         balance_before = {}
         for exchange in [long_exchange, short_exchange]:
             client = self.manager.clients.get(exchange)
@@ -690,6 +771,9 @@ class GUIWorkflowService:
         return result
 
     async def build_monitor_snapshot(self, position: Dict[str, Any]) -> Dict[str, Any]:
+        if position.get("strategy_type") == "cash_carry":
+            return await self.cash_carry_engine.build_monitor_snapshot(position)
+
         total_balance = 0.0
         balances: Dict[Exchange, Any] = {}
         for exchange, client in self.manager.clients.items():
@@ -766,7 +850,21 @@ class GUIWorkflowService:
         skip_spread_check: bool = False,
         close_size: Optional[float] = None,
         split_interval_seconds: float = 2.0,
+        strategy_mode: str = "futures_hedge",
     ) -> Dict[str, Any]:
+        if strategy_mode == "cash_carry":
+            return await self.cash_carry_engine.close_position_with_analysis(
+                pair=pair,
+                spot_exchange=long_exchange,
+                future_exchange=short_exchange,
+                splits=splits,
+                log_callback=log_callback,
+                cancel_event=cancel_event,
+                skip_basis_check=skip_spread_check,
+                close_size=close_size,
+                split_interval_seconds=split_interval_seconds,
+            )
+
         threshold = -100.0
         analyze_result = None
         preflight_result = None
@@ -874,7 +972,23 @@ class GUIWorkflowService:
         interval_seconds: Optional[float] = None,
         policy_mode: Optional[str] = None,
         action_label: Optional[str] = None,
+        strategy_type: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if strategy_type == "cash_carry":
+            return await self.cash_carry_engine.reduce_position_on_risk(
+                pair=pair,
+                spot_exchange=long_exchange,
+                future_exchange=short_exchange,
+                risk_percent=risk_percent,
+                threshold_percent=threshold_percent,
+                reason=reason,
+                reduce_ratio=reduce_ratio if reduce_ratio is not None else 0.5,
+                splits=splits if splits is not None else 10,
+                interval_seconds=interval_seconds if interval_seconds is not None else 2.0,
+                policy_mode=policy_mode or "risk_reduce",
+                action_label=action_label or "REDUCE_50",
+            )
+
         kwargs: Dict[str, Any] = {
             "risk_percent": risk_percent,
             "threshold_percent": threshold_percent,
