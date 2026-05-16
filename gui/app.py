@@ -16,6 +16,7 @@ import subprocess
 import aiohttp
 
 from config.settings import settings
+from core.basis_checker_service import load_basis_config, send_telegram_message
 from core.gui_service import GUIWorkflowService
 
 try:
@@ -27,8 +28,13 @@ try:
         on_close_complete as controller_on_close_complete,
         reset_close_button as controller_reset_close_button,
     )
-    from gui.display_formatters import build_funding_table_rows
+    from gui.display_formatters import (
+        build_funding_fee_history_lines,
+        build_funding_table_rows,
+        build_periodic_funding_pnl_summary_lines,
+    )
     from gui.exchange_display import CASH_CARRY_EXCHANGE_OPTIONS, parse_recommendation_display_names, to_display_name
+    from gui.basis_checker_panel import BasisCheckerPanel
     from gui.layout import create_funding_board_frame, create_widgets as build_widgets
     from gui.monitor_controller import (
         check_funding_reversal as controller_check_funding_reversal,
@@ -72,8 +78,13 @@ except ImportError:
         on_close_complete as controller_on_close_complete,
         reset_close_button as controller_reset_close_button,
     )
-    from display_formatters import build_funding_table_rows
+    from display_formatters import (
+        build_funding_fee_history_lines,
+        build_funding_table_rows,
+        build_periodic_funding_pnl_summary_lines,
+    )
     from exchange_display import CASH_CARRY_EXCHANGE_OPTIONS, parse_recommendation_display_names, to_display_name
+    from basis_checker_panel import BasisCheckerPanel
     from layout import create_funding_board_frame, create_widgets as build_widgets
     from monitor_controller import (
         check_funding_reversal as controller_check_funding_reversal,
@@ -212,6 +223,8 @@ class FundingHunterGUI:
         self._funding_board_window = None
         self.funding_board_tree = None
         self.funding_board_refresh_btn = None
+        self._basis_checker_window = None
+        self._basis_checker_panel = None
         
         # Price spread waiting state (for manual open position)
         self.waiting_for_price_spread = False
@@ -227,6 +240,10 @@ class FundingHunterGUI:
         self._pair_info_update_task = None
         self._usdt_update_pending = None
         self._runtime_refresh_task = None
+        self._periodic_funding_summary_task = None
+        self._periodic_funding_summary_running = False
+        self._last_periodic_funding_summary_at = None
+        self._periodic_funding_summary_initialized = False
         
         # Build UI
         self._create_menu()
@@ -694,6 +711,7 @@ class FundingHunterGUI:
         self._log("Disconnecting...")
         self._run_async(self.manager.disconnect_all())
         self._stop_monitoring()
+        self._stop_periodic_funding_summary_loop()
         self._update_ui_disconnected()
     
     def _load_binance_pairs(self):
@@ -782,6 +800,8 @@ class FundingHunterGUI:
         # Stop monitoring temporarily
         if self.monitoring:
             self._stop_monitoring()
+
+        self._stop_periodic_funding_summary_loop()
         
         logger.info("🛑 Stopped all background tasks")
     
@@ -794,6 +814,164 @@ class FundingHunterGUI:
         future = self._run_async(self.service.recover_active_session())
         if future:
             future.add_done_callback(self._on_recover_session_complete)
+
+    def _arm_periodic_funding_summary_timer(self, delay_ms: int = 4 * 60 * 60 * 1000):
+        """Arm the next periodic funding/PnL summary for the active position."""
+        if not self.active_position:
+            return
+        if self._periodic_funding_summary_task:
+            try:
+                self.root.after_cancel(self._periodic_funding_summary_task)
+            except Exception:
+                pass
+
+        def _tick():
+            self._periodic_funding_summary_task = None
+            if not self.root.winfo_exists():
+                return
+            self._schedule_periodic_funding_summary()
+
+        self._periodic_funding_summary_task = self.root.after(delay_ms, _tick)
+
+    def _start_periodic_funding_summary_loop(self):
+        """Start a 4-hour funding/PnL summary loop for the active position."""
+        self._initialize_periodic_funding_summary_state(refresh=True)
+
+    def _reset_periodic_funding_summary_state(self) -> None:
+        self._stop_periodic_funding_summary_loop()
+        self._periodic_funding_summary_initialized = False
+        self._periodic_funding_summary_running = False
+        self._last_periodic_funding_summary_at = None
+
+    def _initialize_periodic_funding_summary_state(self, *, refresh: bool = False) -> None:
+        if not self.active_position:
+            self._reset_periodic_funding_summary_state()
+            return
+        if self._periodic_funding_summary_initialized and not refresh:
+            return
+
+        position = self.active_position
+        now = int(time.time() * 1000)
+        if position.get("last_periodic_funding_fee_time") is None:
+            position["last_periodic_funding_fee_time"] = now
+        if position.get("last_periodic_funding_fee_key") is None:
+            position["last_periodic_funding_fee_key"] = ""
+        if position.get("total_funding_fees") is None:
+            position["total_funding_fees"] = 0.0
+
+        self.service.persist_active_position(position)
+        self._periodic_funding_summary_initialized = True
+        self._arm_periodic_funding_summary_timer()
+
+    def _stop_periodic_funding_summary_loop(self):
+        """Stop the periodic funding/PnL summary loop."""
+        if self._periodic_funding_summary_task:
+            try:
+                self.root.after_cancel(self._periodic_funding_summary_task)
+            except Exception:
+                pass
+            self._periodic_funding_summary_task = None
+        self._periodic_funding_summary_running = False
+
+    def _schedule_periodic_funding_summary(self):
+        """Request a periodic funding summary when an active position exists."""
+        if self._periodic_funding_summary_running:
+            return
+        if not self.active_position:
+            return
+
+        if not self._periodic_funding_summary_initialized:
+            self._initialize_periodic_funding_summary_state()
+
+        self._periodic_funding_summary_running = True
+        position = dict(self.active_position)
+
+        async def build_summary():
+            return await self.service.build_periodic_funding_pnl_summary(position, limit=100)
+
+        future = self._run_async(build_summary())
+        if future:
+            future.add_done_callback(self._on_periodic_funding_summary_complete)
+        else:
+            self._periodic_funding_summary_running = False
+
+    def _send_periodic_funding_summary_to_telegram(self, summary: Dict[str, Any], lines: List[str]):
+        """Notify Telegram with the periodic funding/PnL summary when configured."""
+        cfg = load_basis_config()
+        if not cfg.get("telegram_enabled"):
+            return
+        token = str(cfg.get("telegram_bot_token", "")).strip()
+        chat_id = str(cfg.get("telegram_chat_id", "")).strip()
+        if not token or not chat_id:
+            self._log("Periodic funding Telegram notify skipped: missing token/chat_id")
+            return
+
+        message = "<pre>" + "\n".join(lines).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "</pre>"
+
+        async def send_notice():
+            return await send_telegram_message(token, chat_id, message, return_details=True)
+
+        future = self._run_async(send_notice())
+        if not future:
+            return
+
+        def on_complete(done):
+            def update_ui():
+                try:
+                    details = done.result(timeout=1.0)
+                    if details.get("ok"):
+                        self._log("Periodic funding Telegram notify sent")
+                    else:
+                        description = details.get("description") or "unknown error"
+                        self._log(f"Periodic funding Telegram notify failed: {description}")
+                except Exception as exc:
+                    self._log(f"Periodic funding Telegram notify error: {exc}")
+
+            self.root.after(0, update_ui)
+
+        future.add_done_callback(on_complete)
+
+    def _on_periodic_funding_summary_complete(self, future):
+        """Handle periodic funding/PnL summary completion."""
+        def update_ui():
+            self._periodic_funding_summary_running = False
+            try:
+                summary = future.result()
+                if not summary:
+                    return
+
+                self._last_periodic_funding_summary_at = time.time()
+                lines = build_periodic_funding_pnl_summary_lines(summary)
+                for line in lines:
+                    self._log(line)
+                self._send_periodic_funding_summary_to_telegram(summary, lines)
+
+                self.service.record_trade_event(
+                    "periodic_funding_pnl_summary",
+                    {
+                        "session_id": summary.get("session_id"),
+                        "pair": summary.get("pair"),
+                        "summary": summary,
+                    },
+                )
+
+                if self.active_position:
+                    if summary.get("newest_record_time") is not None:
+                        self.active_position["last_periodic_funding_fee_time"] = summary["newest_record_time"]
+                    if summary.get("newest_record_key"):
+                        self.active_position["last_periodic_funding_fee_key"] = summary["newest_record_key"]
+                    self.active_position["total_funding_fees"] = summary.get(
+                        "total_funding_fee",
+                        self.active_position.get("total_funding_fees", 0.0),
+                    )
+                    self.service.persist_active_position(self.active_position)
+            except Exception as exc:
+                self._log(f"Periodic funding summary error: {exc}")
+            finally:
+                if self.active_position and self.root.winfo_exists():
+                    self._arm_periodic_funding_summary_timer()
+
+        self.root.after(0, update_ui)
 
     def _on_recover_session_complete(self, future):
         """Handle a recovered active session."""
@@ -813,6 +991,7 @@ class FundingHunterGUI:
                 self.long_exchange.set(to_display_name(recovered["long_exchange"]))
                 self.short_exchange.set(to_display_name(recovered["short_exchange"]))
                 self._update_position_display()
+                self._start_periodic_funding_summary_loop()
                 if recovered.get("strategy_type") == "cash_carry":
                     self._log(
                         f"Recovered active carry session: {recovered['pair']} | "
@@ -906,6 +1085,7 @@ class FundingHunterGUI:
                             f"Net: {self.active_position['initial_net_funding']*100:.6f}%"
                         )
                     self._update_position_display()
+                    self._start_periodic_funding_summary_loop()
                 except Exception as e:
                     logger.error(f"Error fetching initial funding: {e}")
 
@@ -997,6 +1177,53 @@ class FundingHunterGUI:
             self.pos_status_label.config(text=status_text, foreground='green')
             # Enable monitor button when position exists
             self.monitor_btn.config(state=tk.NORMAL)
+            if hasattr(self, "funding_fee_history_btn"):
+                self.funding_fee_history_btn.config(state=tk.NORMAL)
+
+    def _show_funding_fee_history(self):
+        """Fetch and show funding fee records for the active position."""
+        if not self.active_position:
+            messagebox.showinfo("Info", "No active position")
+            return
+
+        self._log("Loading funding fee history...")
+        if hasattr(self, "funding_fee_history_btn"):
+            self.funding_fee_history_btn.config(state=tk.DISABLED)
+
+        position = dict(self.active_position)
+
+        async def load_history():
+            return await self.service.get_funding_fee_history(position, limit=100)
+
+        future = self._run_async(load_history())
+        if not future:
+            if hasattr(self, "funding_fee_history_btn"):
+                self.funding_fee_history_btn.config(state=tk.NORMAL)
+            return
+
+        def on_complete(done):
+            def update_ui():
+                try:
+                    history = done.result(timeout=1.0)
+                    for line in build_funding_fee_history_lines(history):
+                        self._log(line)
+                    self.service.record_trade_event(
+                        "funding_fee_history_viewed",
+                        {
+                            "session_id": position.get("session_id"),
+                            "pair": position.get("pair"),
+                            "history": history,
+                        },
+                    )
+                except Exception as exc:
+                    self._log(f"Funding fee history error: {exc}")
+                finally:
+                    if hasattr(self, "funding_fee_history_btn") and self.active_position:
+                        self.funding_fee_history_btn.config(state=tk.NORMAL)
+
+            self.root.after(0, update_ui)
+
+        future.add_done_callback(on_complete)
     
     def _clear_position_display(self):
         """Clear position display"""
@@ -1012,6 +1239,8 @@ class FundingHunterGUI:
         self.pos_status_label.config(text="Status: No Position", foreground='black')
         # Disable monitor button and reset text
         self.monitor_btn.config(text="👁 Start Monitor", state=tk.DISABLED)
+        if hasattr(self, "funding_fee_history_btn"):
+            self.funding_fee_history_btn.config(state=tk.DISABLED)
         
         self.last_monitor_advice = None
         # Restart pair info update loop when position is closed
@@ -1071,6 +1300,67 @@ class FundingHunterGUI:
         self._funding_board_window = None
         self.funding_board_tree = None
         self.funding_board_refresh_btn = None
+
+    def _open_basis_checker(self):
+        """Open the embedded Binance/Asterdex basis checker."""
+        existing = getattr(self, "_basis_checker_window", None)
+        if existing and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Basis Checker - Binance vs Asterdex")
+        window.geometry("1400x760")
+        window.minsize(1100, 620)
+        window.transient(self.root)
+        self._basis_checker_window = window
+        self._basis_checker_panel = BasisCheckerPanel(self, window)
+        window.protocol("WM_DELETE_WINDOW", self._close_basis_checker)
+
+    def _close_basis_checker(self):
+        panel = getattr(self, "_basis_checker_panel", None)
+        if panel:
+            panel.close()
+        window = getattr(self, "_basis_checker_window", None)
+        if window and window.winfo_exists():
+            window.destroy()
+        self._basis_checker_panel = None
+        self._basis_checker_window = None
+
+    def _basis_symbol_to_pair(self, symbol: str) -> str:
+        symbol = str(symbol or "").strip().upper()
+        if symbol.endswith("USDT"):
+            return f"{symbol[:-4]}/USDT"
+        return symbol
+
+    def _apply_basis_checker_selection(self, row):
+        """Push a selected basis opportunity back into the trading panel."""
+        pair = self._basis_symbol_to_pair(row.get("symbol", ""))
+        if not pair:
+            return
+
+        current_values = list(self.pair_combo["values"])
+        if pair not in current_values:
+            current_values.append(pair)
+            self.pair_combo["values"] = current_values
+        self.pair_combo.set(pair)
+
+        long_display = "Binance" if row.get("rec_long") == "binance" else "Asterdex"
+        short_display = "Binance" if row.get("rec_short") == "binance" else "Asterdex"
+
+        if hasattr(self, "trade_mode_var"):
+            self.trade_mode_var.set("Futures Hedge")
+            self._on_trade_mode_changed()
+
+        self.long_exchange.set(long_display)
+        self.short_exchange.set(short_display)
+        self._log(
+            f"Basis selected: {pair} | LONG {long_display}, SHORT {short_display} | "
+            f"exec {row.get('exec_basis', 0):+.4f}% | funding diff {row.get('funding_diff', 0):+.4f}%"
+        )
+        self._update_pair_info()
+        self._update_usdt_volume()
 
     def _clear_tree(self, tree):
         if not tree:
@@ -1388,6 +1678,9 @@ class FundingHunterGUI:
         if self._runtime_refresh_task:
             self.root.after_cancel(self._runtime_refresh_task)
             self._runtime_refresh_task = None
+
+        self._stop_periodic_funding_summary_loop()
+        self._close_basis_checker()
         
         if self.loop:
             self.loop.call_soon_threadsafe(self.loop.stop)

@@ -295,6 +295,8 @@ def load_hedged_position(app: Any, hedged_pair: dict[str, Any], open_time: Optio
     app._update_position_display()
     app.service.persist_active_position(app.active_position)
     app.service.record_trade_event("position_loaded", app.active_position)
+    if hasattr(app, "_start_periodic_funding_summary_loop"):
+        app._start_periodic_funding_summary_loop()
 
     async def enrich_loaded_position() -> dict[str, Any]:
         return await app.service.get_initial_position_state(

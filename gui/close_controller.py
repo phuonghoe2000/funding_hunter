@@ -6,6 +6,7 @@ import asyncio
 import logging
 import threading
 import tkinter as tk
+from datetime import datetime
 from tkinter import messagebox
 from typing import Any
 
@@ -213,6 +214,8 @@ def on_close_complete(app: Any, future: Any) -> None:
                 if fully_closed:
                     app._log("Position closed successfully!")
                     app._stop_monitoring()
+                    if hasattr(app, "_reset_periodic_funding_summary_state"):
+                        app._reset_periodic_funding_summary_state()
                     if closed_position:
                         app.service.record_trade_event(
                             "position_closed",
@@ -236,6 +239,8 @@ def on_close_complete(app: Any, future: Any) -> None:
                     app.active_position = refreshed_position
                     app.service.persist_active_position(app.active_position)
                     app._update_position_display()
+                    if hasattr(app, "_start_periodic_funding_summary_loop"):
+                        app._start_periodic_funding_summary_loop()
 
                 closed_splits = result.get("closed_splits", 0)
                 total_splits = result.get("splits_total", close_params.get("splits", 1))
@@ -287,10 +292,35 @@ def calculate_and_show_final_pnl(app: Any, closed_position: dict[str, Any]) -> N
     pair = closed_position.get("pair", "Unknown")
     open_time = closed_position.get("open_time")
 
+    def normalize_pnl_data(data: dict[str, Any]) -> dict[str, Any]:
+        realized_pnl = float(data.get("realized_pnl", 0.0) or 0.0)
+        commission = abs(float(data.get("commission", 0.0) or 0.0))
+        funding_fee = float(data.get("funding_fee", 0.0) or 0.0)
+        net_pnl = data.get("position_net_pnl")
+        if net_pnl is None and data.get("net_pnl_source") == "closed_position_history":
+            net_pnl = data.get("net_pnl")
+        if net_pnl is None:
+            net_pnl = realized_pnl - commission
+        return {
+            **data,
+            "realized_pnl": realized_pnl,
+            "commission": commission,
+            "funding_fee": funding_fee,
+            "net_pnl": float(net_pnl or 0.0),
+        }
+
     async def calculate_pnl():
         since = None
         if open_time:
-            since = int(open_time.timestamp() * 1000) - 60000
+            if isinstance(open_time, str):
+                try:
+                    open_dt = datetime.fromisoformat(open_time)
+                except ValueError:
+                    open_dt = None
+            else:
+                open_dt = open_time
+            if open_dt:
+                since = int(open_dt.timestamp() * 1000) - 60000
 
         long_client = app.manager.clients.get(long_exchange)
         short_client = app.manager.clients.get(short_exchange)
@@ -300,15 +330,24 @@ def calculate_and_show_final_pnl(app: Any, closed_position: dict[str, Any]) -> N
 
         if long_client:
             try:
-                long_pnl_data = await long_client.get_closed_pnl(pair, since)
+                long_pnl_data = normalize_pnl_data(await long_client.get_closed_pnl(pair, since))
             except Exception as exc:
                 logger.error("Error getting long PnL from %s: %s", long_exchange.value, exc)
 
         if short_client:
             try:
-                short_pnl_data = await short_client.get_closed_pnl(pair, since)
+                short_pnl_data = normalize_pnl_data(await short_client.get_closed_pnl(pair, since))
             except Exception as exc:
                 logger.error("Error getting short PnL from %s: %s", short_exchange.value, exc)
+
+        funding_history = None
+        try:
+            funding_history = await app.service.get_funding_fee_history(closed_position, limit=100)
+        except Exception as exc:
+            logger.error("Error getting funding fee history: %s", exc)
+        total_funding_fee = long_pnl_data["funding_fee"] + short_pnl_data["funding_fee"]
+        if funding_history is not None:
+            total_funding_fee = float(funding_history.get("total", total_funding_fee) or 0.0)
 
         return {
             "pair": pair,
@@ -319,9 +358,10 @@ def calculate_and_show_final_pnl(app: Any, closed_position: dict[str, Any]) -> N
             "total": {
                 "realized_pnl": long_pnl_data["realized_pnl"] + short_pnl_data["realized_pnl"],
                 "commission": long_pnl_data["commission"] + short_pnl_data["commission"],
-                "funding_fee": long_pnl_data["funding_fee"] + short_pnl_data["funding_fee"],
+                "funding_fee": total_funding_fee,
                 "net_pnl": long_pnl_data["net_pnl"] + short_pnl_data["net_pnl"],
             },
+            "funding_history": funding_history,
         }
 
     def on_pnl_calculated(future: Any) -> None:

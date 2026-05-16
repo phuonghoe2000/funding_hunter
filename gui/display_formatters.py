@@ -2,6 +2,7 @@
 Display formatting helpers for the Funding Hunter GUI.
 """
 
+from datetime import datetime, timezone
 from typing import Any
 
 from config.constants import Exchange
@@ -277,33 +278,127 @@ def build_cash_carry_snapshot_display(
     return "\n".join(lines), color
 
 
+def _fmt_time_utc(timestamp_ms: Any) -> str:
+    try:
+        if timestamp_ms is None:
+            return "-"
+        return datetime.fromtimestamp(int(timestamp_ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return "-"
+
+
+def build_funding_fee_history_lines(history: dict[str, Any], *, max_records: int = 100) -> list[str]:
+    """Build log lines for funding fee records since the position opened."""
+    records = history.get("records", [])
+    legs = history.get("legs", [])
+    lines = [
+        "-" * 50,
+        f"FUNDING FEE HISTORY: {history.get('pair', '-')}",
+        "-" * 50,
+    ]
+
+    if history.get("since"):
+        lines.append(f"Since: {_fmt_time_utc(history.get('since'))}")
+
+    for leg in legs:
+        leg_records = leg.get("records", [])
+        total = sum(float(item.get("income", 0.0) or 0.0) for item in leg_records)
+        status = f"{leg.get('label', '-')} {leg.get('exchange', '-')}: ${total:+.4f}"
+        if leg.get("error"):
+            status += f" | error: {leg['error']}"
+        lines.append(status)
+
+    lines.append(f"Total funding fees: ${history.get('total', 0.0):+.4f}")
+
+    if not records:
+        lines.append("No funding fee records found for this position window.")
+        return lines
+
+    lines.append("")
+    lines.append("Time UTC             | Leg    | Exchange  | Funding")
+    lines.append("---------------------+--------+-----------+------------")
+    for record in records[-max_records:]:
+        lines.append(
+            f"{_fmt_time_utc(record.get('time')):<20} | "
+            f"{record.get('label', '-'):<6} | "
+            f"{record.get('exchange', '-'):<9} | "
+            f"${float(record.get('income', 0.0) or 0.0):+,.4f}"
+        )
+    return lines
+
+
+def build_periodic_funding_pnl_summary_lines(summary: dict[str, Any]) -> list[str]:
+    """Build compact log lines for the GUI periodic funding/PnL check."""
+    pair = summary.get("pair", "-")
+    strategy_type = summary.get("strategy_type", "futures_hedge")
+    label = "Spot/Future Carry" if strategy_type == "cash_carry" else "Futures Hedge"
+    new_funding = float(summary.get("new_funding_fee", 0.0) or 0.0)
+    total_funding = float(summary.get("total_funding_fee", 0.0) or 0.0)
+    unrealized = float(summary.get("unrealized_pnl", 0.0) or 0.0)
+    net_estimate = float(summary.get("net_pnl_estimate", 0.0) or 0.0)
+    long_pnl = float(summary.get("long_pnl", 0.0) or 0.0)
+    short_pnl = float(summary.get("short_pnl", 0.0) or 0.0)
+
+    lines = [
+        "-" * 50,
+        f"4H FUNDING/PnL SUMMARY: {pair} ({label})",
+        f"New funding fees: ${new_funding:+.4f}",
+        f"Total funding fees since open: ${total_funding:+.4f}",
+        f"Unrealized PnL: ${unrealized:+.2f} | Long/Spot: ${long_pnl:+.2f} | Short/Future: ${short_pnl:+.2f}",
+        f"Net estimate incl. funding: ${net_estimate:+.2f}",
+    ]
+
+    records = summary.get("new_records", [])
+    if records:
+        lines.append("New funding records:")
+        for record in records[-10:]:
+            lines.append(
+                f"  {_fmt_time_utc(record.get('time'))} | "
+                f"{record.get('label', '-'):<6} {record.get('exchange', '-'):<9} "
+                f"${float(record.get('income', 0.0) or 0.0):+,.4f}"
+            )
+    else:
+        lines.append("No new funding fee records since last summary.")
+
+    errors = summary.get("errors", [])
+    for error in errors:
+        lines.append(f"Warning: {error}")
+    return lines
+
+
 def build_final_pnl_report_lines(result: dict[str, Any]) -> list[str]:
     """Build log lines for the final PnL report."""
     long_data = result["long"]
     short_data = result["short"]
     total = result["total"]
     pnl_status = "PROFIT" if total["net_pnl"] >= 0 else "LOSS"
+    total_with_funding = total["net_pnl"] + total.get("funding_fee", 0.0)
 
-    return [
+    lines = [
         "=" * 50,
         f"FINAL TRADE REPORT: {result['pair']}",
         "=" * 50,
         f"LONG ({result['long_ex'].value}):",
         f"   Realized PnL: ${long_data['realized_pnl']:+.2f}",
         f"   Trading Fees: -${long_data['commission']:.2f}",
-        f"   Funding Fees: ${long_data['funding_fee']:+.2f}",
-        f"   Net PnL:      ${long_data['net_pnl']:+.2f}",
+        f"   Funding Fees: ${long_data['funding_fee']:+.2f} (tracked separately)",
+        f"   Position PnL: ${long_data['net_pnl']:+.2f}",
         "",
         f"SHORT ({result['short_ex'].value}):",
         f"   Realized PnL: ${short_data['realized_pnl']:+.2f}",
         f"   Trading Fees: -${short_data['commission']:.2f}",
-        f"   Funding Fees: ${short_data['funding_fee']:+.2f}",
-        f"   Net PnL:      ${short_data['net_pnl']:+.2f}",
+        f"   Funding Fees: ${short_data['funding_fee']:+.2f} (tracked separately)",
+        f"   Position PnL: ${short_data['net_pnl']:+.2f}",
         "",
         "-" * 50,
         f"TOTAL REALIZED PnL: ${total['realized_pnl']:+.2f}",
         f"TOTAL TRADING FEES: -${total['commission']:.2f}",
-        f"TOTAL FUNDING FEES: ${total['funding_fee']:+.2f}",
-        f">>> FINAL NET PnL: ${total['net_pnl']:+.2f} ({pnl_status}) <<<",
+        f"TOTAL TRACKED FUNDING FEES: ${total['funding_fee']:+.2f}",
+        f"TOTAL WITH FUNDING (reference): ${total_with_funding:+.2f}",
+        f">>> FINAL POSITION PnL: ${total['net_pnl']:+.2f} ({pnl_status}) <<<",
         "=" * 50,
     ]
+    funding_history = result.get("funding_history")
+    if funding_history:
+        lines.extend(build_funding_fee_history_lines(funding_history, max_records=30))
+    return lines

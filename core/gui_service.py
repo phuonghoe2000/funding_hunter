@@ -5,7 +5,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from config.constants import Exchange, get_exchange_symbol, get_unified_pair
 from config.settings import Settings
-from core.multi_exchange import MultiExchangeManager
+from core.multi_exchange import MultiExchangeManager, build_size_aware_spread_snapshot
 from core.opportunity import build_best_opportunity, build_directional_opportunity
 from core.session_store import SessionStore
 from core.trade_advisor import (
@@ -148,6 +148,231 @@ class GUIWorkflowService:
 
     def read_recent_journal(self, limit: int = 50) -> List[Dict[str, Any]]:
         return self.session_store.read_recent_journal(limit)
+
+    @staticmethod
+    def _timestamp_ms(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return int(value.timestamp() * 1000)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(float(value))
+            except ValueError:
+                try:
+                    return int(datetime.fromisoformat(value).timestamp() * 1000)
+                except ValueError:
+                    return None
+        return None
+
+    @staticmethod
+    def _normalize_income_record(
+        record: Dict[str, Any],
+        *,
+        exchange: Exchange,
+        label: str,
+    ) -> Optional[Dict[str, Any]]:
+        amount_value = (
+            record.get("income")
+            if record.get("income") is not None
+            else record.get("funding", record.get("payment", record.get("balChg", 0)))
+        )
+        try:
+            amount = float(amount_value or 0)
+        except (TypeError, ValueError):
+            return None
+
+        timestamp_ms = GUIWorkflowService._timestamp_ms(
+            record.get("time") or record.get("ts") or record.get("transactionTime")
+        )
+        return {
+            "exchange": exchange.value,
+            "label": label,
+            "symbol": record.get("symbol") or record.get("contract") or record.get("instId") or "",
+            "income": amount,
+            "time": timestamp_ms,
+            "type": record.get("type") or record.get("incomeType") or "FUNDING_FEE",
+            "raw_data": record.get("raw_data", record),
+        }
+
+    async def _fetch_funding_fee_records(
+        self,
+        *,
+        exchange: Exchange,
+        label: str,
+        pair: str,
+        since_ms: Optional[int],
+        limit: int,
+    ) -> Dict[str, Any]:
+        client = self.manager.clients.get(exchange)
+        if not client:
+            return {"exchange": exchange.value, "label": label, "records": [], "error": "Exchange is not connected"}
+        if not hasattr(client, "get_income_history"):
+            return {"exchange": exchange.value, "label": label, "records": [], "error": "Income history is not supported"}
+
+        symbol = get_exchange_symbol(pair, exchange)
+        try:
+            raw_records = await client.get_income_history(
+                symbol=symbol,
+                limit=limit,
+                income_type="FUNDING_FEE",
+            )
+        except Exception as exc:
+            return {"exchange": exchange.value, "label": label, "records": [], "error": str(exc)}
+
+        records: List[Dict[str, Any]] = []
+        for raw in raw_records or []:
+            normalized = self._normalize_income_record(raw, exchange=exchange, label=label)
+            if not normalized:
+                continue
+            timestamp_ms = normalized.get("time")
+            if since_ms is not None and timestamp_ms is not None and timestamp_ms < since_ms:
+                continue
+            records.append(normalized)
+
+        records.sort(key=lambda item: item.get("time") or 0)
+        return {"exchange": exchange.value, "label": label, "records": records, "error": None}
+
+    async def get_funding_fee_history(self, position: Dict[str, Any], limit: int = 100) -> Dict[str, Any]:
+        pair = position.get("pair")
+        if not pair:
+            return {"pair": "-", "records": [], "legs": [], "total": 0.0, "error": "Position has no pair"}
+
+        since_ms = self._timestamp_ms(position.get("open_time"))
+        strategy_type = position.get("strategy_type", "futures_hedge")
+        legs: List[Tuple[Exchange, str]] = []
+
+        if strategy_type == "cash_carry":
+            future_exchange = position.get("future_exchange") or position.get("short_exchange")
+            if isinstance(future_exchange, str):
+                future_exchange = Exchange(future_exchange)
+            if future_exchange:
+                legs.append((future_exchange, "FUTURE"))
+        else:
+            long_exchange = position.get("long_exchange")
+            short_exchange = position.get("short_exchange")
+            if isinstance(long_exchange, str):
+                long_exchange = Exchange(long_exchange)
+            if isinstance(short_exchange, str):
+                short_exchange = Exchange(short_exchange)
+            if long_exchange:
+                legs.append((long_exchange, "LONG"))
+            if short_exchange:
+                legs.append((short_exchange, "SHORT"))
+
+        leg_results = await asyncio.gather(
+            *[
+                self._fetch_funding_fee_records(
+                    exchange=exchange,
+                    label=label,
+                    pair=pair,
+                    since_ms=since_ms,
+                    limit=limit,
+                )
+                for exchange, label in legs
+            ],
+            return_exceptions=True,
+        )
+
+        normalized_legs: List[Dict[str, Any]] = []
+        records: List[Dict[str, Any]] = []
+        for result in leg_results:
+            if isinstance(result, Exception):
+                normalized_legs.append({"exchange": "-", "label": "-", "records": [], "error": str(result)})
+                continue
+            normalized_legs.append(result)
+            records.extend(result.get("records", []))
+
+        records.sort(key=lambda item: item.get("time") or 0)
+        return {
+            "pair": pair,
+            "strategy_type": strategy_type,
+            "since": since_ms,
+            "legs": normalized_legs,
+            "records": records,
+            "total": sum(float(record.get("income", 0.0) or 0.0) for record in records),
+        }
+
+    async def build_periodic_funding_pnl_summary(
+        self,
+        position: Dict[str, Any],
+        *,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Fetch funding fees and current PnL for the GUI periodic summary."""
+        history = await self.get_funding_fee_history(position, limit=limit)
+        snapshot: Dict[str, Any] = {}
+        errors: List[str] = []
+
+        try:
+            snapshot = await self.build_monitor_snapshot(position)
+        except Exception as exc:
+            errors.append(f"Monitor snapshot failed: {exc}")
+
+        for leg in history.get("legs", []):
+            if leg.get("error"):
+                errors.append(f"{leg.get('label', '-')} {leg.get('exchange', '-')}: {leg['error']}")
+
+        last_seen_time = self._timestamp_ms(position.get("last_periodic_funding_fee_time"))
+        last_seen_key = str(position.get("last_periodic_funding_fee_key") or "")
+        new_records: List[Dict[str, Any]] = []
+        newest_time = last_seen_time or 0
+        newest_key = last_seen_key
+
+        for record in history.get("records", []):
+            record_time = self._timestamp_ms(record.get("time")) or 0
+            record_key = self._funding_record_key(record)
+            is_new = False
+            if last_seen_time is None:
+                is_new = True
+            elif record_time > last_seen_time:
+                is_new = True
+            elif record_time == last_seen_time and record_key > last_seen_key:
+                is_new = True
+
+            if is_new:
+                new_records.append(record)
+
+            if record_time > newest_time or (record_time == newest_time and record_key > newest_key):
+                newest_time = record_time
+                newest_key = record_key
+
+        long_pnl = float(snapshot.get("long_pnl", position.get("long_pnl", 0.0)) or 0.0)
+        short_pnl = float(snapshot.get("short_pnl", position.get("short_pnl", 0.0)) or 0.0)
+        total_funding = float(history.get("total", 0.0) or 0.0)
+        new_funding = sum(float(record.get("income", 0.0) or 0.0) for record in new_records)
+
+        return {
+            "pair": history.get("pair", position.get("pair", "-")),
+            "strategy_type": history.get("strategy_type", position.get("strategy_type", "futures_hedge")),
+            "session_id": position.get("session_id"),
+            "history": history,
+            "snapshot": snapshot,
+            "new_records": new_records,
+            "new_funding_fee": new_funding,
+            "total_funding_fee": total_funding,
+            "long_pnl": long_pnl,
+            "short_pnl": short_pnl,
+            "unrealized_pnl": long_pnl + short_pnl,
+            "net_pnl_estimate": long_pnl + short_pnl + total_funding,
+            "newest_record_time": newest_time if newest_time else None,
+            "newest_record_key": newest_key,
+            "errors": errors,
+        }
+
+    @staticmethod
+    def _funding_record_key(record: Dict[str, Any]) -> str:
+        return "|".join(
+            [
+                str(record.get("time") or ""),
+                str(record.get("exchange") or ""),
+                str(record.get("label") or ""),
+                str(record.get("symbol") or ""),
+                str(record.get("income") or ""),
+            ]
+        )
 
     def _restore_position_types(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         restored = dict(payload)
@@ -482,7 +707,12 @@ class GUIWorkflowService:
 
         if not blockers:
             try:
-                spread_snapshot = await self.check_open_spread(pair, long_exchange, short_exchange)
+                spread_snapshot = await self.check_open_spread(
+                    pair,
+                    long_exchange,
+                    short_exchange,
+                    target_size=requested_size_tokens,
+                )
                 details["spread_snapshot"] = spread_snapshot
             except Exception as exc:
                 blockers.append(f"Order book preflight failed: {exc}")
@@ -534,14 +764,19 @@ class GUIWorkflowService:
             short_position = check_result.get("short")
             long_size = float(getattr(long_position, "size", 0.0) or 0.0)
             short_size = float(getattr(short_position, "size", 0.0) or 0.0)
+            details["long_size"] = long_size
+            details["short_size"] = short_size
+            details["balanced_closeable_size"] = min(
+                value for value in (long_size, short_size) if value > 0
+            ) if long_size > 0 and short_size > 0 else max(long_size, short_size)
 
             if long_size <= 0 and short_size <= 0:
                 blockers.append("No active positions found to close.")
             elif close_size is not None:
-                max_closeable = max(long_size, short_size)
+                max_closeable = details["balanced_closeable_size"]
                 if max_closeable > 0 and close_size > max_closeable:
                     warnings.append(
-                        f"Requested close size {close_size:.6f} exceeds current size {max_closeable:.6f}; close will be capped."
+                        f"Requested close size {close_size:.6f} exceeds balanced closeable size {max_closeable:.6f}; close will be capped."
                     )
 
             try:
@@ -549,8 +784,8 @@ class GUIWorkflowService:
                 short_symbol = get_exchange_symbol(pair, short_exchange)
                 long_book, short_book = await asyncio.wait_for(
                     asyncio.gather(
-                        long_client.get_order_book(long_symbol, limit=10),
-                        short_client.get_order_book(short_symbol, limit=10),
+                        long_client.get_order_book(long_symbol, limit=50),
+                        short_client.get_order_book(short_symbol, limit=50),
                     ),
                     timeout=10.0,
                 )
@@ -673,6 +908,7 @@ class GUIWorkflowService:
         short_exchange: Exchange,
         *,
         strategy_mode: str = "futures_hedge",
+        target_size: float = 0.0,
     ) -> Dict[str, float]:
         if strategy_mode == "cash_carry":
             return await self.cash_carry_engine.check_open_basis(pair, long_exchange, short_exchange)
@@ -687,11 +923,22 @@ class GUIWorkflowService:
 
         long_book, short_book = await asyncio.wait_for(
             asyncio.gather(
-                long_client.get_order_book(long_symbol, limit=10),
-                short_client.get_order_book(short_symbol, limit=10),
+                long_client.get_order_book(long_symbol, limit=50),
+                short_client.get_order_book(short_symbol, limit=50),
             ),
             timeout=10.0,
         )
+
+        if target_size > 0:
+            snapshot = build_size_aware_spread_snapshot(long_book, short_book, target_size, mode="open")
+            if not snapshot["enough_depth"] or snapshot["spread_pct"] is None:
+                raise RuntimeError(f"Order book depth is insufficient for open size {target_size:.6f}")
+            return {
+                **snapshot,
+                "long_ask_price": snapshot["long_ask_vwap"],
+                "short_bid_price": snapshot["short_bid_vwap"],
+                "price_spread_pct": snapshot["spread_pct"],
+            }
 
         long_ask = self._first_book_price(long_book.get("asks"))
         short_bid = self._first_book_price(short_book.get("bids"))
@@ -900,6 +1147,10 @@ class GUIWorkflowService:
                 log_callback(f"Close preflight warning: {warning}")
 
         if not skip_spread_check:
+            details = preflight_result.get("details", {})
+            target_size = float(details.get("balanced_closeable_size") or 0.0)
+            if close_size is not None and target_size > 0:
+                target_size = min(target_size, close_size)
             analyze_result = await self.manager.analyze_spread(
                 pair,
                 long_exchange,
@@ -909,11 +1160,19 @@ class GUIWorkflowService:
                 log_callback=log_callback,
                 cancel_event=cancel_event,
                 mode="close",
+                target_size=target_size,
             )
             if analyze_result.get("success"):
-                threshold = analyze_result["avg_spread"]
+                threshold = analyze_result.get("avg_spread")
+                threshold_label = "avg VWAP spread"
+                if threshold is None:
+                    threshold = analyze_result.get("second_best_spread")
+                    threshold_label = "second-best VWAP spread"
+                if threshold is None:
+                    threshold = analyze_result["best_spread"]
+                    threshold_label = "best VWAP spread"
                 if log_callback:
-                    log_callback(f"✅ Analyze done. Threshold (avg spread) = {threshold:.4f}%")
+                    log_callback(f"Analyze done. Threshold ({threshold_label}) = {threshold:.4f}%")
             elif log_callback:
                 log_callback(f"Analyze failed: {analyze_result.get('error')}. Falling back to immediate close threshold.")
 

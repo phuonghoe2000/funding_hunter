@@ -391,6 +391,13 @@ def create_market_summary_frame(app: Any, parent: tk.Widget) -> None:
     )
     app.open_funding_board_btn.pack(side=tk.LEFT)
 
+    app.open_basis_checker_btn = ttk.Button(
+        btn_frame,
+        text="Open Basis Checker",
+        command=app._open_basis_checker,
+    )
+    app.open_basis_checker_btn.pack(side=tk.LEFT, padx=(6, 0))
+
     app.refresh_funding_btn = ttk.Button(
         btn_frame,
         text="Refresh Funding",
@@ -530,6 +537,14 @@ def create_position_frame(app: Any, parent: tk.Widget) -> None:
 
     app.pos_status_label = ttk.Label(app.position_info, text="Status: No Position")
     app.pos_status_label.pack(side=tk.RIGHT, padx=10)
+
+    app.funding_fee_history_btn = ttk.Button(
+        frame,
+        text="Funding Fees",
+        command=app._show_funding_fee_history,
+        state=tk.DISABLED,
+    )
+    app.funding_fee_history_btn.pack(anchor=tk.E, pady=(4, 0))
 
 
 def create_log_frame(app: Any, parent: tk.Widget) -> None:

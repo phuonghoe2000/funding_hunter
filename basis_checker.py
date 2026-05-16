@@ -8,7 +8,6 @@ import asyncio
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
-import aiohttp
 import time
 import json
 import os
@@ -16,30 +15,36 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+from core import basis_checker_service as basis_service
+
 # Public API endpoints (no auth needed)
-BINANCE_PREMIUM_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
-ASTER_PREMIUM_URL = "https://fapi.asterdex.com/fapi/v1/premiumIndex"
-BINANCE_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-BINANCE_EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-ASTER_EXCHANGE_INFO_URL = "https://fapi.asterdex.com/fapi/v1/exchangeInfo"
-BINANCE_DEPTH_URL = "https://fapi.binance.com/fapi/v1/depth"
-ASTER_DEPTH_URL = "https://fapi.asterdex.com/fapi/v1/depth"
-BINANCE_FUNDING_INFO_URL = "https://fapi.binance.com/fapi/v1/fundingInfo"
-ASTER_FUNDING_INFO_URL = "https://fapi.asterdex.com/fapi/v1/fundingInfo"
+BINANCE_PREMIUM_URL = basis_service.BINANCE_PREMIUM_URL
+ASTER_PREMIUM_URL = basis_service.ASTER_PREMIUM_URL
+BINANCE_TICKER_URL = basis_service.BINANCE_TICKER_URL
+BINANCE_EXCHANGE_INFO_URL = basis_service.BINANCE_EXCHANGE_INFO_URL
+ASTER_EXCHANGE_INFO_URL = basis_service.ASTER_EXCHANGE_INFO_URL
+BINANCE_DEPTH_URL = basis_service.BINANCE_DEPTH_URL
+ASTER_DEPTH_URL = basis_service.ASTER_DEPTH_URL
+BINANCE_FUNDING_INFO_URL = basis_service.BINANCE_FUNDING_INFO_URL
+ASTER_FUNDING_INFO_URL = basis_service.ASTER_FUNDING_INFO_URL
 
 # Config file for Telegram settings
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "basis_config.json")
 
 # Default alert threshold
-DEFAULT_ALERT_THRESHOLD = 0.3  # 0.3% basis diff triggers alert
+DEFAULT_ALERT_THRESHOLD = basis_service.DEFAULT_ALERT_THRESHOLD  # 0.3% basis diff triggers alert
 
 # Auto signal requires funding support with at least this configurable minimum diff
-DEFAULT_MIN_FUNDING_DIFF = 0.0
-MIN_EXEC_BASIS_SIGNAL = 0.5
+DEFAULT_MIN_FUNDING_DIFF = basis_service.DEFAULT_MIN_FUNDING_DIFF
+MIN_EXEC_BASIS_SIGNAL = basis_service.MIN_EXEC_BASIS_SIGNAL
 AUTO_SIGNAL_COOLDOWN_SECONDS = 300
 MAX_AUTO_SIGNALS_PER_SCAN = 3
-MAX_EXECUTABLE_BASIS_CANDIDATES = 60
-EXECUTABLE_BASIS_CONCURRENCY = 8
+MAX_EXECUTABLE_BASIS_CANDIDATES = basis_service.MAX_EXECUTABLE_BASIS_CANDIDATES
+EXECUTABLE_BASIS_CONCURRENCY = basis_service.EXECUTABLE_BASIS_CONCURRENCY
+TELEGRAM_HELLO_REPLY = "Basis Checker bot vẫn chạy."
+TELEGRAM_POLL_TIMEOUT_SECONDS = 20
+TELEGRAM_IGNORE_DURATION_SECONDS = 3600
+TELEGRAM_IGNORED_SYMBOLS_CONFIG_KEY = "telegram_ignored_symbols"
 
 
 def load_config():
@@ -58,241 +63,69 @@ def save_config(cfg):
 
 
 async def fetch_trading_symbols(session, url):
-    """Fetch only TRADING status symbols from exchangeInfo, with quantity precision"""
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            data = await resp.json()
-            symbols = set()
-            precisions = {}
-            for s in data.get("symbols", []):
-                sym = s.get("symbol", "")
-                if s.get("status") == "TRADING" and sym.endswith("USDT"):
-                    symbols.add(sym)
-                    precisions[sym] = s.get("quantityPrecision", 0)
-            return symbols, precisions
-    except Exception as e:
-        print(f"Error fetching exchangeInfo {url}: {e}")
-        return set(), {}
+    return await basis_service.fetch_trading_symbols(session, url)
 
 
 async def fetch_all_mark_prices(session, url, trading_only=None):
-    """Fetch all mark prices from an exchange, filtered to TRADING pairs only"""
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            data = await resp.json()
-            result = {}
-            for item in data:
-                sym = item.get("symbol", "")
-                if not sym.endswith("USDT"):
-                    continue
-                if trading_only is not None and sym not in trading_only:
-                    continue
-                try:
-                    result[sym] = {
-                        "mark_price": float(item.get("markPrice", 0)),
-                        "index_price": float(item.get("indexPrice", 0)),
-                        "last_funding": float(item.get("lastFundingRate", 0)),
-                    }
-                except (ValueError, TypeError):
-                    pass
-            return result
-    except Exception as e:
-        print(f"Error fetching {url}: {e}")
-        return {}
+    return await basis_service.fetch_all_mark_prices(session, url, trading_only)
 
 
 async def fetch_24h_tickers(session):
-    """Fetch 24h price change from Binance"""
-    try:
-        async with session.get(BINANCE_TICKER_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            data = await resp.json()
-            result = {}
-            for item in data:
-                sym = item.get("symbol", "")
-                if sym.endswith("USDT"):
-                    try:
-                        result[sym] = {
-                            "price_change_pct": float(item.get("priceChangePercent", 0)),
-                            "volume": float(item.get("quoteVolume", 0)),
-                        }
-                    except (ValueError, TypeError):
-                        pass
-            return result
-    except Exception as e:
-        print(f"Error fetching 24h tickers: {e}")
-        return {}
+    return await basis_service.fetch_24h_tickers(session)
 
 
 async def fetch_funding_intervals(session, url):
-    """Fetch fundingIntervalHours for each symbol"""
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            data = await resp.json()
-            result = {}
-            for item in data:
-                sym = item.get("symbol", "")
-                if sym.endswith("USDT"):
-                    result[sym] = item.get("fundingIntervalHours", 8)
-            return result
-    except Exception as e:
-        print(f"Error fetching fundingInfo {url}: {e}")
-        return {}
+    return await basis_service.fetch_funding_intervals(session, url)
 
 
 async def fetch_all_data():
-    """Fetch prices + 24h tickers + funding intervals, filtered to TRADING pairs only"""
-    async with aiohttp.ClientSession() as session:
-        # Fetch exchange info first to get TRADING symbols + precision
-        (bn_trading, bn_precisions), (as_trading, as_precisions) = await asyncio.gather(
-            fetch_trading_symbols(session, BINANCE_EXCHANGE_INFO_URL),
-            fetch_trading_symbols(session, ASTER_EXCHANGE_INFO_URL),
-        )
-
-        # Then fetch prices + funding intervals filtered by trading status
-        binance_data, aster_data, tickers, bn_intervals, as_intervals = await asyncio.gather(
-            fetch_all_mark_prices(session, BINANCE_PREMIUM_URL, bn_trading),
-            fetch_all_mark_prices(session, ASTER_PREMIUM_URL, as_trading),
-            fetch_24h_tickers(session),
-            fetch_funding_intervals(session, BINANCE_FUNDING_INFO_URL),
-            fetch_funding_intervals(session, ASTER_FUNDING_INFO_URL),
-        )
-    # Merge precisions (use min of both exchanges for safety)
-    qty_precisions = {}
-    for sym in set(bn_precisions) | set(as_precisions):
-        bn_p = bn_precisions.get(sym, 0)
-        as_p = as_precisions.get(sym, 0)
-        qty_precisions[sym] = min(bn_p, as_p) if bn_p and as_p else bn_p or as_p
-    return binance_data, aster_data, tickers, bn_intervals, as_intervals, qty_precisions
+    return await basis_service.fetch_all_data()
 
 
 def _price_fmt(price):
-    """Get decimal format string based on price magnitude"""
-    if price > 1000:
-        return ".2f"
-    elif price > 1:
-        return ".4f"
-    elif price > 0.01:
-        return ".6f"
-    else:
-        return ".8f"
+    return basis_service.price_format(price)
 
 
 def _qty_fmt(qty):
-    """Format quantity for display"""
-    if qty >= 10000:
-        return f"{qty:,.0f}"
-    elif qty >= 100:
-        return f"{qty:,.1f}"
-    elif qty >= 1:
-        return f"{qty:.2f}"
-    else:
-        return f"{qty:.4f}"
+    return basis_service.quantity_format(qty)
 
 
 async def fetch_order_books(symbol, limit=10):
-    """Fetch order books from both Binance and AsterDEX"""
-    async with aiohttp.ClientSession() as session:
-        async def fetch_one(base_url):
-            url = f"{base_url}?symbol={symbol}&limit={limit}"
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    data = await resp.json()
-                    return {
-                        "bids": [(float(p), float(q)) for p, q in data.get("bids", [])],
-                        "asks": [(float(p), float(q)) for p, q in data.get("asks", [])],
-                    }
-            except Exception as e:
-                print(f"Error fetching depth from {base_url}: {e}")
-                return {"bids": [], "asks": []}
-
-        bn_book, as_book = await asyncio.gather(
-            fetch_one(BINANCE_DEPTH_URL),
-            fetch_one(ASTER_DEPTH_URL)
-        )
-    return bn_book, as_book
+    return await basis_service.fetch_order_books(symbol, limit=limit)
 
 
 async def fetch_order_books_for_symbols(symbols, limit=10, concurrency=8):
-    """Fetch Binance/Aster order books for many symbols with bounded concurrency."""
-    async with aiohttp.ClientSession() as session:
-        semaphore = asyncio.Semaphore(concurrency)
-
-        async def fetch_one(symbol, base_url):
-            url = f"{base_url}?symbol={symbol}&limit={limit}"
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    data = await resp.json()
-                    return {
-                        "bids": [(float(p), float(q)) for p, q in data.get("bids", [])],
-                        "asks": [(float(p), float(q)) for p, q in data.get("asks", [])],
-                    }
-            except Exception as e:
-                print(f"Error fetching depth from {base_url} for {symbol}: {e}")
-                return {"bids": [], "asks": []}
-
-        async def fetch_pair(symbol):
-            async with semaphore:
-                bn_book, as_book = await asyncio.gather(
-                    fetch_one(symbol, BINANCE_DEPTH_URL),
-                    fetch_one(symbol, ASTER_DEPTH_URL),
-                )
-                return symbol, bn_book, as_book
-
-        results = await asyncio.gather(*(fetch_pair(symbol) for symbol in symbols), return_exceptions=True)
-
-    books = {}
-    for result in results:
-        if isinstance(result, Exception):
-            continue
-        symbol, bn_book, as_book = result
-        books[symbol] = (bn_book, as_book)
-    return books
+    return await basis_service.fetch_order_books_for_symbols(symbols, limit=limit, concurrency=concurrency)
 
 
 def compute_executable_basis(mark_basis, bn_book, as_book):
-    """Return executable basis details for the direction implied by mark basis."""
-    bn_ask = bn_book["asks"][0][0] if bn_book.get("asks") else 0
-    as_bid = as_book["bids"][0][0] if as_book.get("bids") else 0
-    bn_bid = bn_book["bids"][0][0] if bn_book.get("bids") else 0
-    as_ask = as_book["asks"][0][0] if as_book.get("asks") else 0
-
-    if mark_basis >= 0:
-        exec_basis = ((as_bid - bn_ask) / bn_ask * 100) if bn_ask > 0 else 0
-        directional_exec_basis = exec_basis
-        rec_long, rec_short = "binance", "aster"
-        reference_price = (bn_ask + as_bid) / 2 if bn_ask > 0 and as_bid > 0 else 0
-    else:
-        exec_basis = ((bn_bid - as_ask) / as_ask * 100) if as_ask > 0 else 0
-        directional_exec_basis = -exec_basis
-        rec_long, rec_short = "aster", "binance"
-        reference_price = (as_ask + bn_bid) / 2 if as_ask > 0 and bn_bid > 0 else 0
-
-    return {
-        "exec_basis": exec_basis,
-        "directional_exec_basis": directional_exec_basis,
-        "rec_long": rec_long,
-        "rec_short": rec_short,
-        "reference_price": reference_price,
-    }
+    return basis_service.compute_executable_basis(mark_basis, bn_book, as_book)
 
 
-async def send_telegram_message(bot_token, chat_id, message):
-    """Send message via Telegram bot"""
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                result = await resp.json()
-                return result.get("ok", False)
-    except Exception as e:
-        print(f"Telegram send error: {e}")
-        return False
+async def telegram_api_request(
+    bot_token,
+    method_name,
+    *,
+    http_method="POST",
+    payload=None,
+    params=None,
+):
+    return await basis_service.telegram_api_request(
+        bot_token,
+        method_name,
+        http_method=http_method,
+        payload=payload,
+        params=params,
+    )
+
+
+async def send_telegram_message(bot_token, chat_id, message, return_details=False):
+    return await basis_service.send_telegram_message(
+        bot_token,
+        chat_id,
+        message,
+        return_details=return_details,
+    )
 
 
 class BasisCheckerApp:
@@ -326,6 +159,11 @@ class BasisCheckerApp:
         self.alerted_symbols = {}  # symbol -> last_alert_time (cooldown 5min)
         self.alert_hit_count = {}  # symbol -> consecutive hit count (alert on 2nd hit)
         self.alert_scan_running = False
+        self.telegram_listener_running = False
+        self.telegram_listener_future = None
+        self.telegram_update_offset = None
+        self.telegram_listener_token = None
+        self.ignored_symbols_by_chat = self._load_ignored_symbols(cfg)
 
         # Auto signal state
         self.min_basis = cfg.get("min_basis", 1.0)
@@ -337,6 +175,7 @@ class BasisCheckerApp:
 
         self._build_ui()
         self._start_async_loop()
+        self.root.after(1000, self._start_telegram_listener_if_ready)
         self.root.after(500, self._do_initial_fetch)
 
     # ── UI ──────────────────────────────────────────────────
@@ -438,6 +277,7 @@ class BasisCheckerApp:
         ttk.Checkbutton(row2, text="Enable", variable=self.tg_enabled_var).pack(side="left", padx=5)
         ttk.Button(row2, text="Save", command=self._save_tg_config).pack(side="left", padx=5)
         ttk.Button(row2, text="Test", command=self._test_telegram).pack(side="left", padx=5)
+        ttk.Button(row2, text="Start commands", command=self._start_telegram_listener_if_ready).pack(side="left", padx=5)
         self.tg_status = ttk.Label(row2, text="", foreground="gray")
         self.tg_status.pack(side="left", padx=5)
 
@@ -707,6 +547,103 @@ class BasisCheckerApp:
             self.basis_tree.insert("", "end", values=values, tags=(tag,))
 
     # ── Telegram ────────────────────────────────────────────
+    def _load_ignored_symbols(self, cfg):
+        """Load unexpired Telegram ignore rules from config."""
+        raw = cfg.get(TELEGRAM_IGNORED_SYMBOLS_CONFIG_KEY, {})
+        now = time.time()
+        loaded = {}
+        if not isinstance(raw, dict):
+            return loaded
+
+        for chat_id, symbols in raw.items():
+            if not isinstance(symbols, dict):
+                continue
+            chat_key = str(chat_id)
+            for symbol, until_ts in symbols.items():
+                try:
+                    until_ts = float(until_ts)
+                except (TypeError, ValueError):
+                    continue
+                if until_ts > now:
+                    loaded.setdefault(chat_key, {})[str(symbol).upper()] = until_ts
+        return loaded
+
+    def _save_ignored_symbols(self):
+        cfg = load_config()
+        now = time.time()
+        cleaned = {}
+        for chat_id, symbols in list(self.ignored_symbols_by_chat.items()):
+            active_symbols = {}
+            for symbol, until_ts in list(symbols.items()):
+                if until_ts > now:
+                    active_symbols[symbol] = until_ts
+            if active_symbols:
+                cleaned[str(chat_id)] = active_symbols
+        self.ignored_symbols_by_chat = cleaned
+        if cleaned:
+            cfg[TELEGRAM_IGNORED_SYMBOLS_CONFIG_KEY] = cleaned
+        else:
+            cfg.pop(TELEGRAM_IGNORED_SYMBOLS_CONFIG_KEY, None)
+        save_config(cfg)
+
+    @staticmethod
+    def _normalize_telegram_symbol(raw_symbol):
+        symbol = str(raw_symbol or "").strip().upper()
+        symbol = symbol.split()[0] if symbol else ""
+        for sep in ("/", "-", "_", ":"):
+            symbol = symbol.replace(sep, "")
+        symbol = "".join(ch for ch in symbol if ch.isalnum())
+        if not symbol:
+            return None
+        if not symbol.endswith("USDT"):
+            symbol = f"{symbol}USDT"
+        if symbol == "USDT" or len(symbol) <= 4:
+            return None
+        return symbol
+
+    @staticmethod
+    def _parse_ignore_command(text):
+        if not text:
+            return None
+        parts = text.strip().split()
+        if not parts:
+            return None
+        command = parts[0].lower()
+        if command != "/ignore" and not command.startswith("/ignore@"):
+            return None
+        if len(parts) < 2:
+            return {"error": "Usage: /ignore BTC/USDT"}
+        symbol = BasisCheckerApp._normalize_telegram_symbol(parts[1])
+        if not symbol:
+            return {"error": "Invalid pair. Usage: /ignore BTC/USDT"}
+        return {"symbol": symbol}
+
+    def _is_ignored_symbol(self, symbol, chat_id=None):
+        symbol = self._normalize_telegram_symbol(symbol)
+        if not symbol:
+            return False
+        chat_key = str(chat_id if chat_id is not None else self.tg_chat_id)
+        symbols = self.ignored_symbols_by_chat.get(chat_key)
+        if not symbols:
+            return False
+        until_ts = symbols.get(symbol, 0)
+        if until_ts > time.time():
+            return True
+        if symbol in symbols:
+            symbols.pop(symbol, None)
+        return False
+
+    def _ignore_symbol_for_chat(self, symbol, chat_id):
+        symbol = self._normalize_telegram_symbol(symbol)
+        if not symbol:
+            return None, None
+        chat_key = str(chat_id)
+        until_ts = time.time() + TELEGRAM_IGNORE_DURATION_SECONDS
+        self.ignored_symbols_by_chat.setdefault(chat_key, {})[symbol] = until_ts
+        self.alert_hit_count.pop(symbol, None)
+        self._save_ignored_symbols()
+        return symbol, until_ts
+
     def _save_tg_config(self):
         self.tg_token = self.tg_token_var.get().strip()
         self.tg_chat_id = self.tg_chatid_var.get().strip()
@@ -725,7 +662,140 @@ class BasisCheckerApp:
         })
         save_config(cfg)
         self.tg_status.config(text="Saved!", foreground="green")
+        self._start_telegram_listener_if_ready()
         self.root.after(3000, lambda: self.tg_status.config(text=""))
+
+    def _start_telegram_listener_if_ready(self):
+        """Start Telegram command listener when bot token is configured."""
+        self.tg_token = self.tg_token_var.get().strip()
+        self.tg_chat_id = self.tg_chatid_var.get().strip()
+        self.tg_enabled = self.tg_enabled_var.get()
+
+        if not self.tg_enabled or not self.tg_token:
+            return
+        if self.telegram_listener_running:
+            if self.telegram_listener_token == self.tg_token:
+                self.tg_status.config(text="command listener running", foreground="green")
+                return
+            self._stop_telegram_listener()
+        if not self.loop:
+            self.root.after(500, self._start_telegram_listener_if_ready)
+            return
+
+        self.telegram_listener_running = True
+        self.telegram_listener_token = self.tg_token
+        self.telegram_listener_future = self._run_async(self._telegram_hello_listener())
+        if self.telegram_listener_future:
+            self.telegram_listener_future.add_done_callback(
+                lambda future: self.root.after(0, lambda: self._on_telegram_listener_done(future))
+            )
+        self.tg_status.config(text="command listener started", foreground="green")
+
+    def _on_telegram_listener_done(self, future):
+        self.telegram_listener_running = False
+        self.telegram_listener_token = None
+        if not self.running:
+            return
+        if future.cancelled():
+            return
+        try:
+            future.result()
+        except Exception as e:
+            self.tg_status.config(text=f"command listener error: {e}", foreground="red")
+
+    @staticmethod
+    def _is_hello_command(text):
+        if not text:
+            return False
+        first = text.strip().split()[0].lower()
+        return first == "/hello" or first.startswith("/hello@")
+
+    async def _telegram_hello_listener(self):
+        """Reply to Telegram commands in any chat/group where this bot receives them."""
+        token = self.tg_token
+        self._trade_log("Telegram command listener running")
+
+        while self.running and self.telegram_listener_running:
+            params = {
+                "timeout": TELEGRAM_POLL_TIMEOUT_SECONDS,
+                "allowed_updates": json.dumps(["message"]),
+            }
+            if self.telegram_update_offset is not None:
+                params["offset"] = self.telegram_update_offset
+
+            details = await telegram_api_request(
+                token,
+                "getUpdates",
+                http_method="GET",
+                params=params,
+            )
+            if not details.get("ok"):
+                desc = details.get("description", "unknown error")
+                self.root.after(0, lambda text=desc: self.tg_status.config(text=f"commands failed: {text[:70]}", foreground="red"))
+                await asyncio.sleep(10)
+                continue
+
+            updates = details.get("result") or []
+            for update in updates:
+                update_id = update.get("update_id")
+                if update_id is not None:
+                    self.telegram_update_offset = int(update_id) + 1
+
+                message = update.get("message") or {}
+                chat = message.get("chat") or {}
+                chat_id = chat.get("id")
+                if chat_id is None:
+                    continue
+                chat_title = chat.get("title") or chat.get("username") or chat_id
+
+                text = message.get("text") or ""
+                ignore_command = self._parse_ignore_command(text)
+                if ignore_command is not None:
+                    error = ignore_command.get("error")
+                    if error:
+                        sent = await send_telegram_message(token, chat_id, error)
+                        if sent:
+                            self._trade_log(f"Replied /ignore usage to Telegram chat {chat_title}")
+                        else:
+                            self._trade_log(f"Failed to reply /ignore usage to Telegram chat {chat_title}")
+                        continue
+
+                    symbol, until_ts = self._ignore_symbol_for_chat(ignore_command["symbol"], chat_id)
+                    if symbol is None:
+                        await send_telegram_message(token, chat_id, "Invalid pair. Usage: /ignore BTC/USDT")
+                        continue
+                    expiry = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until_ts))
+                    reply = (
+                        f"Da ignore {symbol} trong 1 gio.\n"
+                        f"Het han: {expiry}"
+                    )
+                    sent = await send_telegram_message(token, chat_id, reply)
+                    if sent:
+                        self._trade_log(f"Ignored {symbol} for Telegram chat {chat_title} until {expiry}")
+                    else:
+                        self._trade_log(f"Failed to reply /ignore to Telegram chat {chat_title}")
+                    continue
+
+                if not self._is_hello_command(text):
+                    continue
+
+                reply = (
+                    f"{TELEGRAM_HELLO_REPLY}\n"
+                    f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                sent = await send_telegram_message(token, chat_id, reply)
+                if sent:
+                    self._trade_log(f"Replied /hello to Telegram chat {chat_title}")
+                else:
+                    self._trade_log(f"Failed to reply /hello to Telegram chat {chat_title}")
+
+    def _stop_telegram_listener(self):
+        self.telegram_listener_running = False
+        self.telegram_listener_token = None
+        future = self.telegram_listener_future
+        if future and not future.done():
+            future.cancel()
+        self.telegram_listener_future = None
 
     def _test_telegram(self):
         token = self.tg_token_var.get().strip()
@@ -736,7 +806,7 @@ class BasisCheckerApp:
 
         self.tg_status.config(text="Sending...", foreground="gray")
         msg = "<b>Basis Checker</b>\nTest message - Alert system working!"
-        future = self._run_async(send_telegram_message(token, chat_id, msg))
+        future = self._run_async(send_telegram_message(token, chat_id, msg, return_details=True))
         if future:
             self.root.after(200, lambda: self._check_tg_test(future))
 
@@ -745,11 +815,21 @@ class BasisCheckerApp:
             self.root.after(200, lambda: self._check_tg_test(future))
             return
         try:
-            ok = future.result()
+            result = future.result()
+            ok = result.get("ok") if isinstance(result, dict) else bool(result)
             if ok:
-                self.tg_status.config(text="Sent OK!", foreground="green")
+                suffix = " (SSL fallback)" if isinstance(result, dict) and result.get("ssl_fallback") else ""
+                self.tg_status.config(text=f"Sent OK{suffix}!", foreground="green")
             else:
-                self.tg_status.config(text="Failed - check token/chat_id", foreground="red")
+                description = result.get("description", "") if isinstance(result, dict) else ""
+                error_code = result.get("error_code") if isinstance(result, dict) else None
+                if error_code == 401:
+                    description = "Unauthorized: bot token invalid/revoked"
+                elif error_code == 400 and "chat" in description.lower():
+                    description = f"{description}: bot may not be in chat/group"
+                if not description:
+                    description = "check token/chat_id"
+                self.tg_status.config(text=f"Failed - {description[:80]}", foreground="red")
         except Exception as e:
             self.tg_status.config(text=f"Error: {e}", foreground="red")
 
@@ -764,6 +844,10 @@ class BasisCheckerApp:
         candidates = []
 
         for sym in self.common_symbols:
+            if self._is_ignored_symbol(sym, self.tg_chat_id):
+                self.alert_hit_count.pop(sym, None)
+                continue
+
             bn = self.binance_data.get(sym)
             ast = self.aster_data.get(sym)
             if not bn or not ast:
@@ -808,6 +892,9 @@ class BasisCheckerApp:
         now = time.time()
 
         for sym, mark_basis, bn_price, as_price in candidates:
+            if self._is_ignored_symbol(sym, self.tg_chat_id):
+                continue
+
             try:
                 bn_book, as_book = await fetch_order_books(sym)
                 bn_ask = bn_book["asks"][0][0] if bn_book["asks"] else 0
@@ -944,6 +1031,9 @@ class BasisCheckerApp:
 
         candidates = []
         for sym in self.common_symbols:
+            if self._is_ignored_symbol(sym, self.tg_chat_id):
+                continue
+
             bn = self.binance_data.get(sym)
             ast = self.aster_data.get(sym)
             if not bn or not ast:
@@ -986,6 +1076,8 @@ class BasisCheckerApp:
         for sym, mark_basis, fr_diff in candidates:
             if signals_sent >= MAX_AUTO_SIGNALS_PER_SCAN:
                 break
+            if self._is_ignored_symbol(sym, self.tg_chat_id):
+                continue
 
             try:
                 bn_book, as_book = await fetch_order_books(sym)
@@ -1031,6 +1123,10 @@ class BasisCheckerApp:
     async def _send_auto_trade_signal(self, symbol, rec_long, rec_short, mark_basis, exec_basis, fr_diff, reference_price):
         """Send a signal-only Telegram alert for a hedged basis opportunity."""
         now = time.time()
+        if self._is_ignored_symbol(symbol, self.tg_chat_id):
+            self._trade_log(f"Telegram ignored for {symbol}; skip auto signal")
+            return False
+
         signal_key = (symbol, rec_long, rec_short)
         last_sent = self.auto_signal_last_sent.get(signal_key, 0)
         if now - last_sent < AUTO_SIGNAL_COOLDOWN_SECONDS:
@@ -1064,7 +1160,7 @@ class BasisCheckerApp:
 
         ok = await send_telegram_message(self.tg_token, self.tg_chat_id, msg)
         if not ok:
-            self._trade_log(f"Telegram FAILED for {symbol}")
+            self._trade_log(f"Telegram FAILED for {symbol}; run Telegram Test for details")
             return False
 
         self.auto_signal_last_sent[signal_key] = now
@@ -1301,6 +1397,7 @@ class BasisCheckerApp:
     def _on_close(self):
         self.running = False
         self.auto_trade_enabled = False
+        self._stop_telegram_listener()
         if self.loop:
             self.loop.call_soon_threadsafe(self.loop.stop)
         self.root.destroy()
